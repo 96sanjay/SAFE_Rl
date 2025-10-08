@@ -1,0 +1,6 @@
+gymnasium>=0.28,<1.0
+numpy>=1.26,<2.0
+pandas>=2.2
+matplotlib>=3.9
+tyro>=0.8.4
+# We’ll install torch separately first (correct wheel for macOS) before OmniSafe.

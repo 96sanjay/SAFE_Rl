@@ -7,6 +7,7 @@ from omnisafe.envs.core import CMDP, env_register  # official hook
 
 from scripts.make_env import make_base_env
 from citylearn_safe.safety_env import CityLearnSafetyEnv
+from citylearn_safe.kpi_logger import init_kpi_logger
 
 @env_register
 class CityLearnCMDP(CMDP):
@@ -35,6 +36,9 @@ class CityLearnCMDP(CMDP):
 
         # If you know the episode horizon (e.g., 35040), expose it:
         self._max_episode_steps = 8759  # optional; aids logging/slicing
+        
+        # Initialize KPI logger - will be set up when OmniSafe creates the run directory
+        # We'll initialize it later in the training process when we know the exact run directory
 
     # ---- required properties / methods (CMDP)
     @property
@@ -59,6 +63,21 @@ class CityLearnCMDP(CMDP):
         obs, info = self._env.reset()
         # OmniSafe expects torch tensors
         obs_t = torch.as_tensor(obs, dtype=torch.float32)
+        
+        # Add KPI metrics to info for OmniSafe logging
+        # Try multiple formats to see what OmniSafe recognizes
+        kpi_info = {}
+        for key, value in info.items():
+            if key.startswith(('obs_', 'soc_', 'action_', 'step_', 'total_', 'constraint_')):
+                # Try different prefixes that OmniSafe might recognize
+                kpi_info[f'Metrics/{key}'] = float(value)
+                kpi_info[f'Train/{key}'] = float(value)
+                kpi_info[key] = float(value)  # Also keep original key
+                kpi_info[f'KPI/{key}'] = float(value)  # Keep KPI prefix too
+        
+        # Merge KPI info with existing info
+        info.update(kpi_info)
+        
         return obs_t, info or {}
 
     def step(self, action: torch.Tensor):
@@ -68,6 +87,20 @@ class CityLearnCMDP(CMDP):
 
         # Pull safety cost from info (your SafetyEnv already writes info['cost'])
         cost = info.get('cost', 0.0)
+        
+        # Add KPI metrics to info for OmniSafe logging
+        # Try multiple formats to see what OmniSafe recognizes
+        kpi_info = {}
+        for key, value in info.items():
+            if key.startswith(('obs_', 'soc_', 'action_', 'step_', 'total_', 'constraint_')):
+                # Try different prefixes that OmniSafe might recognize
+                kpi_info[f'Metrics/{key}'] = float(value)
+                kpi_info[f'Train/{key}'] = float(value)
+                kpi_info[key] = float(value)  # Also keep original key
+                kpi_info[f'KPI/{key}'] = float(value)  # Keep KPI prefix too
+        
+        # Merge KPI info with existing info
+        info.update(kpi_info)
 
         return (
             torch.as_tensor(obs, dtype=torch.float32),

@@ -2,7 +2,7 @@ algo: SAC          # ← change per file: TRPOLag, CPO, RCPO, SACLag, TD3Lag, PC
 env_id: CityLearnSafety-SoC-v0
 
 train_cfgs:
-  total_steps: 87590      # 10 × 8759 (your measured horizon)
+  total_steps: 875900      # 10 × 8759 (your measured horizon)
   vector_env_nums: 1      # keep single env for clean epochs
 
 algo_cfgs:

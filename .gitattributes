@@ -1,0 +1,2 @@
+runs/*/kpis_kpis.csv filter=lfs diff=lfs merge=lfs -text
+runs/**/kpis_kpis.csv filter=lfs diff=lfs merge=lfs -text

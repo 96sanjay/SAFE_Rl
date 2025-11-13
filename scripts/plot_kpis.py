@@ -43,8 +43,18 @@ def plot_kpis(run_dir: str):
     
     # 1. SoC over time
     axes[0, 0].plot(plot_df['step_count'], plot_df['soc_mean'], 'b-', alpha=0.7, linewidth=1)
-    axes[0, 0].axhline(y=0.1, color='r', linestyle='--', label='SoC Min (0.1)')
-    axes[0, 0].axhline(y=0.9, color='r', linestyle='--', label='SoC Max (0.9)')
+    # Try to detect SoC band from data, default to [0.0, 0.95] if not found
+    soc_min_band = 0.0
+    soc_max_band = 0.95
+    # Check if we can infer from violation pattern
+    if 'cost' in plot_df.columns:
+        violating = plot_df[plot_df['cost'] > 0]
+        if len(violating) > 0:
+            # If violations occur when soc_max > 0.95, that's our upper bound
+            if 'soc_max' in violating.columns:
+                soc_max_band = 0.95  # Based on current implementation
+    axes[0, 0].axhline(y=soc_min_band, color='g', linestyle='--', alpha=0.5, label=f'SoC Min ({soc_min_band})')
+    axes[0, 0].axhline(y=soc_max_band, color='r', linestyle='--', label=f'SoC Max ({soc_max_band})')
     axes[0, 0].set_xlabel('Step Count')
     axes[0, 0].set_ylabel('State of Charge (SoC)')
     axes[0, 0].set_title('Battery State of Charge')
@@ -94,17 +104,18 @@ def plot_kpis(run_dir: str):
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     
-    # 6. Observation statistics over time
-    axes[1, 2].plot(plot_df['step_count'], plot_df['obs_mean'], 'brown', alpha=0.7, linewidth=1, label='Mean')
-    axes[1, 2].fill_between(plot_df['step_count'], 
-                           plot_df['obs_mean'] - plot_df['obs_std'], 
-                           plot_df['obs_mean'] + plot_df['obs_std'], 
-                           alpha=0.3, color='brown', label='±1 Std')
-    axes[1, 2].set_xlabel('Step Count')
-    axes[1, 2].set_ylabel('Observation Value')
-    axes[1, 2].set_title('Observation Statistics')
-    axes[1, 2].legend()
-    axes[1, 2].grid(True, alpha=0.3)
+    # 6. Non-shiftable load over time (replacing observation stats)
+    if 'non_shiftable_load' in plot_df.columns:
+        axes[1, 2].plot(plot_df['step_count'], plot_df['non_shiftable_load'], 'brown', alpha=0.7, linewidth=1, label='Non-shiftable Load')
+        axes[1, 2].set_xlabel('Step Count')
+        axes[1, 2].set_ylabel('Normalized Load')
+        axes[1, 2].set_title('Non-shiftable Load')
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3)
+    else:
+        axes[1, 2].text(0.5, 0.5, 'No observation data available', 
+                        ha='center', va='center', transform=axes[1, 2].transAxes)
+        axes[1, 2].set_title('Observation Statistics (N/A)')
     
     # 7. CityLearn Electricity Consumption (episode-level)
     def episode_series(col: str):

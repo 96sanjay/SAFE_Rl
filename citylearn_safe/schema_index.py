@@ -65,3 +65,38 @@ def soc_indices_from_schema_and_obs_dim(
 
     idxs = [start + b * per_b_len + soc_pos for b in range(n_b)]
     return idxs, per_b
+
+def obs_feature_index(
+    schema_path: str,
+    obs_dim: int,
+    feature_name: str,
+) -> int | None:
+    """
+    Find the index of a specific observation feature in the central-agent flattened observation.
+    Returns index for shared features, or first building's index for per-building features.
+    Returns None if feature not found.
+    """
+    if not os.path.exists(schema_path):
+        return None
+    schema = json.load(open(schema_path, "r"))
+    
+    shared, per_b = _active_shared_lists(schema)
+    n_b = _num_included_buildings(schema)
+    
+    # Check if it's a shared feature
+    if feature_name in shared:
+        return shared.index(feature_name)
+    
+    # Check if it's a per-building feature
+    if feature_name in per_b:
+        per_b_len = len(per_b)
+        if per_b_len == 0 or n_b <= 0:
+            return None
+        per_b_pos = per_b.index(feature_name)
+        start = obs_dim - n_b * per_b_len
+        if start < 0:
+            return None
+        # Return first building's index
+        return start + per_b_pos
+    
+    return None

@@ -201,7 +201,7 @@
   },
   "buildings": {
     "Building_1": {
-      "include": true,
+      "include": false,
       "energy_simulation": "Building_1.csv",
       "weather": "weather.csv",
       "carbon_intensity": "carbon_intensity.csv",
@@ -309,7 +309,7 @@
       }
     },
     "Building_5": {
-      "include": false,
+      "include": true,
       "energy_simulation": "Building_5.csv",
       "weather": "weather.csv",
       "carbon_intensity": "carbon_intensity.csv",
@@ -471,7 +471,7 @@
       }
     },
     "Building_11": {
-      "include": false,
+      "include": true,
       "energy_simulation": "Building_11.csv",
       "weather": "weather.csv",
       "carbon_intensity": "carbon_intensity.csv",

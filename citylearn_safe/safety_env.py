@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 
-from .schema_index import soc_indices_from_schema_and_obs_dim
+from .schema_index import soc_indices_from_schema_and_obs_dim, obs_feature_index
 from .kpi_logger import log_kpis, log_episode_end, init_kpi_logger
 
 
@@ -18,9 +18,12 @@ class CityLearnSafetyEnv(gym.Env):
         self,
         base_env: Any,
         *,
-        soc_min: float = 0.1,
-        soc_max: float = 0.9,
+        #soc_min: float = 0.1,
+        #soc_max: float = 0.9
+        soc_min: float = 0.0,
+        soc_max: float = 0.95,
         soc_obs_name: str = "electrical_storage_soc",
+        cost_mode: str = "hinge",
     ):
         super().__init__()
         self.base = base_env
@@ -28,6 +31,17 @@ class CityLearnSafetyEnv(gym.Env):
         self.soc_max = float(soc_max)
         self.observation_space = base_env.observation_space
         self.action_space = base_env.action_space
+        override_mode = os.environ.get("CITYLEARN_COST_MODE")
+        if override_mode:
+            cost_mode = override_mode
+
+        cost_mode_normalized = cost_mode.lower()
+        if cost_mode_normalized not in {"hinge", "binary"}:
+            raise ValueError(
+                f"Unsupported cost_mode '{cost_mode}'. "
+                "Choose between 'hinge' (default) or 'binary'."
+            )
+        self.cost_mode = cost_mode_normalized
 
         schema_path = os.environ.get("CITYLEARN_SCHEMA")
         if not schema_path or not os.path.exists(schema_path):
@@ -60,6 +74,11 @@ class CityLearnSafetyEnv(gym.Env):
         )
         if net_consumption_idx:
             self._idx_net_consumption = net_consumption_idx[0]  # Take first building's index
+        
+        # Find indices for specific observation features
+        self._idx_month = obs_feature_index(schema_path, obs_dim, "month")
+        self._idx_day_type = obs_feature_index(schema_path, obs_dim, "day_type")
+        self._idx_non_shiftable_load = obs_feature_index(schema_path, obs_dim, "non_shiftable_load")
 
     def _ensure_kpi_logger_initialized(self):
         """Initialize KPI logger if not already done."""
@@ -110,7 +129,9 @@ class CityLearnSafetyEnv(gym.Env):
 
         # Reset KPI tracking
         self._step_count = 0
-        self._episode_count += 1
+        # NOTE: Episode counter should NOT increment on reset
+        # It will increment when episode ends (term or trunc in step())
+        # self._episode_count += 1  # REMOVED - causes double counting
 
         # Compute safety metrics
         soc_vals = self._soc_values_from_obs(obs)
@@ -160,6 +181,8 @@ class CityLearnSafetyEnv(gym.Env):
         
         # Log episode end if episode is finished
         if term or trunc:
+            # Increment episode counter when episode actually ends
+            self._episode_count += 1
             # Extract CityLearn KPIs at episode end
             citylearn_kpis = self._extract_citylearn_kpis()
             info.update(citylearn_kpis)
@@ -195,6 +218,9 @@ class CityLearnSafetyEnv(gym.Env):
             return 0.0
         low_violation = max(0.0, self.soc_min - stats["soc_min_obs"])
         high_violation = max(0.0, stats["soc_max_obs"] - self.soc_max)
+        if self.cost_mode == "binary":
+            return 1.0 if (low_violation > 0.0 or high_violation > 0.0) else 0.0
+
         band = max(1e-6, (self.soc_max - self.soc_min))
         return (low_violation + high_violation) / band
 
@@ -203,13 +229,7 @@ class CityLearnSafetyEnv(gym.Env):
         """Compute basic KPIs from current observation and action."""
         kpis = {}
         
-        # 1. Basic observation statistics
-        kpis["obs_mean"] = float(np.mean(obs))
-        kpis["obs_std"] = float(np.std(obs))
-        kpis["obs_min"] = float(np.min(obs))
-        kpis["obs_max"] = float(np.max(obs))
-        
-        # 2. Battery SoC tracking (already computed in metrics)
+        # 1. Battery SoC tracking (already computed in metrics)
         soc_vals = self._soc_values_from_obs(obs)
         if soc_vals:
             kpis["soc_mean"] = float(np.mean(soc_vals))
@@ -231,14 +251,44 @@ class CityLearnSafetyEnv(gym.Env):
         # 4. Step tracking
         kpis["step_count"] = float(self._step_count)
         
-        # 5. Net electricity consumption tracking (step-by-step)
-        # Positive = import from grid, Negative = export to grid
-        if self._idx_net_consumption is not None and self._idx_net_consumption < len(obs):
-            net_consumption_kw = obs[self._idx_net_consumption]  # kW
-            # Current step consumption: kW * hours = kWh
-            step_consumption_kwh = net_consumption_kw * self._dt_h
+        # 5. Specific observation features
+        if self._idx_month is not None and self._idx_month < len(obs):
+            kpis["month"] = float(obs[self._idx_month])
         else:
-            step_consumption_kwh = 0.0
+            kpis["month"] = 0.0
+        
+        if self._idx_day_type is not None and self._idx_day_type < len(obs):
+            kpis["day_type"] = float(obs[self._idx_day_type])
+        else:
+            kpis["day_type"] = 0.0
+        
+        if self._idx_non_shiftable_load is not None and self._idx_non_shiftable_load < len(obs):
+            # Note: This is normalized, so value is in [0, 1]
+            kpis["non_shiftable_load"] = float(obs[self._idx_non_shiftable_load])
+        else:
+            kpis["non_shiftable_load"] = 0.0
+        
+        # 6. Net electricity consumption tracking (step-by-step)
+        # Positive = import from grid, Negative = export to grid
+        # Read RAW value from building (not normalized observation) to match reward calculation
+        try:
+            citylearn_env = self.base.base
+            building = citylearn_env.buildings[0]  # First building
+            if hasattr(building, 'net_electricity_consumption') and len(building.net_electricity_consumption) > 0:
+                # Get raw net consumption in kW (not normalized)
+                net_consumption_kw = building.net_electricity_consumption[-1]
+                # Convert to kWh for this step
+                step_consumption_kwh = net_consumption_kw * self._dt_h
+            else:
+                step_consumption_kwh = 0.0
+        except Exception:
+            # Fallback to normalized observation if building access fails
+            if self._idx_net_consumption is not None and self._idx_net_consumption < len(obs):
+                # Note: This is normalized, so won't match reward exactly
+                net_consumption_kw = obs[self._idx_net_consumption]
+                step_consumption_kwh = net_consumption_kw * self._dt_h
+            else:
+                step_consumption_kwh = 0.0
         kpis["step_net_consumption_kwh"] = float(step_consumption_kwh)
         
         # 6. Electricity pricing (from CityLearn building)
@@ -296,6 +346,21 @@ class CityLearnSafetyEnv(gym.Env):
         except Exception as e:
             kpis["solar_generation_kwh"] = 0.0
         
+        # 8b. Raw non-shiftable load (if available)
+        try:
+            citylearn_env = self.base.base
+            building = citylearn_env.buildings[0]
+            
+            # Get raw load from building's non_shiftable_load attribute
+            if hasattr(building, 'non_shiftable_load') and len(building.non_shiftable_load) > 0:
+                # Raw load in kW, convert to kWh
+                load_kwh = building.non_shiftable_load[-1] * self._dt_h
+                kpis["non_shiftable_load_kwh"] = float(load_kwh)
+            else:
+                kpis["non_shiftable_load_kwh"] = 0.0
+        except Exception as e:
+            kpis["non_shiftable_load_kwh"] = 0.0
+        
         # 9. Import/Export breakdown
         # Positive net consumption = importing, negative = exporting
         if step_consumption_kwh > 0:
@@ -325,8 +390,20 @@ class CityLearnSafetyEnv(gym.Env):
             # Get CityLearn KPIs
             kpis_df = citylearn_env.evaluate()
             
-            # Extract key KPIs for Building_1 (single building setup)
-            building_name = "Building_1"
+            # Dynamically detect the building name from the results
+            # For single building setup, there should be only one unique building name
+            if 'name' in kpis_df.columns:
+                unique_buildings = kpis_df['name'].unique()
+                if len(unique_buildings) > 0:
+                    building_name = unique_buildings[0]  # Use the first (and likely only) building
+                    if len(unique_buildings) > 1:
+                        print(f"[CityLearnSafetyEnv] Warning: Multiple buildings found, using {building_name}")
+                else:
+                    building_name = "Building_1"  # Fallback
+                    print(f"[CityLearnSafetyEnv] Warning: No building names found in KPI results, using fallback")
+            else:
+                building_name = "Building_1"  # Fallback
+                print(f"[CityLearnSafetyEnv] Warning: 'name' column not found in KPI results, using fallback")
             
             # Helper function to safely extract KPI value
             def extract_kpi(cost_function_name: str) -> float:
@@ -353,7 +430,9 @@ class CityLearnSafetyEnv(gym.Env):
             citylearn_kpis['citylearn_discomfort_proportion'] = 0.0
                 
         except Exception as e:
+            import traceback
             print(f"[CityLearnSafetyEnv] Warning: Could not extract CityLearn KPIs: {e}")
+            print(f"[CityLearnSafetyEnv] Traceback: {traceback.format_exc()}")
             # Provide default values
             citylearn_kpis = {
                 'citylearn_electricity_consumption_total': 0.0,

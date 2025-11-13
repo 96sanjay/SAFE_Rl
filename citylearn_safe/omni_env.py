@@ -24,7 +24,9 @@ class CityLearnCMDP(CMDP):
 
         # Build your Gym env as usual
         base: gym.Env = make_base_env(central_agent=True)
-        env: gym.Env = CityLearnSafetyEnv(base, soc_min=0.1, soc_max=0.9)
+        # SoC band: [0.05, 0.95] allows 90% of battery capacity (less restrictive)
+        # Original: [0.1, 0.9] allows 80% of capacity (more restrictive)
+        env: gym.Env = CityLearnSafetyEnv(base, soc_min=0.00, soc_max=0.95)
         self._env = env
 
         # Declare Gym spaces

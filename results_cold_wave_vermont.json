@@ -1,0 +1,10 @@
+{
+  "rbc": {
+    "comfort_violation_rate_%": 0.0,
+    "avg_abs_deviation": 0.007728744060435192,
+    "avg_raw_deviation": 0.0,
+    "peak_power": 756.5887980461121,
+    "total_consumption": 32630.805204749107,
+    "avg_ramping": 45.74383519568914
+  }
+}

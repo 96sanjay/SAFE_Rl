@@ -1,0 +1,49 @@
+# ========================================
+# FAST TRIAL PPO-Lagrangian (5 epochs, aggressive LR)
+# Purpose: Quick verification of constraint fixes
+# Expected: Faster convergence than standard trial
+# ========================================
+
+algo: PPOLag
+env_id: CityLearnSafety-SoC-v0
+seed: 42
+
+train_cfgs:
+  total_steps: 43800        # 5 epochs
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  target_kl: 0.05
+  kl_early_stop: true
+  batch_size: 128
+  update_iters: 40           # ✅ INCREASED: 30 → 40 (more gradient steps)
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.005
+
+lagrange_cfgs:
+  cost_limit: 350.0
+  lagrangian_multiplier_init: 70.0
+  lambda_lr: 0.08            # ✅ INCREASED: 0.05 → 0.08 (faster enforcement)
+  lambda_optimizer: Adam
+
+model_cfgs:
+  actor:
+    hidden_sizes: [64, 64]
+    activation: tanh
+    lr: 0.0005               # ✅ INCREASED: 0.0003 → 0.0005
+  critic:
+    hidden_sizes: [64, 64]
+    activation: tanh
+    lr: 0.002                # ✅ INCREASED: 0.001 → 0.002
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 1
+  log_dir: ./runs/ppo_lag_TRIAL_FAST_5ep
+  window_lens: 1

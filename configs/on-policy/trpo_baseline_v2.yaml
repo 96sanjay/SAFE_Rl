@@ -1,0 +1,39 @@
+# TRPO Baseline: Unconstrained RL for comparison
+algo: TRPO
+env_id: CityLearnSafety-SoC-v0
+seed: 42
+
+train_cfgs:
+  total_steps: 437950
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 80
+  batch_size: 1024
+  target_kl: 0.02
+  cg_iters: 10
+  cg_damping: 0.1
+  obs_normalize: true
+  reward_normalize: false
+  cost_normalize: false
+  use_critic_norm: true
+  entropy_coef: 0.01
+
+model_cfgs:
+  actor:
+    hidden_sizes: [512, 512, 256]
+    activation: tanh
+    lr: 0.0003
+  critic:
+    hidden_sizes: [512, 512, 256]
+    activation: tanh
+    lr: 0.001
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 10
+  log_dir: ./runs/trpo_baseline_v2
+  window_lens: 1

@@ -4,6 +4,8 @@ import argparse, yaml
 import omnisafe
 
 import citylearn_safe.omni_env  # <-- IMPORTANT: triggers @env_register
+import citylearn_safe.omni_env_v2  # V2: forecast + EV reward + rebalanced cost
+import citylearn_safe.omni_env_v2_shield  # V2-shield: ActionProjection + CMDP
 
 def main(cfg_path: str) -> None:
     cfg = yaml.safe_load(open(cfg_path, "r"))

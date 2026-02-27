@@ -1,0 +1,410 @@
+from __future__ import annotations
+import os, time
+from typing import Any, Dict, Tuple
+import numpy as np
+import cvxpy as cp
+import gymnasium as gym
+
+from .psf_extract import unwrap_to_citylearn, flatten_action, unflatten_action
+
+
+class LookaheadPSFWrapper(gym.Wrapper):
+    """
+    Predictive Safety Filter using parametric MPC-style QP (DPP-compliant).
+    Problem compiled once, only cp.Parameter values updated each step.
+    """
+
+    def __init__(self, env, horizon: int = 24,
+                 soc_low=None, soc_high=None,
+                 p_building_max=None, p_grid_max=None,
+                 ev_efficiency: float = 0.95,
+                 w_track: float = 100.0,
+                 w_slack_c1: float = 1000.0,
+                 w_slack_c3: float = 10.0,
+                 w_slack_c4: float = 10.0,
+                 w_future_reg: float = 0.01,
+                 verbose: int = 0):
+        super().__init__(env)
+        self.horizon = horizon
+        self.soc_low = soc_low if soc_low is not None else float(os.environ.get("CITYLEARN_STEMS_SOC_LOW", "0.0"))
+        self.soc_high = soc_high if soc_high is not None else float(os.environ.get("CITYLEARN_STEMS_SOC_HIGH", "0.95"))
+        self.p_building_max = p_building_max if p_building_max is not None else float(os.environ.get("CITYLEARN_STEMS_P_BUILDING_MAX", "3.47"))
+        self.p_grid_max = p_grid_max if p_grid_max is not None else float(os.environ.get("CITYLEARN_STEMS_P_GRID_MAX", "35.76"))
+        self.ev_efficiency = ev_efficiency
+        self.w_track = w_track
+        self.w_slack_c1 = w_slack_c1
+        self.w_slack_c3 = w_slack_c3
+        self.w_slack_c4 = w_slack_c4
+        self.w_future_reg = w_future_reg
+        self.verbose = verbose
+        self._prob = None
+        self._compiled = False
+        self._mapping = None
+        self._step_count = 0
+        self._episode_count = 0
+        self._total_interventions = 0
+        self._total_ev_interventions = 0
+        self._total_batt_interventions = 0
+        self._total_grid_interventions = 0
+        self._total_solve_ms = 0.0
+        self._infeasible_count = 0
+
+    def _get_citylearn_env(self):
+        return unwrap_to_citylearn(self.env)
+
+    def _build_mapping(self):
+        city = self._get_citylearn_env()
+        names_raw = getattr(city, "action_names", [])
+        m = {"agent_dims": [], "batt_gidx": [], "ev_chargers": [], "gidx_to_building": {}}
+        g = 0
+        for b_idx, sub in enumerate(names_raw):
+            if not isinstance(sub, list):
+                sub = [sub]
+            m["agent_dims"].append(len(sub))
+            batt_found = False
+            for n in sub:
+                n_str = str(n).lower()
+                m["gidx_to_building"][g] = b_idx
+                if n_str == "electrical_storage" and not batt_found:
+                    m["batt_gidx"].append(g)
+                    batt_found = True
+                if "electric_vehicle_storage_charger_" in n_str:
+                    m["ev_chargers"].append({"gidx": g, "b_idx": b_idx})
+                g += 1
+            if not batt_found:
+                m["batt_gidx"].append(-1)
+        m["total_dim"] = g
+        return m
+
+    def _compile_qp(self):
+        """Build DPP-compliant parametric QP. All param*var products use
+        pre-computed single parameters to avoid param*param*var."""
+        city = self._get_citylearn_env()
+        self._mapping = self._build_mapping()
+        self._nb = len(city.buildings)
+        nb = self._nb
+        H = self.horizon
+        self._batt_list = [(b_idx, g) for b_idx, g in enumerate(self._mapping["batt_gidx"]) if g >= 0]
+        n_batt = len(self._batt_list)
+        self._n_batt = n_batt
+        self._max_ev = len(self._mapping["ev_chargers"])
+        n_ev = self._max_ev
+
+        self._batt_by_bldg = {}
+        for bi, (b_idx, g) in enumerate(self._batt_list):
+            self._batt_by_bldg[b_idx] = bi
+        self._ev_by_bldg = {}
+        for ei, evc in enumerate(self._mapping["ev_chargers"]):
+            self._ev_by_bldg.setdefault(evc["b_idx"], []).append(ei)
+
+        # Variables
+        self._v_a_batt = cp.Variable((n_batt, H))
+        self._v_a_ev = cp.Variable((n_ev, H)) if n_ev > 0 else None
+        self._v_slack_c3 = cp.Variable((nb, H), nonneg=True)
+        self._v_slack_c4 = cp.Variable(H, nonneg=True)
+        self._v_slack_c1 = cp.Variable(n_ev, nonneg=True) if n_ev > 0 else None
+        self._v_imp = cp.Variable((nb, H), nonneg=True)
+
+        # Parameters — all single params, no products of params in constraints
+        self._p_proposed_batt = cp.Parameter(n_batt, value=np.zeros(n_batt))
+        self._p_proposed_ev = cp.Parameter(n_ev, value=np.zeros(n_ev)) if n_ev > 0 else None
+        self._p_soc0 = cp.Parameter(n_batt, value=np.zeros(n_batt))
+        self._p_soc_scale = cp.Parameter(n_batt, value=np.ones(n_batt), pos=True)
+        self._p_base_net = cp.Parameter((nb, H), value=np.zeros((nb, H)))
+        self._p_batt_gain = cp.Parameter(n_batt, value=np.ones(n_batt), pos=True)
+        # Pre-computed: ev_gain[ei,k] = max_p * active_flag (single param, not product)
+        if n_ev > 0:
+            self._p_ev_gain = cp.Parameter((n_ev, H), value=np.zeros((n_ev, H)), nonneg=True)
+            # Pre-computed: c1_coeff[ei,k] = max_p * tau_mask * efficiency
+            self._p_ev_c1_coeff = cp.Parameter((n_ev, H), value=np.zeros((n_ev, H)), nonneg=True)
+            self._p_ev_deficit = cp.Parameter(n_ev, value=np.zeros(n_ev), nonneg=True)
+
+        constraints = []
+        constraints += [self._v_a_batt >= -1.0, self._v_a_batt <= 1.0]
+        if n_ev > 0:
+            constraints += [self._v_a_ev >= 0.0, self._v_a_ev <= 1.0]
+
+        # C2: SoC bounds — cumulative sum of actions * scale
+        for bi in range(n_batt):
+            for k in range(H):
+                soc_k = self._p_soc0[bi] + cp.sum(self._v_a_batt[bi, :k+1]) * self._p_soc_scale[bi]
+                constraints += [soc_k >= self.soc_low, soc_k <= self.soc_high]
+
+        # C3 + C4: net power per building
+        # net[b,k] = base_net[b,k] + a_batt[bi,k]*gain[bi] + sum_ev(a_ev[ei,k]*ev_gain[ei,k])
+        for b_idx in range(nb):
+            for k in range(H):
+                net_k = self._p_base_net[b_idx, k]
+                if b_idx in self._batt_by_bldg:
+                    bi = self._batt_by_bldg[b_idx]
+                    net_k = net_k + self._v_a_batt[bi, k] * self._p_batt_gain[bi]
+                if n_ev > 0:
+                    for ei in self._ev_by_bldg.get(b_idx, []):
+                        # DPP: single param * variable
+                        net_k = net_k + self._v_a_ev[ei, k] * self._p_ev_gain[ei, k]
+                # C3
+                constraints += [
+                    net_k <= self.p_building_max + self._v_slack_c3[b_idx, k],
+                    net_k >= -self.p_building_max - self._v_slack_c3[b_idx, k],
+                ]
+                # C4 import aux
+                constraints += [self._v_imp[b_idx, k] >= net_k]
+
+        # C4 grid
+        for k in range(H):
+            constraints += [cp.sum(self._v_imp[:, k]) <= self.p_grid_max + self._v_slack_c4[k]]
+
+        # C1: EV deadline — energy = sum(a_ev[ei,k] * c1_coeff[ei,k])
+        if n_ev > 0:
+            for ei in range(n_ev):
+                energy = cp.sum(cp.multiply(self._v_a_ev[ei, :], self._p_ev_c1_coeff[ei, :]))
+                constraints += [energy >= self._p_ev_deficit[ei] - self._v_slack_c1[ei]]
+
+        # Objective
+        obj = self.w_track * cp.sum_squares(self._v_a_batt[:, 0] - self._p_proposed_batt)
+        if n_ev > 0:
+            obj += self.w_track * cp.sum_squares(self._v_a_ev[:, 0] - self._p_proposed_ev)
+            obj += self.w_slack_c1 * cp.sum(self._v_slack_c1)
+        obj += self.w_slack_c3 * cp.sum(self._v_slack_c3)
+        obj += self.w_slack_c4 * cp.sum(self._v_slack_c4)
+        if H > 1:
+            obj += self.w_future_reg * cp.sum_squares(self._v_a_batt[:, 1:])
+            if n_ev > 0:
+                obj += self.w_future_reg * cp.sum_squares(self._v_a_ev[:, 1:])
+
+        self._prob = cp.Problem(cp.Minimize(obj), constraints)
+        assert self._prob.is_dpp(), "Problem must be DPP for fast parametric solves!"
+        self._compiled = True
+        if self.verbose >= 1:
+            print("[PSF-QP] Compiled DPP: %d batt, %d ev, H=%d, %d vars, %d constraints" % (
+                n_batt, n_ev, H, sum(v.size for v in self._prob.variables()),
+                len(constraints)))
+
+    def _update_params_and_solve(self, proposed_flat):
+        t0 = time.time()
+        city = self._get_citylearn_env()
+        buildings = list(getattr(city, "buildings", []))
+        H = self.horizon
+        t_now = int(getattr(city, "time_step", 0))
+        t_idx = max(0, t_now - 1)
+
+        # Battery params
+        soc0 = np.zeros(self._n_batt)
+        soc_scale = np.ones(self._n_batt)
+        batt_gain = np.ones(self._n_batt)
+        proposed_batt = np.zeros(self._n_batt)
+        for bi, (b_idx, gidx) in enumerate(self._batt_list):
+            es = getattr(buildings[b_idx], "electrical_storage", None)
+            cap = float(getattr(es, "capacity", 6.4))
+            nom_p = float(getattr(es, "nominal_power", 5.0))
+            soc_arr = np.asarray(getattr(es, "soc", []), dtype=float)
+            soc0[bi] = float(np.clip(soc_arr[t_idx], 0.0, 1.0)) if 0 <= t_idx < len(soc_arr) else 0.5
+            soc_scale[bi] = nom_p / cap
+            batt_gain[bi] = nom_p * 2.0
+            proposed_batt[bi] = float(proposed_flat[gidx])
+        self._p_soc0.value = soc0
+        self._p_soc_scale.value = soc_scale
+        self._p_batt_gain.value = batt_gain
+        self._p_proposed_batt.value = proposed_batt
+
+        # Base net forecast
+        base_net = np.zeros((self._nb, H))
+        for b_idx, b in enumerate(buildings):
+            raw_nsl = np.asarray(getattr(b, "_Building__energy_to_non_shiftable_load", []), dtype=float)
+            raw_sg = np.asarray(getattr(b, "_Building__solar_generation", []), dtype=float)
+            T_max = min(len(raw_nsl), len(raw_sg))
+            for k in range(H):
+                idx = t_now + k
+                if idx < T_max:
+                    base_net[b_idx, k] = raw_nsl[idx] + raw_sg[idx]
+                elif T_max > 0:
+                    base_net[b_idx, k] = raw_nsl[T_max-1] + raw_sg[T_max-1]
+        self._p_base_net.value = base_net
+
+        # EV params
+        if self._max_ev > 0:
+            ev_gain = np.zeros((self._max_ev, H))
+            ev_c1_coeff = np.zeros((self._max_ev, H))
+            ev_deficit = np.zeros(self._max_ev)
+            proposed_ev = np.zeros(self._max_ev)
+
+            for ei, evc in enumerate(self._mapping["ev_chargers"]):
+                b_idx = evc["b_idx"]
+                gidx = evc["gidx"]
+                b = buildings[b_idx]
+                chargers = getattr(b, "electric_vehicle_chargers", None) or []
+                ev_in_bldg = [e for e in self._mapping["ev_chargers"] if e["b_idx"] == b_idx]
+                local_idx = next((li for li, e in enumerate(ev_in_bldg) if e["gidx"] == gidx), None)
+                if local_idx is None or local_idx >= len(chargers):
+                    proposed_ev[ei] = float(proposed_flat[gidx]) if gidx < len(proposed_flat) else 0.0
+                    continue
+                ch = chargers[local_idx]
+                max_p = getattr(ch, "max_charging_power",
+                                getattr(ch, "_Charger__max_charging_power", 0))
+                if isinstance(max_p, np.ndarray):
+                    max_p = float(max_p.ravel()[0])
+                elif max_p is not None:
+                    max_p = float(max_p)
+                else:
+                    max_p = 0.0
+                proposed_ev[ei] = float(proposed_flat[gidx]) if gidx < len(proposed_flat) else 0.0
+
+                ev_obj = getattr(ch, "connected_electric_vehicle", None)
+                if ev_obj is None:
+                    continue
+
+                batt = getattr(ev_obj, "battery", None)
+                ev_soc = 0.0
+                ev_cap = 0.0
+                if batt is not None:
+                    ev_cap = float(getattr(batt, "capacity", 0) or 0)
+                    soc_data = getattr(batt, "soc", None)
+                    if soc_data is not None:
+                        soc_np = np.asarray(soc_data, dtype=float)
+                        if 0 <= t_idx < len(soc_np):
+                            ev_soc = float(np.clip(soc_np[t_idx], 0.0, 1.0))
+                req_soc = float(getattr(ch, "required_soc_departure",
+                                getattr(ch, "_Charger__required_soc_departure", 0.8)) or 0.8)
+                dep = getattr(ch, "departure_time",
+                              getattr(ch, "_Charger__departure_time", None))
+                tau = 999
+                if dep is not None and np.isfinite(dep):
+                    tau = max(0, int(dep) - t_now)
+
+                ev_deficit[ei] = max(0.0, (req_soc - ev_soc) * ev_cap)
+                for k in range(H):
+                    if k < tau:
+                        ev_gain[ei, k] = max_p
+                        ev_c1_coeff[ei, k] = max_p * self.ev_efficiency
+
+            self._p_ev_gain.value = ev_gain
+            self._p_ev_c1_coeff.value = ev_c1_coeff
+            self._p_ev_deficit.value = ev_deficit
+            self._p_proposed_ev.value = proposed_ev
+
+        # Solve
+        status = "unknown"
+        try:
+            self._prob.solve(solver=cp.OSQP, warm_start=True, verbose=False,
+                             max_iter=5000, eps_abs=1e-3, eps_rel=1e-3)
+            status = str(self._prob.status)
+        except Exception as ex:
+            status = "solve_error: %s" % str(ex)[:80]
+
+        solve_ms = (time.time() - t0) * 1000.0
+        corrected = proposed_flat.copy()
+        is_optimal = status in ("optimal", "optimal_inaccurate")
+        interventions = {"any": False, "ev": 0, "batt": 0, "grid": 0}
+
+        if is_optimal and self._v_a_batt.value is not None:
+            for bi, (b_idx, gidx) in enumerate(self._batt_list):
+                new_val = float(np.clip(self._v_a_batt.value[bi, 0], -1.0, 1.0))
+                old_val = corrected[gidx]
+                corrected[gidx] = new_val
+                if abs(new_val - old_val) > 1e-4:
+                    interventions["batt"] += 1
+                    interventions["any"] = True
+            if self._max_ev > 0 and self._v_a_ev is not None and self._v_a_ev.value is not None:
+                for ei, evc in enumerate(self._mapping["ev_chargers"]):
+                    g = evc["gidx"]
+                    if 0 <= g < len(corrected):
+                        new_val = float(np.clip(self._v_a_ev.value[ei, 0], 0.0, 1.0))
+                        old_val = corrected[g]
+                        corrected[g] = new_val
+                        if abs(new_val - old_val) > 1e-4:
+                            interventions["ev"] += 1
+                            interventions["any"] = True
+            interventions["grid"] = interventions["batt"] + interventions["ev"]
+
+        info = {"psf_active": 1.0, "psf_any_intervention": interventions["any"],
+                "psf_ev_interventions": interventions["ev"],
+                "psf_battery_interventions": interventions["batt"],
+                "psf_grid_interventions": interventions["grid"],
+                "psf_solve_ms": solve_ms, "psf_status": status,
+                "psf_infeasible": 0.0 if is_optimal else 1.0,
+                "psf_action_delta_l2": float(np.linalg.norm(corrected - proposed_flat))}
+        return corrected, info
+
+    def step(self, action):
+        if not self._compiled:
+            self._compile_qp()
+        is_multi = isinstance(self.action_space, list)
+        if is_multi:
+            action_flat = np.concatenate([np.asarray(a, dtype=float).ravel() for a in action])
+        else:
+            action_flat = np.asarray(action, dtype=float).ravel()
+        corrected_flat, psf_info = self._update_params_and_solve(action_flat)
+        if is_multi:
+            corrected_action = unflatten_action(corrected_flat, self.action_space)
+        else:
+            corrected_action = corrected_flat
+                    # --- POST_SOLVE_SOC_CLAMP (guarantee C2; keep correct action shape) ---
+                        _flat = _psf_u_arr.reshape(-1)  # view
+
+            try:
+                import os
+                SOC_LOW  = float(os.environ.get("CITYLEARN_STEMS_SOC_LOW", "0.0"))
+                SOC_HIGH = float(os.environ.get("CITYLEARN_STEMS_SOC_HIGH", "0.95"))
+
+                am = getattr(self, "_action_map", None) or getattr(self, "action_map", None) or getattr(self, "_am", None)
+                batt_gidx = list(getattr(am, "battery_gidx")) if (am is not None and hasattr(am, "battery_gidx")) else None
+                if batt_gidx is None and hasattr(self, "_batt_gidx"):
+                    batt_gidx = list(getattr(self, "_batt_gidx"))
+
+                base = self.env
+                while hasattr(base, "env") and getattr(base, "env") is not None and not hasattr(base, "buildings"):
+                    base = getattr(base, "env")
+                buildings = getattr(base, "buildings", None)
+
+                if buildings is not None and batt_gidx is not None:
+                    for bi, gidx in enumerate(batt_gidx):
+                        es = buildings[bi].electrical_storage
+                        soc_series = getattr(es, "soc", None)
+                        soc = float(soc_series[-1]) if hasattr(soc_series, "__len__") else float(soc_series)
+                        scale = float(es.nominal_power) / float(es.capacity)
+                        a_min = max((SOC_LOW  - soc) / scale, -1.0)
+                        a_max = min((SOC_HIGH - soc) / scale,  1.0)
+                        idx = int(gidx)
+                        _flat[idx] = float(min(max(_flat[idx], a_min), a_max))
+            except Exception:
+                pass
+
+            # CityLearnEnv central_agent=True expects [action_vector]
+            if _psf_u_arr.ndim == 1:
+                            else:
+                            pass
+        obs, reward, term, trunc, info = self.env.step(corrected_action)
+        info.update(psf_info)
+        self._step_count += 1
+        if psf_info.get("psf_any_intervention"):
+            self._total_interventions += 1
+        self._total_ev_interventions += psf_info.get("psf_ev_interventions", 0)
+        self._total_batt_interventions += psf_info.get("psf_battery_interventions", 0)
+        self._total_grid_interventions += psf_info.get("psf_grid_interventions", 0)
+        self._total_solve_ms += psf_info.get("psf_solve_ms", 0)
+        if psf_info.get("psf_infeasible", 0) > 0:
+            self._infeasible_count += 1
+        if self.verbose >= 1 and self._step_count % 500 == 0:
+            avg_ms = self._total_solve_ms / max(1, self._step_count)
+            print("[PSF-QP] step=%d interventions=%d infeasible=%d avg_solve=%.1fms" % (
+                self._step_count, self._total_interventions, self._infeasible_count, avg_ms))
+        return obs, reward, term, trunc, info
+
+    def reset(self, **kwargs):
+        if self._step_count > 0 and self.verbose >= 1:
+            avg_ms = self._total_solve_ms / max(1, self._step_count)
+            print("[PSF-QP] Episode done | steps=%d interventions=%d "
+                  "(ev=%d batt=%d) infeasible=%d avg_solve=%.1fms" % (
+                      self._step_count, self._total_interventions,
+                      self._total_ev_interventions, self._total_batt_interventions,
+                      self._infeasible_count, avg_ms))
+        self._step_count = 0
+        self._episode_count += 1
+        self._total_interventions = 0
+        self._total_ev_interventions = 0
+        self._total_batt_interventions = 0
+        self._total_grid_interventions = 0
+        self._total_solve_ms = 0.0
+        self._infeasible_count = 0
+        self._compiled = False
+        return self.env.reset(**kwargs)

@@ -1,0 +1,957 @@
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional, Callable
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# 1. Unwrapping helpers + generic SoC tools (UNCHANGED from V2)
+# ---------------------------------------------------------------------------
+
+def unwrap_to_raw_citylearn_env(env: Any) -> Any:
+    """Follow .base / .env / .unwrapped links until we hit the raw CityLearnEnv-like object."""
+    seen = set()
+    e = env
+    while True:
+        if id(e) in seen:
+            break
+        seen.add(id(e))
+
+        if hasattr(e, "base"):
+            e = e.base
+            continue
+        if hasattr(e, "env"):
+            e = e.env
+            continue
+        if hasattr(e, "unwrapped"):
+            try:
+                e = e.unwrapped
+                continue
+            except Exception:
+                pass
+        break
+    return e
+
+
+def battery_soc_list(base_env: Any) -> List[float]:
+    """Return SoC (0..1) for every building-level electricity storage, if any."""
+    env = unwrap_to_raw_citylearn_env(base_env)
+    socs: List[float] = []
+    for b in getattr(env, "buildings", []):
+        es = getattr(b, "electrical_storage", None)
+        if es is None:
+            es = getattr(b, "electricity_storage", None)
+        if es is not None and hasattr(es, "soc"):
+            try:
+                socs.append(float(es.soc))
+            except Exception:
+                pass
+    return socs
+
+
+def battery_soc_stats(base_env: Any) -> Dict[str, float]:
+    socs = battery_soc_list(base_env)
+    if not socs:
+        return {
+            "soc_mean": 0.5,
+            "soc_min_obs": 0.5,
+            "soc_max_obs": 0.5,
+            "num_storages": 0.0,
+        }
+    return {
+        "soc_mean": float(sum(socs) / len(socs)),
+        "soc_min_obs": float(min(socs)),
+        "soc_max_obs": float(max(socs)),
+        "num_storages": float(len(socs)),
+    }
+
+
+def current_time_index(base_env: Any) -> int:
+    """
+    Return the index in battery.soc that represents the *current* SoC.
+
+    CityLearn stores SoC as a time series. After each step, the new value
+    is written at index (time_step - 1). At reset (time_step = 0), the
+    current value is at index 0.
+    """
+    env = unwrap_to_raw_citylearn_env(base_env)
+    t = int(getattr(env, "time_step", 0))
+    return 0 if t <= 0 else t - 1
+
+
+def ev_soc_by_charger(base_env: Any) -> Dict[Tuple[str, str], float]:
+    """
+    Return a dict mapping (building_name, charger_name) -> current EV SoC (0..1),
+    for all chargers that currently have a connected EV.
+    """
+    env = unwrap_to_raw_citylearn_env(base_env)
+    t = current_time_index(env)
+    out: Dict[Tuple[str, str], float] = {}
+
+    for b in getattr(env, "buildings", []):
+        bname = getattr(b, "name", "UNKNOWN_BUILDING")
+        chargers = getattr(b, "electric_vehicle_chargers", [])
+        for ch in chargers or []:
+            cname = getattr(ch, "name", getattr(ch, "charger_id", "UNKNOWN_CHARGER"))
+            ev = getattr(ch, "connected_electric_vehicle", None)
+            if ev is None:
+                continue
+            batt = getattr(ev, "battery", None)
+            if batt is None or not hasattr(batt, "soc"):
+                continue
+            try:
+                arr = getattr(batt, "soc")
+                soc_t = float(arr[t])
+                out[(bname, cname)] = soc_t
+            except Exception:
+                continue
+
+    return out
+
+
+def ev_soc_by_name(base_env: Any) -> Dict[str, float]:
+    """Return a dict mapping EV.name -> current SoC (0..1) for all connected EVs."""
+    env = unwrap_to_raw_citylearn_env(base_env)
+    t = current_time_index(env)
+    out: Dict[str, float] = {}
+
+    for b in getattr(env, "buildings", []):
+        chargers = getattr(b, "electric_vehicle_chargers", [])
+        for ch in chargers or []:
+            ev = getattr(ch, "connected_electric_vehicle", None)
+            if ev is None:
+                continue
+            name = getattr(ev, "name", "EV_UNKNOWN")
+            batt = getattr(ev, "battery", None)
+            if batt is None or not hasattr(batt, "soc"):
+                continue
+            try:
+                arr = getattr(batt, "soc")
+                soc_t = float(arr[t])
+                out[str(name)] = soc_t
+            except Exception:
+                continue
+
+    return out
+
+
+def ev_soc_stats(base_env: Any) -> Dict[str, float]:
+    """Aggregate stats over all connected EVs' current SoC."""
+    vals = list(ev_soc_by_name(base_env).values())
+    if not vals:
+        return {
+            "ev_soc_mean": 0.5,
+            "ev_soc_min": 0.5,
+            "ev_soc_max": 0.5,
+            "num_evs": 0.0,
+        }
+    return {
+        "ev_soc_mean": float(sum(vals) / len(vals)),
+        "ev_soc_min": float(min(vals)),
+        "ev_soc_max": float(max(vals)),
+        "num_evs": float(len(vals)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 1.5 Small normalization helpers (NEW, used for robust mapping + oracle evaluator)
+# ---------------------------------------------------------------------------
+
+def _norm_id(x: Any) -> str:
+    if isinstance(x, (bytes, np.bytes_)):
+        x = x.decode("utf-8", errors="ignore")
+    s = str(x).strip()
+    if s.startswith("b'") and s.endswith("'"):
+        s = s[2:-1]
+    return s.strip()
+
+
+def _normalize_action_names(names: Any) -> List[str]:
+    """Flatten CityLearn style action_names into a simple list of strings."""
+    if isinstance(names, list) and len(names) == 1 and isinstance(names[0], list):
+        names = names[0]
+    if not isinstance(names, list):
+        return []
+    return [str(n) for n in names]
+
+
+def _build_ev_action_index_by_charger_id(action_names: Any) -> Dict[str, int]:
+    """
+    Build mapping charger_id -> action_index using action_names.
+    Works with names like 'electric_vehicle_storage_charger_0', etc.
+
+    Convention used elsewhere in your RBC:
+      action name suffix -> charger_id 'charger_<suffix>'
+    """
+    names = _normalize_action_names(action_names)
+    out: Dict[str, int] = {}
+    for idx, n in enumerate(names):
+        s = str(n).strip().lower()
+        key = "electric_vehicle_storage_charger_"
+        if key in s:
+            suffix = s.split(key, 1)[1]
+            charger_id = f"charger_{suffix}"
+            out[charger_id] = idx
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 2. EV departure KPI internals - V3: ACTION-BASED VERSION
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EVDepartureRecordV3:
+    """
+    Per-departure data at the current time step.
+
+    V3: Uses AGENT ACTIONS to compute agent-controllable deficits.
+    Key insight: If action < 1.0, deficit is controllable. If action = 1.0, it's not.
+
+    NOTE:
+      - 'deficit_uncontrollable' here is a *residual after blame assignment*,
+        not the simulator-feasibility minimum. For feasibility-minimum,
+        use ORACLE evaluation via counterfactual rollout (added at bottom).
+    """
+    ev_id: str
+    charger_id: str
+    time_step: int
+    required_soc: float
+    actual_soc: float
+    arrival_soc: float
+    capacity_kwh: float
+    deficit_actual: float
+    deficit_agent_controllable: float  # V3: Based on actions
+    deficit_uncontrollable: float      # V3: Residual when action=1.0 but still deficit
+    # Legacy V2 fields (for comparison)
+    deficit_agent_controllable_v2: float
+    deficit_uncontrollable_v2: float
+    # Diagnostics (NEW)
+    missing_action_samples: int = 0     # count of tau where action not found in actions_history
+
+    # --- NEW V3 diagnostics (V2G-aware split) ---
+    v3_missed_charge_soc: float = 0.0     # sum over window: (1 - clip(a,0,1)) * Pmax*dt/cap
+    v3_discharge_harm_soc: float = 0.0   # sum over window: max(0,-a) * Pmax*dt/cap
+    v3_total_blame_soc: float = 0.0      # missed_charge + discharge_harm
+
+
+def _get_dt_hours(env: Any) -> Optional[float]:
+    seconds_per_step = getattr(env, "seconds_per_time_step", None)
+    if seconds_per_step is None:
+        return None
+    try:
+        return float(seconds_per_step) / 3600.0
+    except Exception:
+        return None
+
+
+def _normalize_ev_id(x: Any) -> Optional[str]:
+    if isinstance(x, (bytes, np.bytes_)):
+        return x.decode("utf-8", errors="ignore")
+    if isinstance(x, str):
+        return x
+    return None
+
+
+def _is_valid_ev_id(x: Any) -> bool:
+    name = _normalize_ev_id(x)
+    return bool(name)
+
+
+def _get_charger_pmax_kw(ch: Any) -> Optional[float]:
+    p = getattr(ch, "max_charging_power", None)
+    if p is None:
+        p = getattr(ch, "_Charger__max_charging_power", None)
+
+    if isinstance(p, np.ndarray):
+        p = float(p.reshape(-1)[0])
+    elif p is not None:
+        p = float(p)
+
+    return p
+
+
+def _get_charger_electricity_consumption(ch: Any) -> Optional[np.ndarray]:
+    """Get electricity_consumption time series (actual delivered kW) - for V2 compatibility."""
+    ec = getattr(ch, "electricity_consumption", None)
+    if ec is None:
+        ec = getattr(ch, "_Charger__electricity_consumption", None)
+
+    if ec is not None:
+        return np.asarray(ec, dtype=float)
+    return None
+
+
+def _collect_ev_meta(env: Any) -> Dict[str, Dict[str, Any]]:
+    """Map EV id/name -> {'cap_kwh', 'soc_series'}."""
+    ev_by_name: Dict[str, Dict[str, Any]] = {}
+
+    for ev in getattr(env, "electric_vehicles", []):
+        name = getattr(ev, "name", None)
+        if name is None:
+            name = getattr(ev, "_ElectricVehicle__name", None)
+        if isinstance(name, (bytes, np.bytes_)):
+            name = name.decode("utf-8", errors="ignore")
+        if not isinstance(name, str):
+            continue
+
+        batt = getattr(ev, "battery", None)
+        if batt is None:
+            batt = getattr(ev, "_ElectricVehicle__battery", None)
+
+        cap_kwh = None
+        soc_series = None
+        if batt is not None:
+            cap_kwh = getattr(batt, "capacity", None)
+            if cap_kwh is None:
+                cap_kwh = getattr(batt, "_EnergyStorage__capacity", None)
+
+            soc_series = getattr(batt, "soc", None)
+            if soc_series is None:
+                soc_series = getattr(batt, "_EnergyStorage__soc", None)
+
+        if isinstance(cap_kwh, np.ndarray):
+            cap_kwh = float(cap_kwh.reshape(-1)[0])
+        elif cap_kwh is not None:
+            cap_kwh = float(cap_kwh)
+
+        if soc_series is not None:
+            soc_series = np.asarray(soc_series, dtype=float)
+        else:
+            soc_series = None
+
+        ev_by_name[name] = {"cap_kwh": cap_kwh, "soc_series": soc_series}
+
+    return ev_by_name
+
+
+def _get_ev_soc_at_index(
+    ev_by_name: Dict[str, Dict[str, Any]],
+    ev_name: str,
+    t_soc_idx: int
+) -> Optional[float]:
+    """Return EV battery.soc[t_soc_idx] if available and finite."""
+    info = ev_by_name.get(ev_name)
+    if info is None:
+        return None
+    series = info.get("soc_series")
+    if series is None:
+        return None
+    series = np.asarray(series, dtype=float)
+    if series.ndim != 1 or not (0 <= t_soc_idx < series.shape[0]):
+        return None
+    v = float(series[t_soc_idx])
+    if not np.isfinite(v):
+        return None
+    return float(np.clip(v, 0.0, 1.0))
+
+
+def _iter_chargers(env: Any) -> List[Any]:
+    chargers: List[Any] = []
+    for b in getattr(env, "buildings", []):
+        chs = getattr(b, "electric_vehicle_chargers", None)
+        if chs is None:
+            chs = getattr(b, "_Building__electric_vehicle_chargers", None)
+        if chs:
+            chargers.extend(chs)
+    return chargers
+
+
+def _get_charger_sim(ch: Any) -> Optional[Any]:
+    sim = getattr(ch, "charger_simulation", None)
+    if sim is None:
+        sim = getattr(ch, "_Charger__charger_simulation", None)
+    return sim
+
+
+def _extract_arrival_soc_at_state_2(
+    sim: Any,
+    start: int,
+    end: int,
+    ev_name: str,
+    state: np.ndarray,
+    ev_id: np.ndarray,
+    arr_soc_raw: np.ndarray
+) -> float:
+    """
+    V3: Extract arrival SOC at state=2 (arrival event).
+
+    State values:
+      1 = EV connected
+      2 = EV arrival event (THIS is where arrival_soc is filled!)
+      3 = EV away
+    """
+    arrival_soc = None
+
+    for tau in range(start, end + 1):
+        if tau >= len(state):
+            break
+
+        if float(state[tau]) == 2.0:
+            if tau < len(arr_soc_raw):
+                soc_val = float(arr_soc_raw[tau])
+                if np.isfinite(soc_val) and soc_val > 0:
+                    arrival_soc = soc_val
+                    break
+
+    if arrival_soc is None or not np.isfinite(arrival_soc) or arrival_soc < 0:
+        arrival_soc = 0.0
+
+    return float(np.clip(arrival_soc, 0.0, 1.0))
+
+
+def _ev_departure_records_v3(
+    env: Any,
+    actions_history: Dict[int, Dict[int, float]],
+    *,
+    missing_action_mode: str = "assume_full"
+) -> List[EVDepartureRecordV3]:
+    """
+    V3: ACTION-BASED agent-controllable deficit calculation.
+
+    missing_action_mode:
+      - "assume_full" (default): keep your original behavior (missing -> action=1.0)
+      - "assume_zero": missing -> action=0.0 (blame agent; aggressive)
+      - "error": raise if any action is missing for a connected timestep
+    """
+    # Keep a handle to wrapper env for action_names mapping
+    env_wrapper = env
+    action_names = getattr(env_wrapper, "action_names", None)
+    ev_action_idx_by_charger = _build_ev_action_index_by_charger_id(action_names) if action_names is not None else {}
+
+    env = unwrap_to_raw_citylearn_env(env)
+    t_state = int(getattr(env, "time_step", 0))
+    if t_state < 0:
+        t_state = 0
+
+    t_soc = current_time_index(env)
+    dt_hours = _get_dt_hours(env)
+
+    # --- FIX: dt_hours fallback (CityLearn challenge is hourly) ---
+    if dt_hours is None:
+        dt_hours = 1.0
+    ev_by_name = _collect_ev_meta(env)
+    chargers = _iter_chargers(env)
+
+    if not chargers or not ev_by_name:
+        return []
+
+    records: List[EVDepartureRecordV3] = []
+
+    for ch in chargers:
+        sim = _get_charger_sim(ch)
+        if sim is None:
+            continue
+
+        state = np.asarray(getattr(sim, "_electric_vehicle_charger_state"), dtype=float)
+        dep_time = np.asarray(getattr(sim, "_electric_vehicle_departure_time"), dtype=float)
+        req_soc = np.asarray(getattr(sim, "_electric_vehicle_required_soc_departure"), dtype=float)
+        ev_id = np.asarray(getattr(sim, "_electric_vehicle_id"))
+        arr_soc_raw = np.asarray(getattr(sim, "_electric_vehicle_estimated_soc_arrival"), dtype=float)
+
+        if state.ndim != 1 or t_state >= state.shape[0]:
+            continue
+
+        s_state = float(state[t_state])
+        d = float(dep_time[t_state])
+        r = float(req_soc[t_state])
+        e = ev_id[t_state]
+
+        if not (np.isfinite(s_state) and np.isfinite(d) and np.isfinite(r)):
+            continue
+        if not _is_valid_ev_id(e):
+            continue
+        if not (s_state == 1.0 and d <= 0.0):
+            continue
+
+        name = _normalize_ev_id(e)
+        if name is None:
+            continue
+
+        ev_info = ev_by_name.get(name)
+        if ev_info is None:
+            continue
+
+        cap_kwh = ev_info.get("cap_kwh")
+        soc_series = ev_info.get("soc_series")
+        p_max_kw = _get_charger_pmax_kw(ch)
+
+        elec_consumption = _get_charger_electricity_consumption(ch)
+
+        # Actual SOC at departure
+        if soc_series is not None:
+            soc_series_arr = np.asarray(soc_series, dtype=float)
+            if soc_series_arr.ndim == 1 and 0 <= t_soc < soc_series_arr.shape[0]:
+                s_actual = float(np.clip(soc_series_arr[t_soc], 0.0, 1.0))
+            else:
+                s_actual = 0.0
+        else:
+            s_actual = 0.0
+
+        deficit_actual = max(0.0, r - s_actual)
+
+        # Find connection window
+        end = t_state
+        start = end
+        for tau in range(end, -1, -1):
+            if float(state[tau]) == 3.0:
+                break
+            name_tau = _normalize_ev_id(ev_id[tau])
+            if name_tau != name:
+                break
+            start = tau
+
+        arrival_soc = _extract_arrival_soc_at_state_2(
+            sim, start, end, name, state, ev_id, arr_soc_raw
+        )
+
+        # ---------------- V3: ACTION-BASED CALCULATION ----------------
+        agent_controllable_v3 = 0.0
+        uncontrollable_v3 = deficit_actual
+        missing_samples = 0
+
+        # --- NEW V3 diagnostics accumulators (always defined) ---
+        total_missed_charge_soc = 0.0
+        total_discharge_harm_soc = 0.0
+        total_blame_soc = 0.0
+
+        actions_ok = (
+            dt_hours is not None
+            and cap_kwh is not None
+            and cap_kwh > 0.0
+            and p_max_kw is not None
+            and p_max_kw > 0.0
+            and actions_history is not None
+        )
+
+        if actions_ok and deficit_actual > 0.0:
+            # robust charger_id -> action index mapping
+            charger_id = _norm_id(getattr(ch, "charger_id", getattr(ch, "name", "UNKNOWN_CHARGER")))
+            charger_action_idx = ev_action_idx_by_charger.get(charger_id)
+
+            # fallback: if mapping not found, keep old behavior by skipping controllable calc
+            if charger_action_idx is not None:
+                controllable_start = start + 1
+                controllable_end = end
+
+                if controllable_start <= controllable_end:
+                    # --- NEW V3 diagnostics accumulators ---
+                    total_missed_charge_soc = 0.0
+                    total_discharge_harm_soc = 0.0
+                    total_blame_soc = 0.0
+
+                    # --- OLD accumulator (kept for rollback/debug) ---
+                    # total_missed_soc = 0.0
+
+                    for tau in range(controllable_start, controllable_end + 1):
+                        if float(state[tau]) != 1.0:
+                            continue
+                        e_tau = ev_id[tau]
+                        if not _is_valid_ev_id(e_tau):
+                            continue
+                        name_tau = _normalize_ev_id(e_tau)
+                        if name_tau != name:
+                            continue
+
+                        # Fetch action value
+                        have = (tau in actions_history and charger_action_idx in actions_history[tau])
+                        if have:
+                            action_val = float(actions_history[tau][charger_action_idx])
+                        else:
+                            missing_samples += 1
+                            if missing_action_mode == "assume_full":
+                                action_val = 1.0
+                            elif missing_action_mode == "assume_zero":
+                                action_val = 0.0
+                            elif missing_action_mode == "error":
+                                raise RuntimeError(
+                                    f"Missing action for tau={tau}, charger_action_idx={charger_action_idx}, charger_id={charger_id}"
+                                )
+                            else:
+                                action_val = 1.0
+
+                        # ========== V3 (V2G-AWARE) BLAME BREAKDOWN ==========
+                        # Separate charge-request vs discharge-request for clarity.
+                        # charge_req in [0,1]    : requested CHARGE fraction
+                        # discharge_req in [0,1] : requested DISCHARGE fraction
+                        charge_req = min(1.0, max(0.0, action_val))
+                        discharge_req = max(0.0, -action_val)
+
+                        # Missed charging opportunity (charge-only component)
+                        missed_charge_kw = (1.0 - charge_req) * p_max_kw
+                        missed_charge_soc = (missed_charge_kw * dt_hours) / cap_kwh
+                        total_missed_charge_soc += missed_charge_soc
+
+                        # Discharge harm (V2G component)
+                        discharge_kw = discharge_req * p_max_kw
+                        discharge_harm_soc = (discharge_kw * dt_hours) / cap_kwh
+                        total_discharge_harm_soc += discharge_harm_soc
+
+                        # Total blame (kept for backward-compatibility with old scalar notion)
+                        total_blame_soc += (missed_charge_soc + discharge_harm_soc)
+
+                        # ------------------------------------------------------------------
+                        # OLD V3 LOGIC (kept for rollback/debug)
+                        # ------------------------------------------------------------------
+                        # Missed opportunity if action < 1
+                        # if action_val < 1.0:
+                        #     missed_power_kw = (1.0 - action_val) * p_max_kw  # type: ignore[operator]
+                        #     missed_energy_kwh = missed_power_kw * dt_hours  # type: ignore[operator]
+                        #     missed_soc = missed_energy_kwh / cap_kwh  # type: ignore[operator]
+                        #     total_missed_soc += missed_soc
+
+                    agent_controllable_v3 = min(total_blame_soc, deficit_actual)
+                    uncontrollable_v3 = deficit_actual - agent_controllable_v3
+
+                    # OLD:
+                    # agent_controllable_v3 = min(total_missed_soc, deficit_actual)
+                    # uncontrollable_v3 = deficit_actual - agent_controllable_v3
+
+        # ---------------- V2: ELECTRICITY-BASED (for comparison) ----------------
+        agent_controllable_v2 = 0.0
+        uncontrollable_v2 = deficit_actual
+
+        v2_ok = (
+            dt_hours is not None
+            and cap_kwh is not None
+            and cap_kwh > 0.0
+            and elec_consumption is not None
+        )
+
+        if v2_ok and deficit_actual > 0.0:
+            controllable_start = start + 1
+            controllable_end = end
+
+            if controllable_start <= controllable_end:
+                total_energy_kwh = 0.0
+                for tau in range(controllable_start, controllable_end + 1):
+                    if tau >= len(elec_consumption):  # type: ignore[arg-type]
+                        break
+                    if float(state[tau]) != 1.0:
+                        continue
+                    e_tau = ev_id[tau]
+                    if not _is_valid_ev_id(e_tau):
+                        continue
+                    name_tau = _normalize_ev_id(e_tau)
+                    if name_tau != name:
+                        continue
+
+                    power_kw = float(elec_consumption[tau])  # type: ignore[index]
+                    energy_kwh = power_kw * dt_hours  # type: ignore[operator]
+                    total_energy_kwh += energy_kwh
+
+                max_delta_soc_actual = total_energy_kwh / cap_kwh  # type: ignore[operator]
+                start_soc_idx = 0 if start <= 0 else start - 1
+                s_start = _get_ev_soc_at_index(ev_by_name, name, start_soc_idx)
+
+                if s_start is not None:
+                    s_max_achievable = min(1.0, float(s_start) + max(0.0, float(max_delta_soc_actual)))
+                    uncontrollable_v2 = max(0.0, r - s_max_achievable)
+                    uncontrollable_v2 = min(uncontrollable_v2, deficit_actual)
+                    agent_controllable_v2 = max(0.0, deficit_actual - uncontrollable_v2)
+
+        record = EVDepartureRecordV3(
+            ev_id=name,
+            charger_id=_norm_id(getattr(ch, "charger_id", getattr(ch, "name", "UNKNOWN_CHARGER"))),
+            time_step=t_state,
+            required_soc=float(np.clip(r, 0.0, 1.0)),
+            actual_soc=s_actual,
+            arrival_soc=arrival_soc,
+            capacity_kwh=float(cap_kwh) if cap_kwh is not None else float("nan"),
+            deficit_actual=float(deficit_actual),
+            deficit_agent_controllable=float(agent_controllable_v3),
+            deficit_uncontrollable=float(uncontrollable_v3),
+            deficit_agent_controllable_v2=float(agent_controllable_v2),
+            deficit_uncontrollable_v2=float(uncontrollable_v2),
+            missing_action_samples=int(missing_samples),
+            # --- NEW diagnostics (V2G-aware split) ---
+            v3_missed_charge_soc=float(total_missed_charge_soc),
+            v3_discharge_harm_soc=float(total_discharge_harm_soc),
+            v3_total_blame_soc=float(total_blame_soc),
+        )
+        records.append(record)
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# 3. Public EV KPI interfaces - V3: ACTION-BASED VERSION (UNCHANGED outputs)
+# ---------------------------------------------------------------------------
+
+def ev_departure_cost_components_v3(
+    citylearn_env: Any,
+    actions_history: Dict[int, Dict[int, float]],
+    *,
+    missing_action_mode: str = "assume_full"
+) -> Dict[str, float]:
+    """
+    V3: Aggregate EV departure SoC deficits using ACTION-BASED classification.
+
+    Returns BOTH V3 metrics (action-based) AND V2 metrics for comparison.
+
+    NOTE: This does NOT compute oracle (simulator-feasibility minimum).
+          Oracle is a separate evaluation procedure (see bottom).
+    """
+    records = _ev_departure_records_v3(citylearn_env, actions_history, missing_action_mode=missing_action_mode)
+
+    total_deficit = float(sum(r.deficit_actual for r in records))
+
+    total_agent_controllable_v3 = float(sum(r.deficit_agent_controllable for r in records))
+    total_uncontrollable_v3 = float(sum(r.deficit_uncontrollable for r in records))
+
+    total_agent_controllable_v2 = float(sum(r.deficit_agent_controllable_v2 for r in records))
+    total_uncontrollable_v2 = float(sum(r.deficit_uncontrollable_v2 for r in records))
+
+    n_dep = int(len(records))
+    missing_samples = int(sum(r.missing_action_samples for r in records))
+
+    # --- NEW V3 diagnostics totals ---
+    total_v3_missed_charge_soc = float(sum(getattr(r, 'v3_missed_charge_soc', 0.0) for r in records))
+    total_v3_discharge_harm_soc = float(sum(getattr(r, 'v3_discharge_harm_soc', 0.0) for r in records))
+    total_v3_total_blame_soc = float(sum(getattr(r, 'v3_total_blame_soc', 0.0) for r in records))
+
+    return {
+        "total": total_deficit,
+        "agent_controllable": total_agent_controllable_v3,
+        "uncontrollable": total_uncontrollable_v3,
+        "agent_controllable_v2": total_agent_controllable_v2,
+        "uncontrollable_v2": total_uncontrollable_v2,
+        "departures": n_dep,
+        "missing_action_samples": float(missing_samples),
+        "v3_missed_charge_soc": total_v3_missed_charge_soc,
+        "v3_discharge_harm_soc": total_v3_discharge_harm_soc,
+        "v3_total_blame_soc": total_v3_total_blame_soc,
+    }
+
+
+def ev_departure_safe_cost_v3(
+    citylearn_env: Any,
+    actions_history: Dict[int, Dict[int, float]],
+    *,
+    quadratic: bool = True,
+    scale_by_capacity_kwh: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    missing_action_mode: str = "assume_full"
+) -> float:
+    """
+    V3: Scalar safety cost for Safe RL based on ACTION-BASED EV departure deficits.
+    Uses deficit_agent_controllable only (training signal).
+    """
+    records = _ev_departure_records_v3(citylearn_env, actions_history, missing_action_mode=missing_action_mode)
+    if not records:
+        return 0.0
+
+    xs: List[float] = []
+    for r in records:
+        d = max(0.0, float(r.deficit_agent_controllable))
+
+        if d <= 0.0:
+            continue
+
+        if scale_by_capacity_kwh and np.isfinite(r.capacity_kwh) and r.capacity_kwh > 0.0:
+            x = d * float(r.capacity_kwh)
+        else:
+            x = d
+        xs.append(x)
+
+    if not xs:
+        return 0.0
+
+    xs_arr = np.asarray(xs, dtype=float)
+    if quadratic:
+        cost = alpha * float(xs_arr.sum()) + beta * float((xs_arr ** 2).sum())
+    else:
+        cost = alpha * float(xs_arr.sum())
+
+    return float(cost)
+
+
+# ---------------------------------------------------------------------------
+# 4. ORACLE EVALUATION (NEW): counterfactual rollout for simulator-unavoidable
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RolloutEVSummary:
+    steps: int
+    departures_total: int
+    deficit_departure_rows: int
+    avoidable_component_rows: int
+    unavoidable_component_rows: int
+    overlap_rows: int
+
+    deficit_kwh_total: float
+    deficit_kwh_avoidable: float
+    deficit_kwh_unavoidable: float
+
+    cost_total: float
+    cost_building_soc: float
+    cost_ev_departure: float
+    cost_ev_controllable: float
+    cost_ev_uncontrollable: float
+
+    citylearn_last: Dict[str, float]
+
+
+def _oracle_connected_now(raw_env: Any, charger_id: str) -> bool:
+    """Return True if the given charger has an EV connected right now."""
+    t_state = int(getattr(raw_env, "time_step", 0))
+    if t_state < 0:
+        t_state = 0
+
+    for b in getattr(raw_env, "buildings", []) or []:
+        for ch in getattr(b, "electric_vehicle_chargers", []) or []:
+            cid = _norm_id(getattr(ch, "charger_id", getattr(ch, "name", "")))
+            if cid != charger_id:
+                continue
+            sim = getattr(ch, "charger_simulation", getattr(ch, "_Charger__charger_simulation", None))
+            if sim is None:
+                return False
+            try:
+                state = np.asarray(getattr(sim, "_electric_vehicle_charger_state"), dtype=float)
+                ev_id = np.asarray(getattr(sim, "_electric_vehicle_id"))
+            except Exception:
+                return False
+            if state.ndim != 1 or t_state >= len(state):
+                return False
+            st = float(state[t_state])
+            eid = ev_id[t_state]
+            return (st == 1.0) and _is_valid_ev_id(eid)
+    return False
+
+
+def run_policy_and_oracle_rollouts(
+    make_env: Callable[[], Any],
+    policy_action_fn: Callable[[Any, Any, Any], np.ndarray],
+    *,
+    seed: int = 42,
+) -> Tuple[RolloutEVSummary, RolloutEVSummary]:
+    """
+    Evaluation helper:
+      - policy rollout uses policy_action_fn
+      - oracle rollout uses same policy_action_fn, but forces EV actions to 1.0 when connected
+
+    Requirements:
+      - env returned by make_env must have .reset(seed=...) and .step(action)
+      - env must expose .action_names compatible with CityLearn naming
+      - env's step info dict contains the same keys you used in CSV analysis:
+          ev_departure_departures, ev_departure_deficit_kwh, ev_avoidable_deficit_kwh, ev_unavoidable_deficit_kwh,
+          cost, cost_building_soc, cost_ev_departure, cost_ev_departure_agent_controllable_v3, cost_ev_departure_uncontrollable_v3,
+          citylearn_* KPIs (optional)
+    """
+
+    def _rollout(use_oracle: bool) -> RolloutEVSummary:
+        env = make_env()
+        obs, info = env.reset(seed=seed)
+
+        # FIX: Get action_names from unwrapped env
+        raw_env = unwrap_to_raw_citylearn_env(env)
+        action_names = _normalize_action_names(getattr(raw_env, "action_names", []))
+        ev_idx_by_charger = _build_ev_action_index_by_charger_id(action_names)
+
+        sums = {
+            "ev_departure_departures": 0.0,
+            "ev_departure_deficit_kwh": 0.0,
+            "ev_avoidable_deficit_kwh": 0.0,
+            "ev_unavoidable_deficit_kwh": 0.0,
+            "cost": 0.0,
+            "cost_building_soc": 0.0,
+            "cost_ev_departure": 0.0,
+            "cost_ev_departure_agent_controllable_v3": 0.0,
+            "cost_ev_departure_uncontrollable_v3": 0.0,
+        }
+
+        city_cols = [
+            "citylearn_electricity_consumption_total",
+            "citylearn_carbon_emissions_total",
+            "citylearn_cost_total",
+            "citylearn_zero_net_energy",
+            "citylearn_discomfort_proportion",
+            "citylearn_ramping_average",
+            "citylearn_daily_peak_average",
+            "citylearn_all_time_peak_average",
+        ]
+        last_city: Dict[str, float] = {}
+
+        counts = {"def": 0, "a": 0, "u": 0}
+
+        done = False
+        steps = 0
+        while not done:
+            action = policy_action_fn(obs, info, env)
+            action = np.asarray(action, dtype=np.float32).copy()
+
+            if use_oracle:
+                raw = unwrap_to_raw_citylearn_env(env)
+                for charger_id, a_idx in ev_idx_by_charger.items():
+                    if 0 <= a_idx < len(action) and _oracle_connected_now(raw, charger_id):
+                        action[a_idx] = 1.0
+
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = bool(terminated or truncated)
+            steps += 1
+
+            for k in sums:
+                if k in info:
+                    sums[k] += float(info[k])
+
+            d = float(info.get("ev_departure_deficit_kwh", 0.0) or 0.0)
+            a = float(info.get("ev_avoidable_deficit_kwh", 0.0) or 0.0)
+            u = float(info.get("ev_unavoidable_deficit_kwh", 0.0) or 0.0)
+            if d > 1e-9: counts["def"] += 1
+            if a > 1e-9: counts["a"] += 1
+            if u > 1e-9: counts["u"] += 1
+
+            for c in city_cols:
+                if c in info:
+                    last_city[c] = float(info[c])
+
+        dep_total = int(round(sums["ev_departure_departures"]))
+        overlap = counts["a"] + counts["u"] - counts["def"]
+
+        return RolloutEVSummary(
+            steps=steps,
+            departures_total=dep_total,
+            deficit_departure_rows=int(counts["def"]),
+            avoidable_component_rows=int(counts["a"]),
+            unavoidable_component_rows=int(counts["u"]),
+            overlap_rows=int(overlap),
+
+            deficit_kwh_total=float(sums["ev_departure_deficit_kwh"]),
+            deficit_kwh_avoidable=float(sums["ev_avoidable_deficit_kwh"]),
+            deficit_kwh_unavoidable=float(sums["ev_unavoidable_deficit_kwh"]),
+
+            cost_total=float(sums["cost"]),
+            cost_building_soc=float(sums["cost_building_soc"]),
+            cost_ev_departure=float(sums["cost_ev_departure"]),
+            cost_ev_controllable=float(sums["cost_ev_departure_agent_controllable_v3"]),
+            cost_ev_uncontrollable=float(sums["cost_ev_departure_uncontrollable_v3"]),
+
+            citylearn_last=last_city,
+        )
+
+    policy = _rollout(use_oracle=False)
+    oracle = _rollout(use_oracle=True)
+    return policy, oracle
+
+
+def summarize_oracle_gap(policy: RolloutEVSummary, oracle: RolloutEVSummary) -> Dict[str, float]:
+    """
+    Convenience: compute policy-vs-oracle gap.
+
+    - simulator_unavoidable_kwh = oracle.deficit_kwh_total
+    - avoidable_wrt_oracle_kwh = policy.deficit_kwh_total - oracle.deficit_kwh_total (clipped at >=0)
+    - avoidable_fraction = avoidable_wrt_oracle_kwh / policy.deficit_kwh_total
+    """
+    pol = float(policy.deficit_kwh_total)
+    orc = float(oracle.deficit_kwh_total)
+    avoid = max(0.0, pol - orc)
+    frac = (avoid / pol) if pol > 0 else 0.0
+    return {
+        "policy_deficit_kwh": pol,
+        "oracle_deficit_kwh": orc,
+        "avoidable_wrt_oracle_kwh": avoid,
+        "avoidable_wrt_oracle_fraction": float(frac),
+    }

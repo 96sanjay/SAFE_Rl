@@ -1,0 +1,69 @@
+# RCPO V2: Aggressive Safety with SGD Lambda
+# Target: <5% violations per constraint
+# Key improvements over PPOLag:
+#   - RCPO algorithm (better safety guarantees)
+#   - Lower cost_limit (20k vs 45k)
+#   - SGD for lambda (stable constraint handling)
+#   - Higher lambda_lr (faster response to violations)
+#   - Larger batch size (1024 for stability)
+algo: RCPO
+env_id: CityLearnSafety-SoC-v0
+seed: 42
+
+train_cfgs:
+  total_steps: 875900          # 100 epochs × 8759 steps
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 80
+  batch_size: 1024             # ← LARGER: More stable gradients
+  
+  # Trust region (like TRPO)
+  target_kl: 0.02              # Conservative policy updates
+  cg_iters: 10
+  cg_damping: 0.1
+  
+  # Normalization
+  obs_normalize: true
+  reward_normalize: false      # Keep interpretable
+  cost_normalize: false
+  
+  # Regularization
+  use_critic_norm: true
+  use_cost_critic_norm: true
+  entropy_coef: 0.01           # Exploration
+
+lagrange_cfgs:
+  cost_limit: 10000            # ← AGGRESSIVE: vs your 57k current
+  # If violations still >10%: try 15000
+  # If violations <5%: SUCCESS!
+  
+  lagrangian_multiplier_init: 1.0   # Start low, let it grow
+  lambda_lr: 0.05                    # ← HIGHER: React faster to violations
+  lambda_optimizer: SGD              # ← CRITICAL: Stable constraint handling
+
+model_cfgs:
+  # Deep network for 153-dim observation
+  actor:
+    hidden_sizes: [512, 512, 256]
+    activation: tanh           # Standard for policy gradient
+    lr: 0.0003                 # Adam (adaptive for actor)
+  
+  critic:
+    hidden_sizes: [512, 512, 256]
+    activation: tanh
+    lr: 0.001                  # Adam (faster value learning)
+  
+  cost_critic:
+    hidden_sizes: [512, 512, 256]
+    activation: tanh
+    lr: 0.001                  # Adam (cost value estimation)
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5           # Save more frequently
+  log_dir: ./runs/rcpo_aggressive_v2
+  window_lens: 1

@@ -1,0 +1,6 @@
+config,steps,reward,C1_pct,C1_violations,C1_departures,C1_deficit_kwh,C2_pct,C2_violations,C3_pct,C3_violations,C4_pct,C4_violations
+FOCOPS-100ep,1000,-43.3,47.66,153,321,154.71,34.88,5929,29.61,5034,12.9,129
+,,,,,,,,,,,,
+,,,,,,,,,,,,
+,,,,,,,,,,,,
+"P_net(b,t)  =  P_load(b,t)  −  P_solar(b,t)  +  P_batt(b,t)  +  P_ev(b,t)",,,,,,,,,,,,

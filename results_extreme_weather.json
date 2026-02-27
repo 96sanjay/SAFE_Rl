@@ -1,0 +1,28 @@
+{
+  "heat_wave": {
+    "rbc": {
+      "cost": 12.176464534848272,
+      "emission": 133.36259279967106,
+      "peak": 15.444056034088135,
+      "consumption": 318.68751584738493,
+      "ramping": 2.572859806493974,
+      "comfort_violation_rate_%": 88.88888888888887,
+      "safety_violations_%": 91.66666666666667,
+      "avg_tin": 25.05539505054854,
+      "avg_comfort_deviation": 0.6554345103137995
+    }
+  },
+  "cold_wave": {
+    "rbc": {
+      "cost": 5.24638506538232,
+      "emission": 73.29207804554996,
+      "peak": 9.730212926864624,
+      "consumption": 146.73456342611462,
+      "ramping": 1.6643751634048745,
+      "comfort_violation_rate_%": 80.55555555555556,
+      "safety_violations_%": 83.33333333333334,
+      "avg_tin": 23.43432250580953,
+      "avg_comfort_deviation": 0.555396073508489
+    }
+  }
+}

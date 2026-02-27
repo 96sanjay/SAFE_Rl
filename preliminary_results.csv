@@ -1,0 +1,8 @@
+Metric,Cost-Only Reward,Bill-Based Reward
+Initial Cost,2805.50,2805.50
+Final Cost (Epoch 35),1368.26,1328.09
+Cost Reduction,1437.24,1477.40
+Reduction %,51.2%,52.7%
+Lambda (Final),11.13,11.12
+Final Return,-28050.12,-20738.39
+Epochs Trained,85,35

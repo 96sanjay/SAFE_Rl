@@ -1,0 +1,904 @@
+
+"""
+V3: CityLearnSafetyEnv with Action-Based EV Deficit Calculation (UPDATED, SAFE VERSION)
+
+Key fixes included in this version:
+✅ Action clipping to env.action_space.low/high (per-dimension; action_2 is [0,1])
+✅ NO double-step bug (self.base.step called exactly once)
+✅ EV actions stored aligned with extractor tau = (pre-step time_step + 1)
+✅ EV logging stable: action_ev_0..7 always present even if fewer chargers exist
+✅ Reset logging no longer crashes if < 8 EV chargers
+✅ Keeps your bill-based reward + KPI logging logic intact
+
+Env vars:
+- CITYLEARN_EV_MISSING_ACTION_MODE: "assume_full" | "assume_zero" | "error"
+- CITYLEARN_EXPORT_FACTOR: float (default 1.0)
+- CITYLEARN_REWARD_SCALE: float (default 1.0)
+- CITYLEARN_EV_COST_SCALE: float (default 1.0)
+- CITYLEARN_KPI_FLUSH_EVERY_STEP: 1 to flush every step (debug)
+- CITYLEARN_KPI_RUN_NAME: override KPI filename prefix (default CityLearnSafety_kpis_v3)
+- CITYLEARN_DEBUG_ACTION_CLIP: 1 to print clip diagnostics every N steps
+- CITYLEARN_DEBUG_ACTION_CLIP_EVERY: integer (default 500)
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import gymnasium as gym
+
+from .schema_index import build_index
+from .kpi_logger import log_kpis, log_episode_end, init_kpi_logger
+from citylearn_safe.extractors_v3 import ev_departure_cost_components_v3
+
+
+class CityLearnSafetyEnvV3(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        base_env: Any,
+        *,
+        soc_min: float = 0.0,
+        soc_max: float = 0.95,
+        cost_mode: str = "hinge",
+        include_ev_in_cost: bool = True,
+    ):
+        super().__init__()
+        self.base = base_env
+        self.soc_min = float(soc_min)
+        self.soc_max = float(soc_max)
+
+        # From the agent's POV, look exactly like base_env.
+        self.observation_space = base_env.observation_space
+        self.action_space = base_env.action_space
+
+        override_mode = os.environ.get("CITYLEARN_COST_MODE")
+        if override_mode:
+            cost_mode = override_mode
+
+        cost_mode_normalized = cost_mode.lower()
+        if cost_mode_normalized not in {"hinge", "binary"}:
+            raise ValueError(
+                f"Unsupported cost_mode '{cost_mode}'. Choose between 'hinge' or 'binary'."
+            )
+        self.cost_mode = cost_mode_normalized
+
+        # Toggle: should EV deficit contribute to CMDP "cost" for OmniSafe?
+        self.include_ev_in_cost = (
+            bool(include_ev_in_cost)
+            if include_ev_in_cost is not None
+            else bool(int(os.environ.get("CITYLEARN_INCLUDE_EV_COST", "1")))
+        )
+
+        # 1 hour per step (CityLearn challenge is hourly)
+        self._dt_h = 1.0
+
+        # --- Grid Peak Constraint (operational safety) ---
+        self.peak_threshold = 96.10  # kW (calibrated from RBC 97th percentile)
+        self.w_grid_peak = 0.05      # Weight for peak cost
+
+        # --- Grid Ramp Constraint (smoothness / grid stability) ---
+        self.ramp_threshold = 48.41  # kW/hour (calibrated from RBC 97th percentile)
+        self.w_grid_ramp = 0.05      # Weight for ramp cost
+        self._prev_grid_signal = None
+        self._prev_net_consumption = None  # For ramping penalty in STEMS reward
+
+        # Track actions per timestep per charger-action-index
+        # NOTE: keys MUST match the "tau" indices used by extractor (CityLearn time_step index)
+        self._actions_history: Dict[int, Dict[int, float]] = {}
+
+        # Discover EV charger action indices
+        self._ev_charger_action_indices: List[int] = self._discover_ev_action_indices()
+
+        # How to treat missing action samples in extractor
+        self._missing_action_mode = os.environ.get(
+            "CITYLEARN_EV_MISSING_ACTION_MODE", "assume_full"
+        ).strip().lower()
+        if self._missing_action_mode not in {"assume_full", "assume_zero", "error"}:
+            print(
+                f"[CityLearnSafetyEnvV3] Warning: invalid CITYLEARN_EV_MISSING_ACTION_MODE={self._missing_action_mode}, using assume_full"
+            )
+            self._missing_action_mode = "assume_full"
+
+        # --- Deterministic obs indices (ONLY for KPI/debug; may be dead/zero under wrappers) ---
+        self._obs_index = None
+        self._soc_idx_obs: List[int] = []
+        self._idx_net_consumption_obs = None
+        self._idx_non_shiftable_load_obs = None
+        self._idx_month_cos = None
+        self._idx_month_sin = None
+        self._idx_day_type_cos = None
+        self._idx_day_type_sin = None
+        self._idx_hour_cos = None
+        self._idx_hour_sin = None
+
+        try:
+            self._obs_index = build_index(self.base, expected_buildings=17)
+            self._soc_idx_obs = list(self._obs_index.electrical_storage_soc)
+            self._idx_net_consumption_obs = self._obs_index.net_electricity_consumption[0]  # building_1
+            self._idx_non_shiftable_load_obs = self._obs_index.non_shiftable_load[0]
+            self._idx_month_cos = self._obs_index.month_cos
+            self._idx_month_sin = self._obs_index.month_sin
+            self._idx_day_type_cos = self._obs_index.day_type_cos
+            self._idx_day_type_sin = self._obs_index.day_type_sin
+            self._idx_hour_cos = self._obs_index.hour_cos
+            self._idx_hour_sin = self._obs_index.hour_sin
+        except Exception:
+            self._obs_index = None
+
+        # --- KPI + episode tracking ---
+        self._step_count = 0
+        self._episode_count = 0
+        self._kpi_logger_initialized = False
+
+        # Debug toggle: include obs-vs-state comparisons in info
+        self._debug_obs_vs_state = bool(int(os.environ.get("CITYLEARN_DEBUG_OBS_VS_STATE", "0")))
+
+        # Debug action clipping
+        self._debug_action_clip = bool(int(os.environ.get("CITYLEARN_DEBUG_ACTION_CLIP", "0")))
+        self._debug_action_clip_every = int(os.environ.get("CITYLEARN_DEBUG_ACTION_CLIP_EVERY", "500"))
+
+        print("[CityLearnSafetyEnvV3] Initialized (V3 action-based EV deficits)")
+        print(f"[CityLearnSafetyEnvV3] EV action indices (from action_names): {self._ev_charger_action_indices}")
+        print(f"[CityLearnSafetyEnvV3] Missing action mode: {self._missing_action_mode}")
+
+    # -------------------------------------------------------------------------
+    # Discover EV indices robustly from action_names
+    # -------------------------------------------------------------------------
+    def _discover_ev_action_indices(self) -> List[int]:
+        names = None
+        try:
+            names = getattr(self.base, "action_names", None)
+        except Exception:
+            names = None
+
+        if names is None:
+            citylearn_env = self._get_citylearn_env()
+            names = getattr(citylearn_env, "action_names", None) if citylearn_env is not None else None
+
+        # flatten if needed
+        if isinstance(names, list) and len(names) == 1 and isinstance(names[0], list):
+            names = names[0]
+
+        if not isinstance(names, list) or len(names) == 0:
+            raise RuntimeError("[CityLearnSafetyEnvV3] Could not read action_names to discover EV indices.")
+
+        names_l = [str(n).lower() for n in names]
+        ev_idx = [i for i, n in enumerate(names_l) if "electric_vehicle_storage_charger_" in n]
+
+        if len(ev_idx) == 0:
+            raise RuntimeError("No EV chargers found in action space")
+        return ev_idx
+
+    # -------------------------------------------------------------------------
+    # Robust unwrapping helper
+    # -------------------------------------------------------------------------
+    def _get_citylearn_env(self):
+        """Best-effort unwrap down to an object that exposes .buildings and .time_step."""
+        cur = self.base
+        seen = set()
+
+        for _ in range(40):
+            if cur is None:
+                break
+            obj_id = id(cur)
+            if obj_id in seen:
+                break
+            seen.add(obj_id)
+
+            try:
+                blds = getattr(cur, "buildings", None)
+                ts = getattr(cur, "time_step", None)
+                if blds is not None and hasattr(blds, "__len__") and len(blds) > 0 and ts is not None:
+                    return cur
+            except Exception:
+                pass
+
+            advanced = False
+            for attr in ("base", "env", "unwrapped", "_env", "raw_env"):
+                if hasattr(cur, attr):
+                    nxt = getattr(cur, attr, None)
+                    if nxt is not None and nxt is not cur:
+                        cur = nxt
+                        advanced = True
+                        break
+            if not advanced:
+                break
+
+        return None
+
+    # -------------------------------------------------------------------------
+    # Store actions under the extractor's tau index
+    # -------------------------------------------------------------------------
+    def _store_actions_at(self, tau: int, action: np.ndarray):
+        action_flat = np.asarray(action, dtype=float).ravel()
+
+        if tau not in self._actions_history:
+            self._actions_history[tau] = {}
+
+        for a_idx in self._ev_charger_action_indices:
+            if 0 <= a_idx < len(action_flat):
+                self._actions_history[tau][a_idx] = float(action_flat[a_idx])
+
+    # -------------------------------------------------------------------------
+    # KPI logger init
+    # -------------------------------------------------------------------------
+    def _ensure_kpi_logger_initialized(self):
+        if self._kpi_logger_initialized:
+            return
+
+        log_dir = os.path.join(os.getcwd(), "runs", "kpi_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        run_name = os.environ.get("CITYLEARN_KPI_RUN_NAME", "CityLearnSafety_kpis_v3").strip()
+        if not run_name:
+            run_name = "CityLearnSafety_kpis_v3"
+
+        init_kpi_logger(log_dir, run_name)
+        self._kpi_logger_initialized = True
+        print(f"[CityLearnSafetyEnvV3] KPI logger initialized in: {log_dir} (run_name={run_name})")
+
+    # -------------------------------------------------------------------------
+    # Gym API: reset / step
+    # -------------------------------------------------------------------------
+    def reset(self, *, seed: int | None = None, options: Dict | None = None):
+        self._ensure_kpi_logger_initialized()
+
+        obs, info = self.base.reset(seed=seed, options=options)
+        obs = np.asarray(obs, dtype=np.float32)
+
+        self._step_count = 0
+        self._actions_history.clear()
+
+        citylearn_env = self._get_citylearn_env()
+
+        soc_state_vals = self._soc_values_from_state(citylearn_env)
+        metrics = self._soc_metrics(soc_state_vals)
+        building_cost = self._soc_band_cost(metrics)
+
+        dummy_action = np.zeros((int(np.prod(self.action_space.shape)),), dtype=float)
+        kpis = self._compute_basic_kpis(obs, dummy_action)
+
+        info = dict(info)
+        info["metrics"] = metrics
+
+        # CMDP cost at reset: 0.0
+        info["cost"] = 0.0
+        info["cost_building_soc"] = float(building_cost)
+        info["cost_ev_departure"] = 0.0
+
+        # Grid peak/ramp defaults
+        info["cost_grid_peak"] = 0.0
+        info["cost_grid_peak_raw"] = 0.0
+        info["grid_peak_violation"] = 0.0
+
+        info["cost_grid_ramp"] = 0.0
+        info["cost_grid_ramp_raw"] = 0.0
+        info["grid_ramp_delta"] = 0.0
+        info["grid_ramp_violation"] = 0.0
+
+        self._prev_grid_signal = None
+
+        # EV defaults
+        info["cost_ev_departure_agent_controllable_v3"] = 0.0
+        info["cost_ev_departure_uncontrollable_v3"] = 0.0
+        info["cost_ev_departure_agent_controllable_v2"] = 0.0
+        info["cost_ev_departure_uncontrollable_v2"] = 0.0
+        info["ev_departure_departures"] = 0
+        info["ev_missing_action_samples"] = 0.0
+
+        info.update(kpis)
+
+        # Advanced KPI defaults
+        info["ev_departure_deficit_kwh"] = 0.0
+        info["ev_avoidable_deficit_kwh"] = 0.0
+        info["ev_unavoidable_deficit_kwh"] = 0.0
+
+        info["ev_v3_missed_charge_soc"] = 0.0
+        info["ev_v3_discharge_harm_soc"] = 0.0
+        info["ev_v3_total_blame_soc"] = 0.0
+        info["ev_impossible_request_count"] = 0.0
+
+        info["battery_abuse_kwh"] = 0.0
+        info["battery_abuse_excess_kwh_equiv"] = 0.0
+        info["battery_abuse_hours"] = 0.0
+        info["solar_waste_kwh"] = 0.0
+
+        info["reward"] = 0.0
+        info["citylearn_reward"] = 0.0
+        info["used_energy_reward"] = False
+
+        # Bill reward metadata
+        info["reward_bill_raw"] = 0.0
+        info["reward_export_factor"] = float(os.environ.get("CITYLEARN_EXPORT_FACTOR", "1.0"))
+        info["reward_scale"] = float(os.environ.get("CITYLEARN_REWARD_SCALE", "1.0"))
+
+        # Stable action_0..25
+        for i in range(26):
+            info[f"action_{i}"] = float(dummy_action[i]) if i < len(dummy_action) else 0.0
+
+        # Stable action_ev_0..7 (safe even if fewer EVs exist)
+        n_ev = len(self._ev_charger_action_indices)
+        for j in range(min(8, n_ev)):
+            idx = self._ev_charger_action_indices[j]
+            info[f"action_ev_{j}"] = float(dummy_action[idx]) if (0 <= idx < len(dummy_action)) else 0.0
+        for j in range(min(8, n_ev), 8):
+            info[f"action_ev_{j}"] = 0.0
+
+        if self._debug_obs_vs_state:
+            info.update(self._debug_soc_obs_vs_state(obs, citylearn_env))
+
+        log_kpis(info, self._step_count, self._episode_count)
+        return obs, info
+
+    def step(self, action):
+        self._ensure_kpi_logger_initialized()
+
+        # --- raw -> clipped action (per-dim bounds; action_2 is [0,1]) ---
+        action_raw = np.asarray(action, dtype=float).ravel()
+        low = np.asarray(self.action_space.low, dtype=float).ravel()
+        high = np.asarray(self.action_space.high, dtype=float).ravel()
+        action_arr = np.clip(action_raw, low, high)
+
+        if self._debug_action_clip and (self._step_count % self._debug_action_clip_every == 0):
+            clip_frac = float(np.mean((action_raw < low) | (action_raw > high)))
+            print(
+                f"[ACTION CLIP] step={self._step_count} clip_frac={clip_frac:.3f} "
+                f"raw_min={float(action_raw.min()):.2f} raw_max={float(action_raw.max()):.2f}"
+            )
+
+        # --- Align tau with extractor (pre-step time_step + 1) ---
+        citylearn_env_before = self._get_citylearn_env()
+        t_before = int(getattr(citylearn_env_before, "time_step", 0)) if citylearn_env_before is not None else 0
+        tau_store = t_before + 1
+        self._store_actions_at(tau_store, action_arr)
+
+        # --- SINGLE STEP ONLY ONCE ---
+        obs, r_base, term, trunc, info = self.base.step(action_arr)
+        obs = np.asarray(obs, dtype=np.float32)
+        self._step_count += 1
+        info = dict(info)
+
+        # Per-dim action logging (stable 26 dims)
+        for i in range(26):
+            info[f"action_{i}"] = float(action_arr[i]) if i < len(action_arr) else 0.0
+
+        # EV action logging (stable 8 columns)
+        n_ev = len(self._ev_charger_action_indices)
+        for j in range(min(8, n_ev)):
+            idx = self._ev_charger_action_indices[j]
+            info[f"action_ev_{j}"] = float(action_arr[idx]) if (0 <= idx < len(action_arr)) else 0.0
+        for j in range(min(8, n_ev), 8):
+            info[f"action_ev_{j}"] = 0.0
+
+        citylearn_env = self._get_citylearn_env()
+
+        # --- Safety cost from INTERNAL building battery SoC (logged only) ---
+        soc_state_vals = self._soc_values_from_state(citylearn_env)
+        metrics = self._soc_metrics(soc_state_vals)
+        building_cost = self._soc_band_cost(metrics)
+
+        # --- KPIs ---
+        kpis = self._compute_basic_kpis(obs, action_arr)
+
+        # --- Bill-based reward ($) ---
+        bill = 0.0
+        export_factor = float(os.environ.get("CITYLEARN_EXPORT_FACTOR", "1.0"))
+        reward_scale = float(os.environ.get("CITYLEARN_REWARD_SCALE", "1.0"))
+
+        reward = None
+        used_energy_reward = False
+
+        try:
+            if citylearn_env is not None:
+                idx = self._state_time_index(citylearn_env)
+
+                total_kw = 0.0
+                for b in getattr(citylearn_env, "buildings", []):
+                    nec = getattr(b, "net_electricity_consumption", None)
+                    if nec is not None and hasattr(nec, "__len__") and len(nec) > idx:
+                        total_kw += float(nec[idx])
+
+                b0 = citylearn_env.buildings[0]
+                try:
+                    ep = b0.pricing.electricity_pricing
+                    current_price = float(ep[idx]) if hasattr(ep, "__len__") and len(ep) > idx else 0.17
+                except Exception:
+                    current_price = 0.17
+
+                if not np.isfinite(current_price) or current_price < 0:
+                    current_price = 0.17
+
+                step_net_kwh = float(total_kw) * self._dt_h
+                import_kwh = max(0.0, step_net_kwh)
+                export_kwh = max(0.0, -step_net_kwh)
+
+                bill = (import_kwh * current_price) - (export_factor * export_kwh * current_price)
+                reward = -reward_scale * bill
+                used_energy_reward = True
+
+                if not np.isfinite(reward):
+                    print(
+                        f"[WARNING] Non-finite reward: {reward}, import_kwh={import_kwh}, "
+                        f"export_kwh={export_kwh}, price={current_price}, bill={bill}"
+                    )
+                    reward = 0.0
+        except Exception:
+            reward = None
+
+        # fallback to base reward if bill reward failed
+        if reward is None:
+            reward = float(np.sum(r_base)) if isinstance(r_base, (list, tuple, np.ndarray)) else float(r_base)
+
+        # --- EV departure deficit (V3 + V2 for comparison) ---
+        ev_cost_components = {
+            "total": 0.0,
+            "agent_controllable": 0.0,
+            "uncontrollable": 0.0,
+            "agent_controllable_v2": 0.0,
+            "uncontrollable_v2": 0.0,
+            "departures": 0,
+            "missing_action_samples": 0.0,
+        }
+        try:
+            if citylearn_env is not None:
+                ev_cost_components = ev_departure_cost_components_v3(
+                    citylearn_env,
+                    self._actions_history,
+                    missing_action_mode=self._missing_action_mode,
+                ) or ev_cost_components
+        except Exception as e:
+            print(f"[CityLearnSafetyEnvV3] Warning: Could not compute EV costs: {e}")
+
+        ev_total = float(ev_cost_components.get("total", 0.0))
+        ev_agent_control_v3 = float(ev_cost_components.get("agent_controllable", 0.0))
+        ev_uncontrol_v3 = float(ev_cost_components.get("uncontrollable", 0.0))
+        ev_agent_control_v2 = float(ev_cost_components.get("agent_controllable_v2", 0.0))
+        ev_uncontrol_v2 = float(ev_cost_components.get("uncontrollable_v2", 0.0))
+        ev_deps = int(ev_cost_components.get("departures", 0) or 0)
+        missing_samples = float(ev_cost_components.get("missing_action_samples", 0.0) or 0.0)
+
+        # V3 diagnostics
+        v3_missed_charge_soc = float(ev_cost_components.get("v3_missed_charge_soc", 0.0) or 0.0)
+        v3_discharge_harm_soc = float(ev_cost_components.get("v3_discharge_harm_soc", 0.0) or 0.0)
+        v3_total_blame_soc = float(ev_cost_components.get("v3_total_blame_soc", 0.0) or 0.0)
+
+        # --- Battery abuse + solar waste ---
+        adv = self._compute_battery_solar_kpis(citylearn_env)
+        battery_abuse_kwh = float(adv.get("battery_abuse_kwh", 0.0))
+        solar_waste_kwh = float(adv.get("solar_waste_kwh", 0.0))
+        battery_abuse_hours = float(adv.get("battery_abuse_hours", 0.0))
+        battery_abuse_excess = float(adv.get("battery_abuse_excess_kwh_equiv", 0.0))
+
+        # --- CMDP cost: scaled EV controllable component (V3) ---
+        ev_cost_scale = float(os.environ.get("CITYLEARN_EV_COST_SCALE", "1.0"))
+        ev_cost_for_cmdp = (ev_cost_scale * ev_agent_control_v3) if self.include_ev_in_cost else 0.0
+
+        info["cost_ev_departure_avoidable"] = float(ev_cost_scale * ev_agent_control_v3)
+        info["cost_ev_departure_unavoidable"] = float(ev_cost_scale * ev_uncontrol_v3)
+
+        # --- Grid Peak Cost ---
+        grid_import = float(kpis.get("grid_import_kwh", 0.0))
+        cost_grid_peak_raw = max(0.0, grid_import - self.peak_threshold)
+        cost_grid_peak = self.w_grid_peak * cost_grid_peak_raw
+
+        info["cost_grid_peak"] = float(cost_grid_peak)
+        info["cost_grid_peak_raw"] = float(cost_grid_peak_raw)
+        info["grid_peak_violation"] = 1.0 if cost_grid_peak_raw > 0 else 0.0
+
+        # --- Grid Ramp Cost ---
+        p_signal = float(kpis.get("step_net_consumption_kwh", 0.0))
+        if self._prev_grid_signal is None:
+            ramp_delta = 0.0
+            cost_grid_ramp_raw = 0.0
+        else:
+            ramp_delta = abs(p_signal - float(self._prev_grid_signal))
+            cost_grid_ramp_raw = max(0.0, ramp_delta - self.ramp_threshold)
+
+        self._prev_grid_signal = p_signal
+        cost_grid_ramp = self.w_grid_ramp * cost_grid_ramp_raw
+
+        info["cost_grid_ramp"] = float(cost_grid_ramp)
+        info["cost_grid_ramp_raw"] = float(cost_grid_ramp_raw)
+        info["grid_ramp_delta"] = float(ramp_delta)
+        info["grid_ramp_violation"] = 1.0 if cost_grid_ramp_raw > 0 else 0.0
+
+        total_cost = float(ev_cost_for_cmdp + cost_grid_peak + cost_grid_ramp)
+
+        info["ev_cost_scale"] = float(ev_cost_scale)
+        info["metrics"] = metrics
+
+        info["cost"] = float(total_cost)
+        info["cost_building_soc"] = float(building_cost)
+        info["cost_ev_departure"] = float(ev_cost_for_cmdp)
+
+        info["cost_ev_departure_agent_controllable_v3"] = float(ev_agent_control_v3)
+        info["cost_ev_departure_uncontrollable_v3"] = float(ev_uncontrol_v3)
+        info["cost_ev_departure_agent_controllable_v2"] = float(ev_agent_control_v2)
+        info["cost_ev_departure_uncontrollable_v2"] = float(ev_uncontrol_v2)
+        info["ev_departure_departures"] = int(ev_deps)
+        info["ev_missing_action_samples"] = float(missing_samples)
+
+        info.update(kpis)
+
+        info["ev_departure_deficit_kwh"] = float(ev_total)
+        info["ev_avoidable_deficit_kwh"] = float(ev_agent_control_v3)
+        info["ev_unavoidable_deficit_kwh"] = float(ev_uncontrol_v3)
+
+        info["ev_v3_missed_charge_soc"] = float(v3_missed_charge_soc)
+        info["ev_v3_discharge_harm_soc"] = float(v3_discharge_harm_soc)
+        info["ev_v3_total_blame_soc"] = float(v3_total_blame_soc)
+        info["ev_impossible_request_count"] = 1.0 if ev_uncontrol_v3 > 0 else 0.0
+
+        info["battery_abuse_kwh"] = float(battery_abuse_kwh)
+        info["battery_abuse_excess_kwh_equiv"] = float(battery_abuse_excess)
+        info["battery_abuse_hours"] = float(battery_abuse_hours)
+        info["solar_waste_kwh"] = float(solar_waste_kwh)
+
+        info["reward"] = float(reward)
+        info["citylearn_reward"] = (
+            float(np.sum(r_base)) if isinstance(r_base, (list, tuple, np.ndarray)) else float(r_base)
+        )
+        info["used_energy_reward"] = bool(used_energy_reward)
+
+        # bill reward metadata always defined
+        info["reward_bill_raw"] = float(bill)
+        info["reward_export_factor"] = float(export_factor)
+        info["reward_scale"] = float(reward_scale)
+
+        if self._debug_obs_vs_state:
+            info.update(self._debug_soc_obs_vs_state(obs, citylearn_env))
+
+        log_kpis(info, self._step_count, self._episode_count)
+
+        # Episode end KPIs
+        if term or trunc:
+            citylearn_kpis = self._extract_citylearn_kpis()
+            info.update(citylearn_kpis)
+            log_episode_end(info, self._episode_count)
+            self._episode_count += 1
+
+        return obs, float(reward), bool(term), bool(trunc), info
+
+    # -------------------------------------------------------------------------
+    # INTERNAL SoC helpers (truth)
+    # -------------------------------------------------------------------------
+    def _state_time_index(self, env) -> int:
+        if env is None:
+            return 0
+        t = getattr(env, "time_step", 0)
+        return max(0, int(t) - 1)
+
+    def _soc_values_from_state(self, env) -> List[float]:
+        if env is None or not getattr(env, "buildings", None):
+            return []
+
+        t_idx = self._state_time_index(env)
+        out: List[float] = []
+
+        for b in env.buildings:
+            soc_val = 0.0
+            try:
+                es = getattr(b, "electrical_storage", None)
+                soc = getattr(es, "soc", None) if es is not None else None
+
+                if soc is None:
+                    soc_val = 0.0
+                elif hasattr(soc, "__len__") and len(soc) > t_idx:
+                    soc_val = float(soc[t_idx])
+                elif np.isscalar(soc):
+                    soc_val = float(soc)
+                else:
+                    soc_val = 0.0
+
+                if not np.isfinite(soc_val):
+                    soc_val = 0.0
+
+                soc_val = float(np.clip(soc_val, 0.0, 1.0))
+            except Exception:
+                soc_val = 0.0
+
+            out.append(soc_val)
+
+        return out
+
+    def _soc_values_from_obs(self, obs: np.ndarray) -> List[float]:
+        vals: List[float] = []
+        if not self._soc_idx_obs:
+            return vals
+        for idx in self._soc_idx_obs:
+            if 0 <= idx < obs.shape[0]:
+                vals.append(float(obs[idx]))
+        return vals
+
+    def _soc_metrics(self, vals: List[float]) -> Dict[str, float]:
+        if not vals:
+            return {"soc_mean": 0.5, "soc_min_obs": 0.5, "soc_max_obs": 0.5, "num_storages": 0.0}
+        return {
+            "soc_mean": float(np.mean(vals)),
+            "soc_min_obs": float(np.min(vals)),
+            "soc_max_obs": float(np.max(vals)),
+            "num_storages": float(len(vals)),
+        }
+
+    def _soc_band_cost(self, stats: Dict[str, float]) -> float:
+        if stats.get("num_storages", 0.0) <= 0.0:
+            return 0.0
+
+        low_violation = max(0.0, self.soc_min - stats["soc_min_obs"])
+        high_violation = max(0.0, stats["soc_max_obs"] - self.soc_max)
+
+        if self.cost_mode == "binary":
+            return 1.0 if (low_violation > 0.0 or high_violation > 0.0) else 0.0
+
+        band = max(1e-6, (self.soc_max - self.soc_min))
+        return (low_violation + high_violation) / band
+
+    def _debug_soc_obs_vs_state(self, obs: np.ndarray, env) -> Dict[str, float]:
+        obs_vals = self._soc_values_from_obs(obs)
+        state_vals = self._soc_values_from_state(env)
+
+        d: Dict[str, float] = {}
+        d["debug_obs_soc_min"] = float(np.min(obs_vals)) if obs_vals else 0.0
+        d["debug_obs_soc_max"] = float(np.max(obs_vals)) if obs_vals else 0.0
+        d["debug_obs_soc_mean"] = float(np.mean(obs_vals)) if obs_vals else 0.0
+
+        d["debug_state_soc_min"] = float(np.min(state_vals)) if state_vals else 0.0
+        d["debug_state_soc_max"] = float(np.max(state_vals)) if state_vals else 0.0
+        d["debug_state_soc_mean"] = float(np.mean(state_vals)) if state_vals else 0.0
+        return d
+
+    # -------------------------------------------------------------------------
+    # Advanced KPIs: Battery abuse + Solar waste (district totals)
+    # -------------------------------------------------------------------------
+    def _compute_battery_solar_kpis(self, env) -> Dict[str, float]:
+        kpis = {
+            "battery_abuse_kwh": 0.0,
+            "battery_abuse_excess_kwh_equiv": 0.0,
+            "battery_abuse_hours": 0.0,
+            "solar_waste_kwh": 0.0,
+        }
+        if env is None or not getattr(env, "buildings", None):
+            return kpis
+
+        t_idx = self._state_time_index(env)
+        any_abuse = False
+
+        for b in env.buildings:
+            es = getattr(b, "electrical_storage", None)
+
+            if es is not None:
+                try:
+                    soc_data = getattr(es, "soc", None)
+                    cap = float(getattr(es, "capacity", 0.0) or 0.0)
+
+                    if soc_data is None:
+                        soc = 0.0
+                    elif hasattr(soc_data, "__len__") and len(soc_data) > t_idx:
+                        soc = float(soc_data[t_idx])
+                    elif np.isscalar(soc_data):
+                        soc = float(soc_data)
+                    else:
+                        soc = 0.0
+
+                    if np.isfinite(soc) and soc > 0.95 and cap > 0.0:
+                        excess = (soc - 0.95) * cap
+                        kpis["battery_abuse_kwh"] += excess
+                        kpis["battery_abuse_excess_kwh_equiv"] += excess
+                        any_abuse = True
+                except Exception:
+                    pass
+
+            try:
+                nec = getattr(b, "net_electricity_consumption", None)
+                if nec is None:
+                    net_grid = 0.0
+                elif hasattr(nec, "__len__") and len(nec) > t_idx:
+                    net_grid = float(nec[t_idx])
+                elif np.isscalar(nec):
+                    net_grid = float(nec)
+                else:
+                    net_grid = 0.0
+
+                batt_soc = None
+                if es is not None:
+                    soc_data = getattr(es, "soc", None)
+                    if soc_data is not None and hasattr(soc_data, "__len__") and len(soc_data) > t_idx:
+                        batt_soc = float(soc_data[t_idx])
+                    elif np.isscalar(soc_data):
+                        batt_soc = float(soc_data)
+
+                if net_grid < -0.01 and (batt_soc is not None) and (batt_soc < 0.9):
+                    kpis["solar_waste_kwh"] += abs(net_grid) * self._dt_h
+            except Exception:
+                pass
+
+        kpis["battery_abuse_hours"] = 1.0 if any_abuse else 0.0
+        return kpis
+
+    # -------------------------------------------------------------------------
+    # Basic KPI helpers (district-level)
+    # -------------------------------------------------------------------------
+    def _compute_basic_kpis(self, obs: np.ndarray, action: np.ndarray) -> Dict[str, float]:
+        kpis: Dict[str, float] = {}
+
+        citylearn_env = self._get_citylearn_env()
+        soc_vals = self._soc_values_from_state(citylearn_env)
+        kpis["soc_mean"] = float(np.mean(soc_vals)) if soc_vals else 0.0
+        kpis["soc_min"] = float(np.min(soc_vals)) if soc_vals else 0.0
+        kpis["soc_max"] = float(np.max(soc_vals)) if soc_vals else 0.0
+        kpis["soc_std"] = float(np.std(soc_vals)) if soc_vals else 0.0
+
+        action = np.asarray(action, dtype=float).ravel()
+        kpis["action_mean"] = float(np.mean(action)) if action.size else 0.0
+        kpis["action_std"] = float(np.std(action)) if action.size else 0.0
+        kpis["action_min"] = float(np.min(action)) if action.size else 0.0
+        kpis["action_max"] = float(np.max(action)) if action.size else 0.0
+
+        kpis["step_count"] = float(self._step_count)
+
+        def safe_obs(i: Optional[int]) -> float:
+            if i is None:
+                return 0.0
+            return float(obs[i]) if 0 <= i < len(obs) else 0.0
+
+        kpis["month_cos"] = safe_obs(self._idx_month_cos)
+        kpis["month_sin"] = safe_obs(self._idx_month_sin)
+        kpis["day_type_cos"] = safe_obs(self._idx_day_type_cos)
+        kpis["day_type_sin"] = safe_obs(self._idx_day_type_sin)
+        kpis["hour_cos"] = safe_obs(self._idx_hour_cos)
+        kpis["hour_sin"] = safe_obs(self._idx_hour_sin)
+        kpis["non_shiftable_load_obs_b1"] = safe_obs(self._idx_non_shiftable_load_obs)
+
+        step_net_kwh = 0.0
+        current_price = 0.0
+        carbon_intensity = 0.0
+
+        if citylearn_env is not None and getattr(citylearn_env, "buildings", None):
+            idx = self._state_time_index(citylearn_env)
+
+            total_kw = 0.0
+            for b in citylearn_env.buildings:
+                nec = getattr(b, "net_electricity_consumption", None)
+                if nec is not None and hasattr(nec, "__len__") and len(nec) > idx:
+                    total_kw += float(nec[idx])
+            step_net_kwh = total_kw * self._dt_h
+
+            b0 = citylearn_env.buildings[0]
+            try:
+                ep = b0.pricing.electricity_pricing
+                if hasattr(ep, "__len__") and len(ep) > idx:
+                    current_price = float(ep[idx])
+            except Exception:
+                pass
+            try:
+                ci = b0.carbon_intensity.carbon_intensity
+                if hasattr(ci, "__len__") and len(ci) > idx:
+                    carbon_intensity = float(ci[idx])
+            except Exception:
+                pass
+        else:
+            if self._idx_net_consumption_obs is not None and self._idx_net_consumption_obs < len(obs):
+                step_net_kwh = float(obs[self._idx_net_consumption_obs]) * self._dt_h
+
+        kpis["step_net_consumption_kwh"] = float(step_net_kwh)
+        kpis["electricity_price"] = float(current_price)
+
+        import_kwh = max(step_net_kwh, 0.0)
+        export_kwh = max(-step_net_kwh, 0.0)
+        kpis["grid_import_kwh"] = float(import_kwh)
+        kpis["grid_export_kwh"] = float(export_kwh)
+
+        kpis["step_cost"] = float(import_kwh * current_price)
+        kpis["carbon_intensity"] = float(carbon_intensity)
+        kpis["step_carbon_kg"] = float(import_kwh * carbon_intensity)
+
+        kpis["thermal_discomfort"] = 0.0
+        kpis["indoor_temperature"] = 0.0
+        kpis["outdoor_temperature"] = 0.0
+
+        solar_gen = 0.0
+        if citylearn_env is not None and getattr(citylearn_env, "buildings", None):
+            idx = self._state_time_index(citylearn_env)
+            b0 = citylearn_env.buildings[0]
+            try:
+                sg = getattr(b0, "solar_generation", None)
+                if sg is not None and hasattr(sg, "__len__") and len(sg) > idx:
+                    solar_gen = float(sg[idx]) * self._dt_h
+            except Exception:
+                pass
+        kpis["solar_generation_kwh"] = float(solar_gen)
+
+        nsl = 0.0
+        if citylearn_env is not None and getattr(citylearn_env, "buildings", None):
+            idx = self._state_time_index(citylearn_env)
+            b0 = citylearn_env.buildings[0]
+            try:
+                load = getattr(b0, "non_shiftable_load", None)
+                if load is not None and hasattr(load, "__len__") and len(load) > idx:
+                    nsl = float(load[idx]) * self._dt_h
+            except Exception:
+                pass
+        kpis["non_shiftable_load_kwh"] = float(nsl)
+
+        violation = False
+        if soc_vals:
+            viol_ind = [1.0 if (s < self.soc_min or s > self.soc_max) else 0.0 for s in soc_vals]
+            violation = bool(max(viol_ind))
+            kpis["constraint_violation_any"] = float(max(viol_ind))
+            kpis["constraint_violation_frac"] = float(np.mean(viol_ind))
+            kpis["constraint_violation_rate_%"] = 100.0 * float(np.mean(viol_ind))
+        else:
+            kpis["constraint_violation_any"] = 0.0
+            kpis["constraint_violation_frac"] = 0.0
+            kpis["constraint_violation_rate_%"] = 0.0
+        kpis["constraint_violation"] = 1.0 if violation else 0.0
+
+        return kpis
+
+    # -------------------------------------------------------------------------
+    # CityLearn KPI extraction at episode end
+    # -------------------------------------------------------------------------
+    def _extract_citylearn_kpis(self) -> Dict[str, float]:
+        citylearn_kpis: Dict[str, float] = {}
+        try:
+            citylearn_env = self._get_citylearn_env()
+            if citylearn_env is None:
+                raise RuntimeError("CityLearnEnv not found in wrapper stack.")
+
+            if hasattr(citylearn_env, "evaluate"):
+                kpis_df = citylearn_env.evaluate()
+            elif hasattr(citylearn_env, "env") and hasattr(citylearn_env.env, "evaluate"):
+                kpis_df = citylearn_env.env.evaluate()
+            else:
+                raise RuntimeError("evaluate() not found on unwrapped CityLearn object.")
+
+            building_name = "District"
+            if "name" in kpis_df.columns:
+                if (kpis_df["name"] == "District").any():
+                    building_name = "District"
+                else:
+                    unique = kpis_df["name"].unique()
+                    building_name = unique[0] if len(unique) else "District"
+
+            def extract_kpi(cost_function_name: str) -> float:
+                result = kpis_df[
+                    (kpis_df["name"] == building_name)
+                    & (kpis_df["cost_function"] == cost_function_name)
+                ]
+                if not result.empty:
+                    value = result["value"].iloc[0]
+                    if pd.notna(value):
+                        return float(value)
+                return float("nan")
+
+            citylearn_kpis["citylearn_electricity_consumption_total"] = extract_kpi("electricity_consumption_total")
+            citylearn_kpis["citylearn_carbon_emissions_total"] = extract_kpi("carbon_emissions_total")
+            citylearn_kpis["citylearn_cost_total"] = extract_kpi("cost_total")
+            citylearn_kpis["citylearn_zero_net_energy"] = extract_kpi("zero_net_energy")
+
+            citylearn_kpis["citylearn_daily_peak_average"] = extract_kpi("daily_peak_average")
+            citylearn_kpis["citylearn_all_time_peak_average"] = extract_kpi("all_time_peak_average")
+            citylearn_kpis["citylearn_ramping_average"] = extract_kpi("ramping_average")
+            citylearn_kpis["citylearn_discomfort_proportion"] = extract_kpi("discomfort_proportion")
+
+        except Exception as e:
+            import traceback
+            print(f"[CityLearnSafetyEnvV3] Warning: Could not extract CityLearn KPIs: {e}")
+            print(f"[CityLearnSafetyEnvV3] Traceback: {traceback.format_exc()}")
+            citylearn_kpis = {
+                "citylearn_electricity_consumption_total": float("nan"),
+                "citylearn_carbon_emissions_total": float("nan"),
+                "citylearn_cost_total": float("nan"),
+                "citylearn_daily_peak_average": float("nan"),
+                "citylearn_all_time_peak_average": float("nan"),
+                "citylearn_ramping_average": float("nan"),
+                "citylearn_discomfort_proportion": float("nan"),
+                "citylearn_zero_net_energy": float("nan"),
+            }
+
+        return citylearn_kpis

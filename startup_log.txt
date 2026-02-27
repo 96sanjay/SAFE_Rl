@@ -1,0 +1,2 @@
+nohup: ignoring input
+bash: start_training_bulletproof.sh: No such file or directory

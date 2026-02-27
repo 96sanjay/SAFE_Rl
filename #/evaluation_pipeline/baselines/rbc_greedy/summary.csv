@@ -1,0 +1,2 @@
+controller,total_cost,violations,violation_pct,total_reward,ev_v3_controllable,ev_v3_uncontrollable,ev_missing_actions,citylearn_electricity_consumption_total,citylearn_carbon_emissions_total,citylearn_cost_total,citylearn_daily_peak_average
+RBC_Greedy,0.0,0,0.0,-25867.880441226585,0.0,71.66361016787593,0.0,2.7816254806787244,2.858672750769465,2.8183755629548193,3.605979271098421

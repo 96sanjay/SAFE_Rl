@@ -9,7 +9,7 @@ This logger writes:
 
 Key guarantees:
 ✅ Fieldnames defined ONCE in __init__ (stable schema)
-✅ Includes action_0..action_25 and action_ev_0..action_ev_7
+✅ Includes action_0..action_N and action_ev_0..action_ev_M (dynamic)
 ✅ Includes bill/reward bill fields:
    - step_bill, export_factor
    - reward_bill_raw, reward_export_factor, reward_scale
@@ -28,7 +28,7 @@ import numpy as np
 class KPILogger:
     """Custom logger to track KPIs separately from OmniSafe."""
 
-    def __init__(self, log_dir: str, run_name: str):
+    def __init__(self, log_dir: str, run_name: str, n_buildings: int = 17, n_actions: int = 26, n_ev_actions: int = 8):
         self.log_dir = log_dir
         self.run_name = run_name
 
@@ -56,23 +56,7 @@ class KPILogger:
             "soc_min",
             "soc_max",
             "soc_std",
-            "battery_soc_b1",
-            "battery_soc_b2",
-            "battery_soc_b3",
-            "battery_soc_b4",
-            "battery_soc_b5",
-            "battery_soc_b6",
-            "battery_soc_b7",
-            "battery_soc_b8",
-            "battery_soc_b9",
-            "battery_soc_b10",
-            "battery_soc_b11",
-            "battery_soc_b12",
-            "battery_soc_b13",
-            "battery_soc_b14",
-            "battery_soc_b15",
-            "battery_soc_b16",
-            "battery_soc_b17",
+            *[f"battery_soc_b{i+1}" for i in range(n_buildings)],
             "battery_abuse_kwh",
             "battery_abuse_excess_kwh_equiv",
             "battery_abuse_hours",
@@ -210,9 +194,9 @@ class KPILogger:
             "citylearn_zero_net_energy",
         ]
 
-        # ✅ Per-dimension actions
-        self.fieldnames += [f"action_{i}" for i in range(26)]
-        self.fieldnames += [f"action_ev_{j}" for j in range(8)]
+        # Per-dimension actions (dynamic)
+        self.fieldnames += [f"action_{i}" for i in range(n_actions)]
+        self.fieldnames += [f"action_ev_{j}" for j in range(n_ev_actions)]
 
         # Writers/handles
         self.csv_file = None
@@ -623,10 +607,10 @@ class KPILogger:
 _kpi_logger = None
 
 
-def init_kpi_logger(log_dir: str, run_name: str):
+def init_kpi_logger(log_dir: str, run_name: str, n_buildings: int = 17, n_actions: int = 26, n_ev_actions: int = 8):
     """Initialize the global KPI logger."""
     global _kpi_logger
-    _kpi_logger = KPILogger(log_dir, run_name)
+    _kpi_logger = KPILogger(log_dir, run_name, n_buildings=n_buildings, n_actions=n_actions, n_ev_actions=n_ev_actions)
 
 
 def log_kpis(info: Dict[str, Any], step: int, episode: int):

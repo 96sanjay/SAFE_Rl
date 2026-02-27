@@ -418,12 +418,12 @@ class SpatialGraphFeaturesWrapper(gym.ObservationWrapper):
     Appends inter-building spatial interaction features.
     No learnable parameters — pure analytic feature engineering.
 
-    Features per building (N=17):
-      • power_headroom:     P_building_max - estimated_current_power  (17 dims)
-      • soc_spread:         per-battery SoC minus district mean SoC   (17 dims)
-      • neighbour_avg_soc:  mean SoC of neighbours (all-to-all graph) (17 dims)
-      • grid_contribution:  building power / total district power      (17 dims)
-    Total: 68 dims
+    Features per building (N buildings):
+      • power_headroom:     P_building_max - estimated_current_power  (N dims)
+      • soc_spread:         per-battery SoC minus district mean SoC   (N dims)
+      • neighbour_avg_soc:  mean SoC of neighbours (all-to-all graph) (N dims)
+      • grid_contribution:  building power / total district power      (N dims)
+    Total: 4*N dims
     """
 
     def __init__(
@@ -590,7 +590,7 @@ class STEMSCombinedWrapper(gym.Wrapper):
             forecast_horizon: Hours ahead for price/load/solar forecasts.
             temporal_window:  Steps of history to keep.
             temporal_mode:    'summary' (4×obs) or 'raw' (W×obs).
-            num_buildings:    Number of buildings (17).
+            num_buildings:    Number of buildings in the district.
             p_building_max:   Building power threshold for C3 (2.273834 kW).
             enable_forecast:  Toggle forecast features.
             enable_spatial:   Toggle spatial features.

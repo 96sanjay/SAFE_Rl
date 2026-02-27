@@ -66,6 +66,19 @@ class CityLearnSafetyEnvV3(gym.Env):
     ):
         super().__init__()
         self.base = base_env
+
+        # Detect building count dynamically from the CityLearn env
+        self.n_buildings = 17  # fallback
+        _cur = base_env
+        for _ in range(20):
+            blds = getattr(_cur, 'buildings', None)
+            if blds is not None and hasattr(blds, '__len__') and len(blds) > 0:
+                self.n_buildings = len(blds)
+                break
+            _cur = getattr(_cur, 'env', getattr(_cur, 'base', None))
+            if _cur is None:
+                break
+
         self.soc_min = float(soc_min)
         self.soc_max = float(soc_max)
 
@@ -122,7 +135,7 @@ class CityLearnSafetyEnvV3(gym.Env):
         
         # Building/grid limits (for normalization in stability reward)
         self.P_building_max = 50.0  # kW per building (approximate)
-        self.P_grid_max = 500.0     # kW for entire district (17 buildings)
+        self.P_grid_max = 500.0 * (self.n_buildings / 17.0)  # kW, scaled for N buildings
         
         # Reward type: "bill" (old) or "stems" (new)
         self.reward_type = os.environ.get("CITYLEARN_REWARD_TYPE", "bill").strip().lower()
@@ -173,7 +186,7 @@ class CityLearnSafetyEnvV3(gym.Env):
         self._idx_hour_sin = None
 
         try:
-            self._obs_index = build_index(self.base, expected_buildings=17)
+            self._obs_index = build_index(self.base, expected_buildings=self.n_buildings)
             self._soc_idx_obs = list(self._obs_index.electrical_storage_soc)
             self._idx_net_consumption_obs = self._obs_index.net_electricity_consumption[0]  # building_1
             self._idx_non_shiftable_load_obs = self._obs_index.non_shiftable_load[0]
@@ -198,7 +211,7 @@ class CityLearnSafetyEnvV3(gym.Env):
         self._debug_action_clip = bool(int(os.environ.get("CITYLEARN_DEBUG_ACTION_CLIP", "0")))
         self._debug_action_clip_every = int(os.environ.get("CITYLEARN_DEBUG_ACTION_CLIP_EVERY", "500"))
 
-        print("[CityLearnSafetyEnvV3] Initialized (V3 action-based EV deficits)")
+        print(f"[CityLearnSafetyEnvV3] Initialized (V3 action-based EV deficits) — {self.n_buildings} buildings detected")
         print(f"[CityLearnSafetyEnvV3] EV action indices (from action_names): {self._ev_charger_action_indices}")
         print(f"[CityLearnSafetyEnvV3] Missing action mode: {self._missing_action_mode}")
 
@@ -391,7 +404,9 @@ class CityLearnSafetyEnvV3(gym.Env):
         if not run_name:
             run_name = "CityLearnSafety_kpis_v3"
 
-        init_kpi_logger(log_dir, run_name)
+        n_act = self.action_space.shape[0] if hasattr(self.action_space, 'shape') else 26
+        n_ev = len(self._ev_charger_action_indices)
+        init_kpi_logger(log_dir, run_name, n_buildings=self.n_buildings, n_actions=n_act, n_ev_actions=n_ev)
         self._kpi_logger_initialized = True
         print(f"[CityLearnSafetyEnvV3] KPI logger initialized in: {log_dir} (run_name={run_name})")
 
@@ -468,15 +483,15 @@ class CityLearnSafetyEnvV3(gym.Env):
         metrics = self._soc_metrics(soc_state_vals)
 
         building_cost = self._soc_band_cost(metrics)
-        # --- Per-building battery SOC (b1..b17) for analysis ---
+        # --- Per-building battery SOC for analysis ---
         # Log from OBS indices (robust across wrapper stacks).
-        if self._soc_idx_obs and len(self._soc_idx_obs) >= 17:
-            for i in range(17):
+        if self._soc_idx_obs:
+            for i in range(len(self._soc_idx_obs)):
                 idx_soc = int(self._soc_idx_obs[i])
                 info[f"battery_soc_b{i+1}"] = float(obs[idx_soc]) if 0 <= idx_soc < len(obs) else 0.0
         else:
             # fallback
-            for i in range(17):
+            for i in range(self.n_buildings):
                 info[f"battery_soc_b{i+1}"] = 0.0
 
         # Handle both Box and list action spaces
@@ -492,15 +507,15 @@ class CityLearnSafetyEnvV3(gym.Env):
         metrics = self._soc_metrics(soc_state_vals)
         metrics = self._soc_metrics(soc_state_vals)
         info["metrics"] = metrics
-        # --- Per-building battery SOC (b1..b17) for analysis ---
+        # --- Per-building battery SOC for analysis ---
         # Log from OBS indices (robust across wrapper stacks).
-        if self._soc_idx_obs and len(self._soc_idx_obs) >= 17:
-            for i in range(17):
+        if self._soc_idx_obs:
+            for i in range(len(self._soc_idx_obs)):
                 idx_soc = int(self._soc_idx_obs[i])
                 info[f"battery_soc_b{i+1}"] = float(obs[idx_soc]) if 0 <= idx_soc < len(obs) else 0.0
         else:
             # fallback
-            for i in range(17):
+            for i in range(self.n_buildings):
                 info[f"battery_soc_b{i+1}"] = 0.0
 
         # CMDP cost at reset: 0.0
@@ -741,7 +756,7 @@ class CityLearnSafetyEnvV3(gym.Env):
             cost_stems_battery = float(np.sum(v) * battery_scale)  # SUM + scale
 
             # Realistic violation metrics
-            viol_any = float(viol_ind.max())        # 1 if any of 17 violates (strict)
+            viol_any = float(viol_ind.max())        # 1 if any building violates (strict)
             viol_frac = float(viol_ind.mean())      # fraction of buildings violating (recommended)
             viol_cnt = float(viol_ind.sum())        # count of buildings violating
             viol_rate_pct = 100.0 * viol_frac       # % buildings violating this step (averaged over time)
@@ -838,7 +853,7 @@ class CityLearnSafetyEnvV3(gym.Env):
 
 
 
-        b_viol_frac = float(b_viol_cnt / max(1.0, float(len(getattr(self, "buildings", [])) or 17.0)))
+        b_viol_frac = float(b_viol_cnt / max(1.0, float(len(getattr(self, "buildings", [])) or float(self.n_buildings))))
         info["building_power_violation_count"] = float(b_viol_cnt)
         info["building_power_violation_frac"]  = float(b_viol_frac)
         info["building_power_violation_rate_%"] = float(100.0 * b_viol_frac)
@@ -1523,7 +1538,7 @@ class CityLearnSafetyEnvV3(gym.Env):
                     
         except Exception:
             # Fallback to old approximation if loop fails
-            building_consumption = abs(net_consumption) / 17.0
+            building_consumption = abs(net_consumption) / float(self.n_buildings)
             building_ratio = building_consumption / max(1e-6, self.P_building_max)
             reward_stability_building = self.alpha_build * (1.0 - building_ratio)
         
@@ -1636,9 +1651,8 @@ class CityLearnSafetyEnvV3(gym.Env):
         kpis["soc_max"] = float(np.max(soc_vals)) if soc_vals else 0.0
         kpis["soc_std"] = float(np.std(soc_vals)) if soc_vals else 0.0
 
-        # --- Per-building battery SOC (b1..b17) from STATE soc_vals ---
-        # This is what you need for: sum(violated buildings)/(17*T)
-        for i in range(17):
+        # --- Per-building battery SOC from STATE soc_vals ---
+        for i in range(len(soc_vals)):
             kpis[f"battery_soc_b{i+1}"] = float(soc_vals[i]) if i < len(soc_vals) else 0.0
 
         action = self._action_to_flat(action)

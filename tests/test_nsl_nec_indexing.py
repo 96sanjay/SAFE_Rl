@@ -4,6 +4,8 @@
 The C3 block in safety_env_v3.py reads at idx_bp = max(0, time_step - 1).
 This test verifies that NSL[idx_bp] and NEC[idx_bp] refer to the same timestep,
 which is critical for the agent-controllable C3 (P1) to work correctly.
+
+Uses 5-building schema by default; override with CITYLEARN_SCHEMA env var.
 """
 import os, sys
 import numpy as np
@@ -11,14 +13,20 @@ import numpy as np
 os.chdir("/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork")
 sys.path.insert(0, os.getcwd())
 
+if "CITYLEARN_SCHEMA" not in os.environ:
+    os.environ["CITYLEARN_SCHEMA"] = os.path.join(
+        os.getcwd(), "data/citylearn_challenge_2022_phase_all_plus_evs/schema.json"
+    )
 os.environ["CITYLEARN_STEMS_P_BUILDING_MAX"] = "4.6083"
 os.environ["CITYLEARN_STEMS_P_GRID_MAX"] = "29.6915"
 os.environ["CITYLEARN_EV_MISSING_ACTION_MODE"] = "assume_zero"
 
 from citylearn.citylearn import CityLearnEnv
 
-schema_path = "data/citylearn_challenge_2022_phase_all_plus_evs/schema.json"
-env = CityLearnEnv(schema=schema_path, central_agent=True)
+env = CityLearnEnv(schema=os.environ["CITYLEARN_SCHEMA"], central_agent=True)
+num_buildings = len(env.buildings)
+print(f"Schema: {os.environ['CITYLEARN_SCHEMA']}")
+print(f"Num buildings: {num_buildings}")
 env.reset()
 
 # action_space is a list of Box for central_agent=True
@@ -65,7 +73,7 @@ for step in range(100):
                       f"nec={nec:.4f} vs nsl+sg={expected_nec:.4f} (diff={diff:.4f})")
 
 if mismatches == 0:
-    print("PASS: NSL + solar indexing matches NEC for all 100 steps x 17 buildings")
+    print(f"PASS: NSL + solar indexing matches NEC for all 100 steps x {num_buildings} buildings")
 else:
     print(f"FAIL: {mismatches} mismatches found")
 

@@ -51,8 +51,23 @@ class CityLearnCMDPv2(CMDP):
         # P0: Add spatial observations (per-building C3 headroom, SoC spread, etc.)
         if os.environ.get("CITYLEARN_SPATIAL_OBS", "0") == "1":
             p_bmax = float(os.environ.get("CITYLEARN_STEMS_P_BUILDING_MAX", "4.6083"))
-            env_final = SpatialGraphFeaturesWrapper(forecast, num_buildings=17, p_building_max=p_bmax)
-            print(f"[CMDPv2] Spatial obs ENABLED (+68 dims, P_building_max={p_bmax})")
+            # Auto-detect building count from the underlying CityLearn env
+            n_buildings = int(os.environ.get("CITYLEARN_NUM_BUILDINGS", "0"))
+            if n_buildings == 0:
+                # Walk wrapper chain to find CityLearnEnv.buildings
+                _e = safety
+                for _ in range(20):
+                    if hasattr(_e, 'buildings') and len(getattr(_e, 'buildings', [])) > 0:
+                        n_buildings = len(_e.buildings)
+                        break
+                    _e = getattr(_e, 'env', getattr(_e, 'base', None))
+                    if _e is None:
+                        break
+                if n_buildings == 0:
+                    n_buildings = 17  # fallback
+            n_extra = n_buildings * 4
+            env_final = SpatialGraphFeaturesWrapper(forecast, num_buildings=n_buildings, p_building_max=p_bmax)
+            print(f"[CMDPv2] Spatial obs ENABLED (+{n_extra} dims, {n_buildings} buildings, P_building_max={p_bmax})")
         else:
             env_final = forecast
 

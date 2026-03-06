@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Test that agent-controllable C3 produces zero cost for passive agent."""
+"""Test that agent-controllable C3 produces zero cost for passive agent.
+
+Uses 5-building schema by default; override with CITYLEARN_SCHEMA env var.
+"""
 import os, sys
 import numpy as np
 
 os.chdir("/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork")
 sys.path.insert(0, os.getcwd())
 
-os.environ["CITYLEARN_SCHEMA"] = os.path.join(os.getcwd(), "data/citylearn_challenge_2022_phase_all_plus_evs/schema.json")
+if "CITYLEARN_SCHEMA" not in os.environ:
+    os.environ["CITYLEARN_SCHEMA"] = os.path.join(
+        os.getcwd(), "data/citylearn_challenge_2022_phase_all_plus_evs/schema.json"
+    )
 os.environ["CITYLEARN_STEMS_P_BUILDING_MAX"] = "4.6083"
 os.environ["CITYLEARN_STEMS_P_GRID_MAX"] = "29.6915"
 os.environ["CITYLEARN_REWARD_TYPE"] = "stems"

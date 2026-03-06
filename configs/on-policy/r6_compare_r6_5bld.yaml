@@ -28,13 +28,13 @@ lagrange_cfgs:
 
 model_cfgs:
   actor:
-    # Larger network for spatial obs (base + forecast + N*4 spatial dims)
-    hidden_sizes: [512, 512, 256]
-    activation: relu
-    lr: 0.0003
+    # Same network as R5-A/R5-B for clean comparison (only P0+P1 differ)
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0005
   critic:
-    hidden_sizes: [512, 512, 256]
-    activation: relu
+    hidden_sizes: [256, 256]
+    activation: tanh
     lr: 0.001
   linear_lr_decay: false
 

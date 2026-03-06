@@ -790,6 +790,7 @@ class CityLearnSafetyEnvV3(gym.Env):
             building_powers = []  # Track raw powers for debug logging
             idx_bp = self._state_time_index(citylearn_env)
             c3_controllable = os.environ.get("CITYLEARN_C3_CONTROLLABLE", "0") == "1"
+            c3_structural_removed = 0.0  # cost removed by controllability filter
 
             for b in citylearn_env.buildings:
                 try:
@@ -828,6 +829,10 @@ class CityLearnSafetyEnvV3(gym.Env):
                     else:
                         # Structural violation: only penalize agent's marginal excess
                         v_i = max(0.0, abs(p_i) - abs(nsl_i))
+
+                    # Track how much cost the controllability filter removed
+                    v_old = max(0.0, abs(p_i) - p_building_max)
+                    c3_structural_removed += max(0.0, v_old - v_i)
                 else:
                     # Original C3 (unchanged)
                     v_i = max(0.0, abs(p_i) - p_building_max)
@@ -845,6 +850,9 @@ class CityLearnSafetyEnvV3(gym.Env):
 
         info["cost_stems_building_power"] = float(cost_stems_building_power)
         info["building_power_violation"] = float(b_any_violation)
+        # --- Agent-controllable C3 debug info ---
+        info["c3_controllable_enabled"] = 1.0 if os.environ.get("CITYLEARN_C3_CONTROLLABLE", "0") == "1" else 0.0
+        info["c3_structural_cost_removed"] = float(c3_structural_removed) if "c3_structural_removed" in locals() else 0.0
         # --- Debug: log building power summary stats used for violations ---
         try:
             # violations_list holds per-building violation magnitudes; to infer power we need the raw powers

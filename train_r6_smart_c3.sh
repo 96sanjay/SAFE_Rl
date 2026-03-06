@@ -51,17 +51,12 @@ echo "  Seed: $SEED"
 echo "  Schema: $CITYLEARN_SCHEMA"
 echo ""
 
-# NOTE: Replace the python command below with your actual training invocation.
-# The multilag PPOLag training script and config from R5-A/R5-B should be used here,
-# with the R5-A StopIter fix (train_iters > 1) and R5-B sparse Saute fix combined.
-#
-# Example (adjust to your actual training script):
-# python train_omnisafe_multilag.py \
-#     --algo PPOLag \
-#     --env CityLearnSafety-V2G-v2-multilag \
-#     --seed $SEED \
-#     --epochs 200 \
-#     --tag "r6_smart_c3_seed${SEED}"
+# Config: R5-A StopIter fix (update_iters=60) + R5-B sparse Saute (in safety_env_v3 V3 cost)
+# Uses CityLearnSafety-V2G-v2 env (omni_env_v2.py with P0 spatial obs wiring)
+CFG="$PROJECT/configs/on-policy/ppolag_r6_smart_c3.yaml"
 
-echo "TODO: Add your training command here (see comments above)"
-echo "Env vars are set. You can also source this script and run manually."
+echo "  Config: $CFG"
+echo "  Env: CityLearnSafety-V2G-v2"
+echo ""
+
+python scripts/train_omnisafe.py --cfg "$CFG"

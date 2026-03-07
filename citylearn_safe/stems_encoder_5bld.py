@@ -9,18 +9,23 @@ dependency — uses a simple matrix-multiply GCN instead of GCNConv.
 Uses ObsIndex from schema_index.py for exact observation parsing
 (no naive obs_dim // num_buildings splitting).
 
-Architecture:
+Architecture (v2 — stateless, PPO-compatible):
     obs → ObsIndex parse → per-node [B, N, F_node]
         → ObservationEmbedding → [B, N, D]
-        → HistoryBuffer push
         → AdaptiveGraphConstructor → adj [N, N]
         → SpatialEncoder (GCN stack) → h_spatial [B, N, D]
-        → TemporalTransformer (over window) → z_temporal [B, N, D]
+        → SpatialSelfAttention (MHA over N nodes) → z_attn [B, N, D]
         → GatedFusion → r [B, N, D]
         → flatten → output_proj → [B, output_dim]
+
+v2 changes from v1:
+  - Removed HistoryBuffer + TemporalTransformerBlock (caused rollout/update
+    behavioral split breaking PPO importance sampling, detached gradients)
+  - Added SpatialSelfAttention (stateless, same function in rollout & update)
+  - Removed output_proj final ReLU (was blocking negative features)
+  - Fixed GCN double normalization (graph constructor already normalizes)
 """
 
-import math
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -34,33 +39,24 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 class SimpleGCNLayer(nn.Module):
     """
-    GCN layer: H' = sigma(D_hat^{-1/2} A_hat D_hat^{-1/2} H W + b)
-    where A_hat = A + I (adjacency with self-loops).
+    GCN layer: H' = linear(A_norm @ H)
 
-    Mathematically equivalent to GCNConv(improved=True, add_self_loops=True).
+    Expects pre-normalized adjacency matrix (from AdaptiveGraphConstructor
+    which applies softmax + self-loops). No additional symmetric normalization
+    to avoid double-normalization feature shrinkage.
     """
 
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.linear = nn.Linear(in_dim, out_dim)
 
-    @staticmethod
-    def _normalize_adj(adj: torch.Tensor) -> torch.Tensor:
-        """Symmetric normalization: D^{-1/2} A D^{-1/2}"""
-        # adj: [N, N] with self-loops already added
-        deg = adj.sum(dim=-1).clamp(min=1e-8)  # [N]
-        deg_inv_sqrt = deg.pow(-0.5)
-        # D^{-1/2} A D^{-1/2}
-        return adj * deg_inv_sqrt.unsqueeze(-1) * deg_inv_sqrt.unsqueeze(-2)
-
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         """
         x:   [N, D_in]
-        adj: [N, N] (raw adjacency with self-loops)
+        adj: [N, N] (pre-normalized from AdaptiveGraphConstructor)
         Returns: [N, D_out]
         """
-        adj_norm = self._normalize_adj(adj)
-        return self.linear(adj_norm @ x)
+        return self.linear(adj @ x)
 
 
 # ---------------------------------------------------------------------------
@@ -101,71 +97,55 @@ class SpatialEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 3. Sinusoidal Positional Encoding
+# 3. Spatial Self-Attention (replaces temporal transformer)
 # ---------------------------------------------------------------------------
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 128):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term[: d_model // 2])
-        self.register_buffer("pe", pe.unsqueeze(0))  # [1, max_len, d_model]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(-2), :]
-
-
-# ---------------------------------------------------------------------------
-# 4. Temporal Transformer Block
-# ---------------------------------------------------------------------------
-class TemporalTransformerBlock(nn.Module):
+class SpatialSelfAttention(nn.Module):
     """
-    Transformer encoder applied per-node across temporal window.
-    Multi-head self-attention + FFN with pre-norm residual.
+    Multi-head self-attention over building nodes.
+
+    Stateless — same function in rollout and update, so PPO importance
+    sampling ratios are correct. Gets proper gradients during backprop.
+
+    This replaces the TemporalTransformerBlock which used a HistoryBuffer
+    that broke PPO by computing different functions in rollout vs update.
     """
 
-    def __init__(
-        self, embed_dim: int, num_heads: int = 4, ff_mult: int = 4,
-        dropout: float = 0.1, max_window: int = 64,
-    ):
+    def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.pos_enc = SinusoidalPositionalEncoding(embed_dim, max_len=max_window)
-        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
         self.attn = nn.MultiheadAttention(
-            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout, batch_first=True,
+            embed_dim=embed_dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
         )
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ff = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * ff_mult),
+            nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim * ff_mult, embed_dim),
+            nn.Linear(embed_dim * 4, embed_dim),
             nn.Dropout(dropout),
         )
 
-    def forward(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        seq: [B*N, T, D]
-        Returns: out [B*N, D], attn_weights [B*N, T, T]
+        x: [B, N, D]  (N = num_buildings)
+        Returns: [B, N, D]
         """
-        seq = self.pos_enc(seq)
-        h = self.norm1(seq)
-        attn_out, attn_weights = self.attn(h, h, h)
-        seq = seq + attn_out
-        h = self.norm2(seq)
-        seq = seq + self.ff(h)
-        return seq[:, -1, :], attn_weights  # last position
+        # Pre-norm self-attention
+        h = self.norm(x)
+        attn_out, _ = self.attn(h, h, h)
+        x = x + attn_out
+        # Pre-norm FFN
+        h = self.norm2(x)
+        x = x + self.ff(h)
+        return x
 
 
 # ---------------------------------------------------------------------------
-# 5. Gated Spatial-Temporal Fusion
+# 4. Gated Spatial-Attention Fusion
 # ---------------------------------------------------------------------------
 class GatedFusion(nn.Module):
-    """Learnable gate combining spatial and temporal features per node."""
+    """Learnable gate combining spatial (GCN) and attention features per node."""
 
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -177,47 +157,15 @@ class GatedFusion(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, h_spatial: torch.Tensor, z_temporal: torch.Tensor) -> torch.Tensor:
+    def forward(self, h_spatial: torch.Tensor, z_attn: torch.Tensor) -> torch.Tensor:
         s = self.W_s(h_spatial)
-        t = self.W_t(z_temporal)
-        g = self.gate(torch.cat([h_spatial, z_temporal], dim=-1))
+        t = self.W_t(z_attn)
+        g = self.gate(torch.cat([h_spatial, z_attn], dim=-1))
         return self.norm(g * s + (1 - g) * t)
 
 
 # ---------------------------------------------------------------------------
-# 6. History Buffer
-# ---------------------------------------------------------------------------
-class HistoryBuffer:
-    """Ring buffer storing last window_size embedded observations per node."""
-
-    def __init__(self, window_size: int, num_nodes: int, embed_dim: int):
-        self.window_size = window_size
-        self.num_nodes = num_nodes
-        self.embed_dim = embed_dim
-        self.buffer: Optional[torch.Tensor] = None
-        self.count = 0
-
-    def reset(self, batch_size: int = 1, device: torch.device = torch.device("cpu")):
-        self.buffer = torch.zeros(
-            batch_size, self.num_nodes, self.window_size, self.embed_dim, device=device,
-        )
-        self.count = 0
-
-    def push(self, node_embeds: torch.Tensor):
-        """node_embeds: [B, N, D]"""
-        if self.buffer is None:
-            self.reset(node_embeds.size(0), node_embeds.device)
-        self.buffer = torch.roll(self.buffer, shifts=-1, dims=2)
-        self.buffer[:, :, -1, :] = node_embeds
-        self.count = min(self.count + 1, self.window_size)
-
-    def get(self) -> torch.Tensor:
-        """Returns [B, N, T, D]"""
-        return self.buffer.clone()
-
-
-# ---------------------------------------------------------------------------
-# 7. Observation Embedding
+# 5. Observation Embedding
 # ---------------------------------------------------------------------------
 class ObservationEmbedding(nn.Module):
     """Two-layer MLP with LayerNorm to project per-node raw features to uniform embedding."""
@@ -239,13 +187,15 @@ class ObservationEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 8. Adaptive Graph Constructor (pure learned, no prior matrices)
+# 6. Adaptive Graph Constructor (pure learned, no prior matrices)
 # ---------------------------------------------------------------------------
 class AdaptiveGraphConstructor(nn.Module):
     """
     Builds adjacency matrix from node embeddings via bilinear attention.
-    For 5 buildings without geographic metadata, we use pure learned structure
-    with a uniform prior (all buildings equally connected initially).
+    Output is row-normalized (softmax) with self-loops.
+
+    NOTE: Output is already normalized — downstream GCN layers should NOT
+    apply additional symmetric normalization to avoid feature shrinkage.
     """
 
     def __init__(self, num_nodes: int, embed_dim: int):
@@ -260,7 +210,7 @@ class AdaptiveGraphConstructor(nn.Module):
     def forward(self, node_embeds: torch.Tensor) -> torch.Tensor:
         """
         node_embeds: [B, N, D]
-        Returns: adj [N, N] with self-loops (averaged over batch)
+        Returns: adj [N, N] row-normalized with self-loops (averaged over batch)
         """
         B, N, _ = node_embeds.shape
         gate = torch.sigmoid(self.gate_logit)
@@ -277,14 +227,15 @@ class AdaptiveGraphConstructor(nn.Module):
         # Mix prior and learned
         adj = (1 - gate) * prior + gate * learned
 
-        # Add self-loops
+        # Add self-loops and re-normalize rows to sum to 1
         adj = adj + torch.eye(N, device=adj.device)
+        adj = adj / adj.sum(dim=-1, keepdim=True)
 
         return adj
 
 
 # ---------------------------------------------------------------------------
-# 9. Observation Parser (ObsIndex-based, replaces naive splitting)
+# 7. Observation Parser (ObsIndex-based, replaces naive splitting)
 # ---------------------------------------------------------------------------
 def build_node_indices(obs_index, num_buildings: int) -> Dict:
     """
@@ -308,35 +259,17 @@ def build_node_indices(obs_index, num_buildings: int) -> Dict:
         ])
 
     # Map charger IDs to building indices
-    # charger_id format: "charger_{bld}_{slot}" where bld is 1-indexed building number
     ev_feature_names = [
         "connected_state", "departure_time", "required_soc_departure",
         "soc", "battery_capacity", "incoming_state", "estimated_arrival_time",
     ]
 
-    # Parse building numbers from schema
-    # We need to figure out the building numbering. The per-building features
-    # in ObsIndex are ordered by observation_names, which follows schema order.
-    # charger_X_Y means it's in building X (1-indexed in schema).
-    # We need to map schema building numbers to our 0-indexed building array.
-
-    # Get all building numbers that appear in observations
-    # non_shiftable_load appears once per building in schema order
-    # The i-th entry corresponds to the i-th building (0-indexed)
-
     # Parse charger building numbers
     charger_to_building_idx = {}
     for charger_id in sorted(obs_index.ev.keys()):
-        # charger_id like "charger_1_1" -> building 1 -> need to find its index
         match = re.match(r"charger_(\d+)_(\d+)", charger_id)
         if match:
             bld_num = int(match.group(1))
-            # Find which 0-indexed position this building is at
-            # We can look at observation_names to determine building order
-            # For now, use a heuristic: building numbers in schema_5buildings
-            # are 1,2,3,4,5 mapping to indices 0,1,2,3,4
-            # For 17 buildings: 1..17 -> 0..16
-            # This assumes buildings are numbered contiguously starting from 1
             bld_idx = bld_num - 1
             if bld_idx < num_buildings:
                 charger_to_building_idx[charger_id] = bld_idx
@@ -371,14 +304,18 @@ def build_node_indices(obs_index, num_buildings: int) -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# 10. Main STEMS Encoder for 5 Buildings
+# 8. Main STEMS Encoder for 5 Buildings (v2)
 # ---------------------------------------------------------------------------
 class STEMSEncoder5Bld(nn.Module):
     """
-    STEMS GCN-Transformer encoder adapted for N-building CityLearn.
+    STEMS GCN + Self-Attention encoder adapted for N-building CityLearn.
 
     Uses ObsIndex for exact observation parsing. Pure PyTorch GCN.
     Designed as a drop-in mean_net for OmniSafe's GaussianLearningActor.
+
+    v2: Stateless architecture — no HistoryBuffer or temporal transformer.
+    Uses SpatialSelfAttention over building nodes instead. Same function
+    computed in rollout and update, so PPO importance sampling is correct.
     """
 
     def __init__(
@@ -390,28 +327,15 @@ class STEMSEncoder5Bld(nn.Module):
         global_hidden: int = 32,
         num_gcn_layers: int = 3,
         num_heads: int = 4,
-        temporal_window: int = 24,
+        temporal_window: int = 24,  # kept for API compat, not used
         ff_mult: int = 4,
         dropout: float = 0.1,
         output_dim: int = 256,
     ):
-        """
-        Args:
-            obs_dim: Total observation dimension from environment.
-            node_info: Output of build_node_indices() — index mappings.
-            num_buildings: Number of building nodes.
-            hidden_dim: Node embedding / hidden dimension.
-            global_hidden: Global context embedding dimension.
-            num_gcn_layers: Number of stacked GCN layers.
-            num_heads: Transformer attention heads.
-            temporal_window: History window for temporal attention.
-            output_dim: Final output vector dimension.
-        """
         super().__init__()
         self.obs_dim = obs_dim
         self.num_buildings = num_buildings
         self.hidden_dim = hidden_dim
-        self.temporal_window = temporal_window
         self.base_obs_dim = node_info["base_obs_dim"]
 
         # Store index tensors as buffers for fast gathering
@@ -458,21 +382,17 @@ class STEMSEncoder5Bld(nn.Module):
 
         self.spatial_encoder = SpatialEncoder(hidden_dim, num_gcn_layers, dropout)
 
-        self.temporal_encoder = TemporalTransformerBlock(
-            hidden_dim, num_heads, ff_mult, dropout, max_window=temporal_window + 8,
-        )
+        # Spatial self-attention over building nodes (replaces temporal transformer)
+        self.spatial_attn = SpatialSelfAttention(hidden_dim, num_heads, dropout)
 
         self.fusion = GatedFusion(hidden_dim)
 
-        # Output: flatten all node features → output_dim
+        # Output: flatten all node features → output_dim (NO final ReLU)
         self.output_proj = nn.Sequential(
             nn.LayerNorm(num_buildings * hidden_dim),
             nn.Linear(num_buildings * hidden_dim, output_dim),
-            nn.ReLU(),
         )
         self.output_dim = output_dim
-
-        self.history = HistoryBuffer(temporal_window, num_buildings, hidden_dim)
 
     def _parse_obs(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -506,14 +426,12 @@ class STEMSEncoder5Bld(nn.Module):
 
         return node_raw, global_raw
 
-    def reset_history(self, batch_size: int = 1, device: torch.device = None):
-        dev = device or next(self.parameters()).device
-        self.history.reset(batch_size, dev)
-
-    def forward(self, obs: torch.Tensor, push_history: bool = True) -> torch.Tensor:
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """
         obs: [B, obs_dim] or [obs_dim]
         Returns: [B, output_dim] feature vector for OmniSafe actor/critic.
+
+        Fully stateless — same computation in rollout and PPO update.
         """
         squeeze = False
         if obs.dim() == 1:
@@ -536,43 +454,23 @@ class STEMSEncoder5Bld(nn.Module):
         # 4. Embed to hidden dim
         node_embed = self.obs_embed(node_input)  # [B, N, D]
 
-        # Detect rollout vs PPO update phase:
-        #   Rollout: OmniSafe uses @torch.no_grad() → is_grad_enabled() == False
-        #   Update: gradients enabled for backprop through policy
-        in_rollout = not torch.is_grad_enabled()
-
-        # 5. Push to history only during sequential rollout
-        if self.history.buffer is None or self.history.buffer.size(0) != B:
-            self.history.reset(B, obs.device)
-        if push_history and in_rollout:
-            self.history.push(node_embed.detach())
-
-        # 6. Adaptive graph
+        # 5. Adaptive graph
         adj = self.graph_constructor(node_embed)  # [N, N]
 
-        # 7. Spatial GCN (process batch in loop for compatibility)
+        # 6. Spatial GCN (process batch in loop for per-sample adj compat)
         h_spatial_list = []
         for b in range(B):
             h_b = self.spatial_encoder(node_embed[b], adj)  # [N, D]
             h_spatial_list.append(h_b)
         h_spatial = torch.stack(h_spatial_list, dim=0)  # [B, N, D]
 
-        # 8. Temporal Transformer: only during rollout (sequential context)
-        #    During PPO updates, observations come in random mini-batches
-        #    so temporal context is meaningless. Use spatial features directly.
-        if in_rollout and self.history.count > 0:
-            history_seq = self.history.get()  # [B, N, T, D]
-            hist_flat = history_seq.reshape(B * N, self.temporal_window, self.hidden_dim)
-            z_temporal, _ = self.temporal_encoder(hist_flat)  # [B*N, D]
-            z_temporal = z_temporal.reshape(B, N, self.hidden_dim)  # [B, N, D]
-        else:
-            # During updates: skip temporal, use spatial output as temporal proxy
-            z_temporal = h_spatial
+        # 7. Spatial self-attention over building nodes
+        z_attn = self.spatial_attn(h_spatial)  # [B, N, D]
 
-        # 9. Gated fusion
-        r = self.fusion(h_spatial, z_temporal)  # [B, N, D]
+        # 8. Gated fusion (GCN spatial + attention)
+        r = self.fusion(h_spatial, z_attn)  # [B, N, D]
 
-        # 10. Flatten and project
+        # 9. Flatten and project (no ReLU — allow negative features)
         r_flat = r.reshape(B, N * self.hidden_dim)  # [B, N*D]
         features = self.output_proj(r_flat)  # [B, output_dim]
 
@@ -583,7 +481,7 @@ class STEMSEncoder5Bld(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 11. Quick sanity check
+# 9. Quick sanity check
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     # Simulate 5-building obs (no real env needed for shape test)
@@ -605,12 +503,20 @@ if __name__ == "__main__":
         hidden_dim=64,
         output_dim=256,
     )
-    encoder.reset_history(1)
 
+    # Test forward pass (no history needed — stateless)
     for step in range(5):
         obs = torch.randn(1, OBS_DIM)
         feat = encoder(obs)
         print(f"Step {step}: obs {obs.shape} -> features {feat.shape}")
+
+    # Test with gradient (simulates PPO update)
+    obs = torch.randn(4, OBS_DIM)
+    obs.requires_grad_(True)
+    feat = encoder(obs)
+    loss = feat.sum()
+    loss.backward()
+    print(f"\nGrad test: obs {obs.shape} -> features {feat.shape}, grad norm: {obs.grad.norm():.4f}")
 
     total = sum(p.numel() for p in encoder.parameters())
     trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)

@@ -333,30 +333,229 @@ def collect_zero_action_rollout(env: Any) -> Dict[str, np.ndarray]:
 # ---------------------------------------------------------------------------
 # Diagnostic tests (Task 2+)
 # ---------------------------------------------------------------------------
-def test_value_function(
-    rollout: Dict[str, np.ndarray], critic: Any
-) -> Dict[str, Any]:
-    """Test 1: Value function accuracy vs. Monte Carlo returns."""
-    raise NotImplementedError("test_value_function — to be implemented in Task 2")
+def test_value_function(data, v_reward=None, v_cost=None, checkpoint_path=None, gamma=GAMMA):
+    """Test 1: Value Function Accuracy."""
+    rewards = data['rewards']
+    costs = data['costs']
+    T = len(rewards)
+
+    # Compute actual discounted returns (backward pass)
+    returns_r = np.zeros(T, dtype=np.float64)
+    returns_c = np.zeros(T, dtype=np.float64)
+    returns_r[T - 1] = rewards[T - 1]
+    returns_c[T - 1] = costs[T - 1]
+    for t in range(T - 2, -1, -1):
+        returns_r[t] = rewards[t] + gamma * returns_r[t + 1]
+        returns_c[t] = costs[t] + gamma * returns_c[t + 1]
+
+    # Explained variance
+    var_r = np.var(returns_r)
+    var_c = np.var(returns_c)
+    ev_r = 1.0 - np.var(returns_r - v_reward) / (var_r + 1e-8) if v_reward is not None else float('nan')
+    ev_c = 1.0 - np.var(returns_c - v_cost) / (var_c + 1e-8) if v_cost is not None else float('nan')
+
+    # TD errors and autocorrelation
+    def autocorr_lag1(x):
+        if len(x) < 3 or np.std(x) < 1e-10:
+            return 0.0
+        return float(np.corrcoef(x[:-1], x[1:])[0, 1])
+
+    td_ac_r, td_ac_c = 0.0, 0.0
+    if v_reward is not None:
+        td_r = rewards[:-1] + gamma * v_reward[1:] - v_reward[:-1]
+        td_ac_r = autocorr_lag1(td_r)
+    if v_cost is not None:
+        td_c = costs[:-1] + gamma * v_cost[1:] - v_cost[:-1]
+        td_ac_c = autocorr_lag1(td_c)
+
+    ev_min = min(ev_r if not np.isnan(ev_r) else 1.0, ev_c if not np.isnan(ev_c) else 1.0)
+    status = 'broken' if ev_min < 0.1 else ('warning' if ev_min < 0.5 else 'healthy')
+
+    return {
+        'ev_reward': float(ev_r), 'ev_cost': float(ev_c),
+        'td_autocorr_reward': float(td_ac_r), 'td_autocorr_cost': float(td_ac_c),
+        'returns_reward_mean': float(np.mean(returns_r)),
+        'returns_cost_mean': float(np.mean(returns_c)),
+        'status': status,
+    }
 
 
-def test_feature_action_mi(rollout: Dict[str, np.ndarray]) -> Dict[str, Any]:
-    """Test 2: Mutual information between key features and actions."""
-    raise NotImplementedError("test_feature_action_mi — to be implemented in Task 3")
+def test_feature_action_mi(data, n_neighbors=5):
+    """Test 2: Feature-action mutual information (KSG estimator)."""
+    from sklearn.feature_selection import mutual_info_regression
+
+    obs = data['obs']       # (T, 330)
+    actions = data['actions']  # (T, 9)
+    T, n_features = obs.shape
+    n_actions = actions.shape[1]
+
+    # Compute full MI matrix
+    mi_matrix = np.zeros((n_features, n_actions), dtype=np.float64)
+    for j in range(n_actions):
+        mi_matrix[:, j] = mutual_info_regression(
+            obs, actions[:, j], n_neighbors=n_neighbors, random_state=42
+        )
+
+    # Noise floor via shuffled obs
+    rng = np.random.RandomState(123)
+    obs_shuffled = obs.copy()
+    for col in range(n_features):
+        rng.shuffle(obs_shuffled[:, col])
+    noise_mis = []
+    for j in range(n_actions):
+        noise_mis.append(np.mean(mutual_info_regression(
+            obs_shuffled, actions[:, j], n_neighbors=n_neighbors, random_state=42
+        )))
+    noise_floor = float(np.mean(noise_mis))
+
+    # Top-5 mean MI
+    flat_mi = mi_matrix.flatten()
+    top5_indices = np.argsort(flat_mi)[-5:]
+    mean_mi_top5 = float(np.mean(flat_mi[top5_indices]))
+
+    # Status
+    if mean_mi_top5 < 2 * noise_floor:
+        status = 'broken'
+    elif mean_mi_top5 < 0.1:
+        status = 'warning'
+    else:
+        status = 'healthy'
+
+    return {
+        'mi_matrix': mi_matrix,
+        'mean_mi_top5': mean_mi_top5,
+        'noise_floor': noise_floor,
+        'status': status,
+    }
 
 
-def test_conditional_entropy(rollout: Dict[str, np.ndarray]) -> Dict[str, Any]:
-    """Test 3: Conditional entropy of actions given state context."""
-    raise NotImplementedError(
-        "test_conditional_entropy — to be implemented in Task 4"
-    )
+def test_conditional_entropy(data, n_bins=20):
+    """Test 3: Conditional entropy reduction of actions given key features."""
+    obs = data['obs']       # (T, 330)
+    actions = data['actions']  # (T, 9)
+    T = obs.shape[0]
+
+    # Key feature indices and names
+    key_features = {
+        'price': PRICE_IDX,
+        'hour_cos': HOUR_COS_IDX,
+        'hour_sin': HOUR_SIN_IDX,
+    }
+    for i, idx in enumerate(SOC_INDICES):
+        key_features[f'soc_{i}'] = idx
+
+    # Battery action columns (0..4)
+    battery_cols = list(range(min(NUM_BUILDINGS, actions.shape[1])))
+
+    entropy_reduction = {}
+
+    for feat_name, feat_idx in key_features.items():
+        feat_vals = obs[:, feat_idx]
+
+        # Quantile binning — handle constant features
+        try:
+            bins = np.percentile(feat_vals, np.linspace(0, 100, n_bins + 1))
+            # Remove duplicate bin edges
+            bins = np.unique(bins)
+            if len(bins) < 2:
+                entropy_reduction[feat_name] = 0.0
+                continue
+            bin_idx = np.digitize(feat_vals, bins[1:-1])
+        except Exception:
+            entropy_reduction[feat_name] = 0.0
+            continue
+
+        # Compute conditional variance reduction (rho) averaged over battery actions
+        rho_per_action = []
+        for act_col in battery_cols:
+            act_vals = actions[:, act_col]
+            total_var = np.var(act_vals)
+            if total_var < 1e-12:
+                rho_per_action.append(0.0)
+                continue
+
+            # Weighted conditional variance
+            cond_var = 0.0
+            for b in np.unique(bin_idx):
+                mask = bin_idx == b
+                n_b = np.sum(mask)
+                if n_b < 2:
+                    cond_var += (n_b / T) * total_var
+                else:
+                    cond_var += (n_b / T) * np.var(act_vals[mask])
+
+            rho = 1.0 - cond_var / (total_var + 1e-12)
+            rho_per_action.append(float(rho))
+
+        entropy_reduction[feat_name] = float(np.mean(rho_per_action))
+
+    # Top-5 mean rho
+    rho_vals = sorted(entropy_reduction.values(), reverse=True)
+    mean_rho_top5 = float(np.mean(rho_vals[:5])) if len(rho_vals) >= 5 else float(np.mean(rho_vals))
+
+    # Status
+    if mean_rho_top5 < 0.01:
+        status = 'broken'
+    elif mean_rho_top5 < 0.05:
+        status = 'warning'
+    else:
+        status = 'healthy'
+
+    return {
+        'entropy_reduction': entropy_reduction,
+        'mean_rho_top5': mean_rho_top5,
+        'status': status,
+    }
 
 
-def test_action_correlation(rollout: Dict[str, np.ndarray]) -> Dict[str, Any]:
+def test_action_correlation(data):
     """Test 4: Inter-building action correlation analysis."""
-    raise NotImplementedError(
-        "test_action_correlation — to be implemented in Task 5"
-    )
+    actions = data['actions']  # (T, 9)
+    T = actions.shape[0]
+
+    # Battery actions: columns 0..4
+    n_batt = min(NUM_BUILDINGS, actions.shape[1])
+    batt_actions = actions[:, :n_batt]  # (T, 5)
+
+    # 5x5 Pearson correlation matrix
+    battery_corr_matrix = np.corrcoef(batt_actions.T)  # (5, 5)
+
+    # Mean absolute off-diagonal correlation
+    mask = ~np.eye(n_batt, dtype=bool)
+    mean_abs_corr = float(np.mean(np.abs(battery_corr_matrix[mask])))
+
+    # Spatial variance ratio: eta = mean(Var_across_buildings_per_timestep) / Var(all_battery_actions)
+    var_across_buildings_per_t = np.var(batt_actions, axis=1)  # (T,) variance across 5 buildings each step
+    total_var = np.var(batt_actions)
+    spatial_variance_ratio = float(np.mean(var_across_buildings_per_t) / (total_var + 1e-12))
+
+    # ACF for each battery action up to lag 48
+    max_lag = min(48, T - 1)
+    acf = np.zeros((n_batt, max_lag), dtype=np.float64)
+    for j in range(n_batt):
+        x = batt_actions[:, j]
+        x_centered = x - np.mean(x)
+        var_x = np.var(x)
+        if var_x < 1e-12:
+            continue
+        for lag in range(max_lag):
+            acf[j, lag] = float(np.mean(x_centered[:T - lag - 1] * x_centered[lag + 1:])) / (var_x + 1e-12)
+
+    # Status
+    if mean_abs_corr > 0.9 or spatial_variance_ratio < 0.05:
+        status = 'broken'
+    elif mean_abs_corr > 0.7 or spatial_variance_ratio < 0.1:
+        status = 'warning'
+    else:
+        status = 'healthy'
+
+    return {
+        'battery_corr_matrix': battery_corr_matrix,
+        'mean_abs_corr': mean_abs_corr,
+        'spatial_variance_ratio': spatial_variance_ratio,
+        'acf': acf,
+        'status': status,
+    }
 
 
 def test_gradient_attribution(

@@ -234,31 +234,19 @@ class TestScaffold:
         assert len(SOC_INDICES) == NUM_BUILDINGS
 
     def test_placeholder_functions_raise(self) -> None:
-        """All placeholder test functions should raise NotImplementedError."""
+        """Remaining placeholder test functions should raise NotImplementedError."""
         from scripts.diagnose_policy_health import (
             compute_phi,
             diagnose,
             generate_report,
-            test_action_correlation,
-            test_conditional_entropy,
             test_constraint_decomposition,
-            test_feature_action_mi,
             test_gradient_attribution,
             test_headroom,
             test_temporal_planning,
-            test_value_function,
         )
 
         rollout = make_synthetic_rollout(T=10)
 
-        with pytest.raises(NotImplementedError):
-            test_value_function(rollout, None)
-        with pytest.raises(NotImplementedError):
-            test_feature_action_mi(rollout)
-        with pytest.raises(NotImplementedError):
-            test_conditional_entropy(rollout)
-        with pytest.raises(NotImplementedError):
-            test_action_correlation(rollout)
         with pytest.raises(NotImplementedError):
             test_gradient_attribution(rollout, None)
         with pytest.raises(NotImplementedError):
@@ -273,3 +261,86 @@ class TestScaffold:
             diagnose("dummy", "/tmp")
         with pytest.raises(NotImplementedError):
             generate_report({}, "/tmp")
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Value Function tests
+# ---------------------------------------------------------------------------
+class TestValueFunction:
+    def test_returns_expected_keys(self):
+        data = make_synthetic_rollout(T=200)
+        T = len(data['rewards'])
+        returns_r = np.zeros(T, dtype=np.float32)
+        returns_r[-1] = data['rewards'][-1]
+        for t in range(T - 2, -1, -1):
+            returns_r[t] = data['rewards'][t] + 0.99 * returns_r[t + 1]
+        v_pred_r = returns_r + np.random.randn(T).astype(np.float32) * 0.5
+        v_pred_c = np.cumsum(data['costs'][::-1])[::-1].astype(np.float32) * 0.01 + np.random.randn(T).astype(np.float32) * 0.5
+        from scripts.diagnose_policy_health import test_value_function
+        result = test_value_function(data, v_reward=v_pred_r, v_cost=v_pred_c, gamma=0.99)
+        assert 'ev_reward' in result and 'ev_cost' in result and 'status' in result
+        assert result['ev_reward'] > 0.3  # good critic
+
+    def test_random_critic_is_broken(self):
+        data = make_synthetic_rollout(T=200)
+        T = len(data['rewards'])
+        from scripts.diagnose_policy_health import test_value_function
+        result = test_value_function(data, v_reward=np.random.randn(T).astype(np.float32)*100,
+                                     v_cost=np.random.randn(T).astype(np.float32)*100, gamma=0.99)
+        assert result['ev_reward'] < 0.1
+        assert result['status'] == 'broken'
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Mutual Information tests
+# ---------------------------------------------------------------------------
+class TestMutualInformation:
+    def test_detects_correlated_features(self):
+        from scripts.diagnose_policy_health import test_feature_action_mi
+        data = make_synthetic_rollout(T=2000)
+        result = test_feature_action_mi(data)
+        assert result['mi_matrix'].shape == (330, 9)
+        # Price should have higher MI with battery than EV actions
+        assert np.mean(result['mi_matrix'][22, :5]) > np.mean(result['mi_matrix'][22, 5:8])
+        assert 'mean_mi_top5' in result and 'status' in result
+
+    def test_random_actions_low_mi(self):
+        from scripts.diagnose_policy_health import test_feature_action_mi
+        data = make_synthetic_rollout(T=2000)
+        data['actions'] = np.clip(np.random.randn(2000, 9).astype(np.float32), -1, 1)
+        result = test_feature_action_mi(data)
+        assert result['mean_mi_top5'] < 0.1
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Conditional Entropy tests
+# ---------------------------------------------------------------------------
+class TestConditionalEntropy:
+    def test_returns_expected_structure(self):
+        from scripts.diagnose_policy_health import test_conditional_entropy
+        data = make_synthetic_rollout(T=2000)
+        result = test_conditional_entropy(data)
+        assert 'entropy_reduction' in result and isinstance(result['entropy_reduction'], dict)
+        assert 'status' in result
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Action Correlation tests
+# ---------------------------------------------------------------------------
+class TestActionCorrelation:
+    def test_detects_differentiated_buildings(self):
+        from scripts.diagnose_policy_health import test_action_correlation
+        data = make_synthetic_rollout(T=1000)
+        result = test_action_correlation(data)
+        assert result['battery_corr_matrix'].shape == (5, 5)
+        assert 'spatial_variance_ratio' in result
+        assert 'acf' in result and 'status' in result
+
+    def test_identical_actions_detected(self):
+        from scripts.diagnose_policy_health import test_action_correlation
+        data = make_synthetic_rollout(T=1000)
+        for j in range(1, 5):
+            data['actions'][:, j] = data['actions'][:, 0]
+        result = test_action_correlation(data)
+        assert result['mean_abs_corr'] > 0.95
+        assert result['status'] == 'broken'

@@ -955,30 +955,686 @@ def test_headroom(
 # ---------------------------------------------------------------------------
 # Aggregate scoring
 # ---------------------------------------------------------------------------
-def compute_phi(test_results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Compute the overall health score phi from individual test results."""
-    raise NotImplementedError("compute_phi — to be implemented in Task 10")
+def compute_phi(results: Dict[str, Dict[str, Any]]) -> float:
+    """Compute the overall Policy Health Index (PHI) from test results.
+
+    Takes a results dict with keys 'test1' through 'test8'. Returns a float
+    in [0, 1] representing overall policy health.
+
+    Parameters
+    ----------
+    results : dict
+        Keys 'test1'..'test8', each a dict of test-specific metrics.
+
+    Returns
+    -------
+    float
+        PHI score in [0.0, 1.0].
+    """
+    def clip01(x):
+        return max(0.0, min(1.0, x))
+
+    t1 = results.get('test1', {})
+    t2 = results.get('test2', {})
+    t3 = results.get('test3', {})
+    t4 = results.get('test4', {})
+    t5 = results.get('test5', {})
+    t6 = results.get('test6', {})
+    t7 = results.get('test7', {})
+
+    ev_r = t1.get('ev_reward', 0)
+    ev_c = t1.get('ev_cost', 0)
+    s_value = clip01(np.mean([
+        ev_r if not np.isnan(ev_r) else 0,
+        ev_c if not np.isnan(ev_c) else 0,
+    ]))
+
+    s_mi = clip01(t2.get('mean_mi_top5', 0) / 0.3)
+
+    s_entropy = clip01(t3.get('mean_rho_top5', 0) / 0.2)
+
+    s_corr = (
+        clip01(1.0 - t4.get('mean_abs_corr', 1.0) / 0.9)
+        * clip01(t4.get('spatial_variance_ratio', 0) / 0.1)
+    )
+
+    s_gradient = (
+        clip01(t5.get('temporal_fraction', 0) / 0.2)
+        * clip01(t5.get('price_gradient', 0) / 0.01)
+    )
+
+    tps_s = clip01(t6.get('tps', 0) / 0.1)
+    perturb = t6.get('perturbation_effects', {}).get('zero_history', 0)
+    if isinstance(perturb, float) and np.isnan(perturb):
+        perturb = 0.0
+    s_temporal = (tps_s * clip01(perturb / 0.05)) ** 0.5
+
+    s_constraints = clip01(1.0 - t7.get('total_behavioral_vr', 1.0) / 0.5)
+
+    return float(
+        0.20 * s_value
+        + 0.20 * s_mi
+        + 0.10 * s_entropy
+        + 0.10 * s_corr
+        + 0.10 * s_gradient
+        + 0.20 * s_temporal
+        + 0.10 * s_constraints
+    )
 
 
 # ---------------------------------------------------------------------------
-# Orchestration
+# Decision-tree diagnosis
 # ---------------------------------------------------------------------------
-def diagnose(
-    checkpoint_path: str,
-    output_dir: str,
-    config_path: Optional[str] = None,
-    skip_env: bool = False,
-    rollout_data_path: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Run the full diagnostic suite and return structured results."""
-    raise NotImplementedError("diagnose — to be implemented in Task 10")
+def diagnose(results: Dict[str, Dict[str, Any]]) -> str:
+    """Produce an actionable diagnosis string from test results.
+
+    Walks a decision tree over the test metrics, returning the first
+    matching failure mode or an 'ARCHITECTURE WORKS' message.
+
+    Parameters
+    ----------
+    results : dict
+        Keys 'test1'..'test8', each a dict of test-specific metrics.
+
+    Returns
+    -------
+    str
+        Human-readable diagnosis with fix suggestions.
+    """
+    t1 = results.get('test1', {})
+    t2 = results.get('test2', {})
+    t4 = results.get('test4', {})
+    t5 = results.get('test5', {})
+    t6 = results.get('test6', {})
+    t7 = results.get('test7', {})
+    t8 = results.get('test8', {})
+
+    ev_r = t1.get('ev_reward', 0)
+    ev_c = t1.get('ev_cost', 0)
+    if (ev_r if not np.isnan(ev_r) else 1) < 0.1 or (ev_c if not np.isnan(ev_c) else 1) < 0.1:
+        return (
+            f"CRITIC BROKEN: Value function cannot predict returns "
+            f"(EV_r={ev_r:.3f}, EV_c={ev_c:.3f}). "
+            f"Fix: increase critic LR, add critic update epochs."
+        )
+
+    mi = t2.get('mean_mi_top5', 0)
+    if mi < 0.02:
+        pg = t5.get('price_gradient', 0)
+        if (pg if not np.isnan(pg) else 0) < 0.001:
+            return (
+                f"ENCODER DEAD: Price->action gradient near zero "
+                f"(price_grad={pg:.5f}). "
+                f"Fix: check global encoder -> broadcast -> per-node integration."
+            )
+        return (
+            f"POLICY TOO NOISY: Gradients exist but MI low "
+            f"(MI={mi:.4f}). "
+            f"Fix: reduce PolicyStd, more training epochs."
+        )
+
+    if t4.get('mean_abs_corr', 0) > 0.9:
+        return (
+            f"GCN DEAD: All buildings identical "
+            f"(mean_corr={t4['mean_abs_corr']:.3f}). "
+            f"Fix: check adjacency, gated fusion."
+        )
+
+    if t8.get('total_reward_vs_baseline', 0) < 0:
+        return (
+            f"WORSE THAN ZERO-ACTION: Lambda erasing reward "
+            f"(delta={t8['total_reward_vs_baseline']:.1f}). "
+            f"Fix: enable standardized_cost_adv, raise cost_limit."
+        )
+
+    tf = t5.get('temporal_fraction', 0)
+    tps = t6.get('tps', 0)
+    if (tf if not np.isnan(tf) else 0) < 0.01 and tps < 0.02:
+        return (
+            f"TEMPORAL DEAD: History no effect "
+            f"(temporal_frac={tf:.4f}, TPS={tps:.4f}). "
+            f"Fix: check concat projection weights."
+        )
+
+    if t7.get('total_behavioral_vr', 0) > 0.5:
+        return (
+            f"CONSTRAINT FAILURE: Avoidable violations "
+            f"(behavioral_VR={t7['total_behavioral_vr']:.3f}). "
+            f"Fix: dense cost shaping."
+        )
+
+    return "ARCHITECTURE WORKS: Policy shows learning signals. Needs more training epochs with lambda cap."
 
 
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
 def generate_report(
-    results: Dict[str, Any], output_dir: str
+    results: Dict[str, Any],
+    phi: float,
+    diagnosis: str,
+    output_dir: str,
 ) -> str:
-    """Write JSON report and summary to output_dir. Returns report path."""
-    raise NotImplementedError("generate_report — to be implemented in Task 10")
+    """Generate diagnostic report with figures, markdown, and JSON.
+
+    Creates:
+      - figures/mi_heatmap.png
+      - figures/cross_temporal_corr.png
+      - figures/building_correlation.png
+      - figures/action_autocorrelation.png
+      - figures/violation_timing.png
+      - report.md
+      - phi_score.json
+
+    Parameters
+    ----------
+    results : dict
+        Keys 'test1'..'test8' with per-test metric dicts.
+    phi : float
+        Computed PHI score.
+    diagnosis : str
+        Diagnosis string from diagnose().
+    output_dir : str
+        Directory to write all outputs.
+
+    Returns
+    -------
+    str
+        Path to the generated report.md file.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig_dir = os.path.join(output_dir, 'figures')
+    os.makedirs(fig_dir, exist_ok=True)
+
+    # --- Figure 1: MI heatmap ---
+    t2 = results.get('test2', {})
+    mi_matrix = t2.get('mi_matrix', None)
+    if mi_matrix is not None:
+        mi_matrix = np.asarray(mi_matrix)
+        # Top 30 features by max MI across actions
+        max_mi_per_feature = mi_matrix.max(axis=1)
+        top30_idx = np.argsort(max_mi_per_feature)[-30:][::-1]
+        mi_top30 = mi_matrix[top30_idx, :]
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(mi_top30, aspect='auto', cmap='viridis')
+        ax.set_xlabel('Action dimension')
+        ax.set_ylabel('Feature index (top 30 by max MI)')
+        ax.set_yticks(range(len(top30_idx)))
+        ax.set_yticklabels([str(i) for i in top30_idx], fontsize=7)
+        ax.set_title('Feature-Action Mutual Information (top 30)')
+        plt.colorbar(im, ax=ax, label='MI (nats)')
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, 'mi_heatmap.png'), dpi=150)
+        plt.close(fig)
+
+    # --- Figure 2: Cross-temporal correlation bar chart ---
+    t6 = results.get('test6', {})
+    ctc = t6.get('cross_temporal_corr', None)
+    if ctc is not None:
+        lags = sorted(ctc.keys(), key=lambda x: int(x))
+        corr_vals = [ctc[lag] for lag in lags]
+        fig, ax = plt.subplots(figsize=(10, 4))
+        colors = ['#d62728' if int(lag) < 0 else '#1f77b4' for lag in lags]
+        ax.bar([int(lag) for lag in lags], corr_vals, color=colors, width=0.8)
+        ax.axhline(0, color='black', linewidth=0.5)
+        ax.set_xlabel('Lag (hours)')
+        ax.set_ylabel('Mean correlation with price')
+        ax.set_title(f'Cross-temporal correlation (TPS={t6.get("tps", 0):.4f})')
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, 'cross_temporal_corr.png'), dpi=150)
+        plt.close(fig)
+
+    # --- Figure 3: Building correlation 5x5 heatmap ---
+    t4 = results.get('test4', {})
+    corr_matrix = t4.get('battery_corr_matrix', None)
+    if corr_matrix is not None:
+        corr_matrix = np.asarray(corr_matrix)
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+        n = corr_matrix.shape[0]
+        for i in range(n):
+            for j in range(n):
+                ax.text(j, i, f'{corr_matrix[i, j]:.2f}', ha='center', va='center', fontsize=9)
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels([f'B{i}' for i in range(n)])
+        ax.set_yticklabels([f'B{i}' for i in range(n)])
+        ax.set_title(f'Battery Action Correlation (mean_abs={t4.get("mean_abs_corr", 0):.3f})')
+        plt.colorbar(im, ax=ax, label='Pearson r')
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, 'building_correlation.png'), dpi=150)
+        plt.close(fig)
+
+    # --- Figure 4: Action autocorrelation curves ---
+    acf_data = t4.get('acf', None)
+    if acf_data is not None:
+        if isinstance(acf_data, dict):
+            # dict keyed by building index
+            fig, ax = plt.subplots(figsize=(10, 4))
+            for j in sorted(acf_data.keys(), key=lambda x: int(x)):
+                acf_vals = np.asarray(acf_data[j])
+                ax.plot(range(len(acf_vals)), acf_vals, label=f'B{j}', alpha=0.7)
+            ax.set_xlabel('Lag (hours)')
+            ax.set_ylabel('Autocorrelation')
+            ax.set_title('Battery Action Autocorrelation')
+            ax.legend(fontsize=8)
+            ax.axhline(0, color='black', linewidth=0.5)
+            fig.tight_layout()
+            fig.savefig(os.path.join(fig_dir, 'action_autocorrelation.png'), dpi=150)
+            plt.close(fig)
+        else:
+            # numpy array (n_batt, max_lag)
+            acf_arr = np.asarray(acf_data)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            for j in range(acf_arr.shape[0]):
+                ax.plot(range(acf_arr.shape[1]), acf_arr[j], label=f'B{j}', alpha=0.7)
+            ax.set_xlabel('Lag (hours)')
+            ax.set_ylabel('Autocorrelation')
+            ax.set_title('Battery Action Autocorrelation')
+            ax.legend(fontsize=8)
+            ax.axhline(0, color='black', linewidth=0.5)
+            fig.tight_layout()
+            fig.savefig(os.path.join(fig_dir, 'action_autocorrelation.png'), dpi=150)
+            plt.close(fig)
+
+    # --- Figure 5: Violation timing 24-hour heatmap ---
+    t7 = results.get('test7', {})
+    per_constraint = t7.get('per_constraint', None)
+    if per_constraint is not None and len(per_constraint) > 0:
+        constraint_names = sorted(per_constraint.keys())
+        n_constraints = len(constraint_names)
+        hourly_matrix = np.zeros((n_constraints, 24))
+        for i, cname in enumerate(constraint_names):
+            hvr = per_constraint[cname].get('hourly_violation_rate', np.zeros(24))
+            hvr = np.asarray(hvr)
+            hourly_matrix[i, :len(hvr)] = hvr[:24]
+
+        fig, ax = plt.subplots(figsize=(12, 3))
+        im = ax.imshow(hourly_matrix, aspect='auto', cmap='YlOrRd', vmin=0, vmax=1)
+        ax.set_yticks(range(n_constraints))
+        ax.set_yticklabels(constraint_names)
+        ax.set_xlabel('Hour of day')
+        ax.set_title('Constraint Violation Rate by Hour')
+        plt.colorbar(im, ax=ax, label='Violation rate')
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, 'violation_timing.png'), dpi=150)
+        plt.close(fig)
+
+    # --- report.md ---
+    status_icon = {
+        'healthy': '[OK]',
+        'warning': '[WARN]',
+        'broken': '[FAIL]',
+    }
+    lines = []
+    lines.append('# Policy Health Diagnostic Report')
+    lines.append('')
+    lines.append(f'**PHI Score: {phi:.3f}**')
+    lines.append('')
+    lines.append(f'**Diagnosis:** {diagnosis}')
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+    lines.append('## Per-Test Summary')
+    lines.append('')
+
+    test_names = {
+        'test1': 'Value Function Accuracy',
+        'test2': 'Feature-Action Mutual Information',
+        'test3': 'Conditional Entropy',
+        'test4': 'Inter-Building Action Correlation',
+        'test5': 'Gradient Attribution',
+        'test6': 'Temporal Planning Horizon',
+        'test7': 'Constraint Decomposition',
+        'test8': 'Safety Headroom',
+    }
+
+    for tkey in [f'test{i}' for i in range(1, 9)]:
+        tdata = results.get(tkey, {})
+        tname = test_names.get(tkey, tkey)
+        st = tdata.get('status', 'unknown')
+        icon = status_icon.get(st, '[??]')
+        lines.append(f'### {icon} {tname}')
+        lines.append('')
+        # Print key scalar metrics
+        for k, v in sorted(tdata.items()):
+            if k in ('mi_matrix', 'battery_corr_matrix', 'acf',
+                      'cross_temporal_corr', 'perturbation_effects',
+                      'per_constraint', 'reward_headroom', 'cost_headroom',
+                      'entropy_reduction', 'hourly_violation_rate'):
+                continue
+            if isinstance(v, float):
+                lines.append(f'- {k}: {v:.4f}')
+            elif isinstance(v, (int, str, bool)):
+                lines.append(f'- {k}: {v}')
+        lines.append('')
+
+    report_md = '\n'.join(lines)
+    report_path = os.path.join(output_dir, 'report.md')
+    with open(report_path, 'w') as f:
+        f.write(report_md)
+
+    # --- phi_score.json ---
+    phi_json = {'phi': phi, 'diagnosis': diagnosis}
+    with open(os.path.join(output_dir, 'phi_score.json'), 'w') as f:
+        json.dump(phi_json, f, indent=2)
+
+    return report_path
+
+
+# ---------------------------------------------------------------------------
+# Run all tests
+# ---------------------------------------------------------------------------
+def run_all_tests(
+    data: Dict[str, np.ndarray],
+    baseline_data: Optional[Dict[str, np.ndarray]] = None,
+    actor: Any = None,
+    v_reward: Optional[np.ndarray] = None,
+    v_cost: Optional[np.ndarray] = None,
+    checkpoint_path: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Run all 8 diagnostic tests and return structured results.
+
+    Parameters
+    ----------
+    data : dict
+        Agent rollout data (from collect_rollout or synthetic).
+    baseline_data : dict or None
+        Zero-action baseline rollout.
+    actor : torch.nn.Module or None
+        Policy network for gradient/perturbation tests.
+    v_reward : np.ndarray or None
+        Value predictions for reward critic.
+    v_cost : np.ndarray or None
+        Value predictions for cost critic.
+    checkpoint_path : str or None
+        Path to checkpoint (passed to test_value_function).
+
+    Returns
+    -------
+    dict
+        Keys 'test1'..'test8', each a dict of test-specific metrics.
+    """
+    results = {}
+
+    # Test 1: Value Function Accuracy
+    print("[1/8] Value Function Accuracy...", end=" ", flush=True)
+    try:
+        results['test1'] = test_value_function(
+            data, v_reward=v_reward, v_cost=v_cost,
+            checkpoint_path=checkpoint_path, gamma=GAMMA,
+        )
+        print(f"status={results['test1'].get('status', '?')}")
+    except Exception as e:
+        print(f"SKIPPED ({e})")
+        results['test1'] = {'status': 'skipped', 'error': str(e)}
+
+    # Test 2: Feature-Action MI
+    print("[2/8] Feature-Action Mutual Information...", end=" ", flush=True)
+    try:
+        results['test2'] = test_feature_action_mi(data)
+        print(f"status={results['test2'].get('status', '?')}")
+    except Exception as e:
+        print(f"SKIPPED ({e})")
+        results['test2'] = {'status': 'skipped', 'error': str(e)}
+
+    # Test 3: Conditional Entropy
+    print("[3/8] Conditional Entropy...", end=" ", flush=True)
+    try:
+        results['test3'] = test_conditional_entropy(data)
+        print(f"status={results['test3'].get('status', '?')}")
+    except Exception as e:
+        print(f"SKIPPED ({e})")
+        results['test3'] = {'status': 'skipped', 'error': str(e)}
+
+    # Test 4: Action Correlation
+    print("[4/8] Inter-Building Action Correlation...", end=" ", flush=True)
+    try:
+        results['test4'] = test_action_correlation(data)
+        print(f"status={results['test4'].get('status', '?')}")
+    except Exception as e:
+        print(f"SKIPPED ({e})")
+        results['test4'] = {'status': 'skipped', 'error': str(e)}
+
+    # Test 5: Gradient Attribution
+    print("[5/8] Gradient Attribution...", end=" ", flush=True)
+    if actor is not None:
+        try:
+            results['test5'] = test_gradient_attribution(data, actor)
+            print(f"status={results['test5'].get('status', '?')}")
+        except Exception as e:
+            print(f"SKIPPED ({e})")
+            results['test5'] = {'status': 'skipped', 'error': str(e)}
+    else:
+        print("SKIPPED (no actor)")
+        results['test5'] = {'status': 'skipped', 'error': 'no actor provided'}
+
+    # Test 6: Temporal Planning
+    print("[6/8] Temporal Planning Horizon...", end=" ", flush=True)
+    try:
+        results['test6'] = test_temporal_planning(data, actor=actor)
+        print(f"status={results['test6'].get('status', '?')}")
+    except Exception as e:
+        print(f"SKIPPED ({e})")
+        results['test6'] = {'status': 'skipped', 'error': str(e)}
+
+    # Test 7: Constraint Decomposition
+    print("[7/8] Constraint Decomposition...", end=" ", flush=True)
+    try:
+        results['test7'] = test_constraint_decomposition(data)
+        print(f"status={results['test7'].get('status', '?')}")
+    except Exception as e:
+        print(f"SKIPPED ({e})")
+        results['test7'] = {'status': 'skipped', 'error': str(e)}
+
+    # Test 8: Safety Headroom
+    print("[8/8] Safety Headroom...", end=" ", flush=True)
+    try:
+        results['test8'] = test_headroom(data, baseline_data=baseline_data)
+        print(f"status={results['test8'].get('status', '?')}")
+    except Exception as e:
+        print(f"SKIPPED ({e})")
+        results['test8'] = {'status': 'skipped', 'error': str(e)}
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint loading
+# ---------------------------------------------------------------------------
+def load_actor_from_checkpoint(
+    checkpoint_path: str,
+) -> Tuple[Any, Optional[Dict[str, Any]]]:
+    """Load the policy actor from a training checkpoint.
+
+    Detects STEMS vs MLP architecture by checking for 'mean.encoder.' keys
+    in the state dict.
+
+    Parameters
+    ----------
+    checkpoint_path : str
+        Path to the checkpoint file (.pt or directory containing one).
+
+    Returns
+    -------
+    tuple of (actor, obs_normalizer_dict_or_None)
+        actor is a torch.nn.Module, obs_normalizer is a dict or None.
+    """
+    import torch
+
+    # Find the checkpoint file
+    ckpt_file = checkpoint_path
+    if os.path.isdir(checkpoint_path):
+        # Look for common checkpoint filenames
+        candidates = ['model.pt', 'actor.pt', 'checkpoint.pt']
+        for c in candidates:
+            p = os.path.join(checkpoint_path, c)
+            if os.path.exists(p):
+                ckpt_file = p
+                break
+        else:
+            # Try torch_save subdirectory
+            ts_dir = os.path.join(checkpoint_path, 'torch_save')
+            if os.path.isdir(ts_dir):
+                for c in candidates:
+                    p = os.path.join(ts_dir, c)
+                    if os.path.exists(p):
+                        ckpt_file = p
+                        break
+
+    ckpt = torch.load(ckpt_file, map_location='cpu', weights_only=False)
+
+    # Get the actor state dict
+    if 'pi' in ckpt:
+        actor_sd = ckpt['pi']
+    elif 'actor' in ckpt:
+        actor_sd = ckpt['actor']
+    else:
+        actor_sd = ckpt
+
+    # Detect STEMS vs MLP by checking for encoder keys
+    is_stems = any('encoder.' in k or 'mean.encoder.' in k for k in actor_sd.keys())
+
+    # Strip 'mean.' prefix if present
+    cleaned_sd = {}
+    for k, v in actor_sd.items():
+        if k.startswith('mean.'):
+            cleaned_sd[k[5:]] = v
+        else:
+            cleaned_sd[k] = v
+
+    if is_stems:
+        # Reconstruct STEMS architecture from checkpoint
+        from scripts.stems_v3 import STEMSEncoderV3, STEMSMeanNet
+
+        # Extract node_info from checkpoint buffers
+        node_info = {}
+        buffer_keys = ['bld_idx', 'ev_idx', 'ev_mask', 'global_idx']
+        for bk in buffer_keys:
+            for k, v in cleaned_sd.items():
+                if bk in k:
+                    node_info[bk] = v
+                    break
+
+        # Infer base_obs_dim from global encoder weight shape
+        base_obs_dim = CURRENT_OBS_DIM
+        for k, v in cleaned_sd.items():
+            if 'global_enc' in k and 'weight' in k and v.dim() == 2:
+                base_obs_dim = v.shape[1]
+                break
+
+        encoder = STEMSEncoderV3(
+            obs_dim=OBS_DIM,
+            base_obs_dim=base_obs_dim,
+            node_info=node_info,
+        )
+        actor = STEMSMeanNet(encoder=encoder, action_dim=ACT_DIM)
+        actor.load_state_dict(cleaned_sd, strict=False)
+    else:
+        # MLP architecture: infer dimensions from weight shapes
+        layer_dims = []
+        weight_keys = sorted([k for k in cleaned_sd.keys() if 'weight' in k])
+        for k in weight_keys:
+            w = cleaned_sd[k]
+            if w.dim() == 2:
+                if not layer_dims:
+                    layer_dims.append(w.shape[1])  # input dim
+                layer_dims.append(w.shape[0])  # output dim
+
+        if not layer_dims:
+            raise ValueError("Cannot infer MLP dimensions from checkpoint")
+
+        import torch.nn as nn
+        layers = []
+        for i in range(len(layer_dims) - 1):
+            layers.append(nn.Linear(layer_dims[i], layer_dims[i + 1]))
+            if i < len(layer_dims) - 2:
+                layers.append(nn.Tanh())
+        # Final Tanh for action output
+        layers.append(nn.Tanh())
+        actor = nn.Sequential(*layers)
+        actor.load_state_dict(cleaned_sd, strict=False)
+
+    actor.eval()
+
+    # Load obs normalizer if present
+    obs_norm = ckpt.get('obs_normalizer', None)
+
+    return actor, obs_norm
+
+
+def load_critics_from_checkpoint(
+    checkpoint_path: str,
+) -> Tuple[Any, Any]:
+    """Load reward and cost critics from a training checkpoint.
+
+    Parameters
+    ----------
+    checkpoint_path : str
+        Path to the checkpoint file.
+
+    Returns
+    -------
+    tuple of (v_r_critic, v_c_critic)
+        Both are torch.nn.Module instances, or None if not found.
+    """
+    import torch
+    import torch.nn as nn
+
+    # Find the checkpoint file
+    ckpt_file = checkpoint_path
+    if os.path.isdir(checkpoint_path):
+        candidates = ['model.pt', 'actor.pt', 'checkpoint.pt']
+        for c in candidates:
+            p = os.path.join(checkpoint_path, c)
+            if os.path.exists(p):
+                ckpt_file = p
+                break
+        else:
+            ts_dir = os.path.join(checkpoint_path, 'torch_save')
+            if os.path.isdir(ts_dir):
+                for c in candidates:
+                    p = os.path.join(ts_dir, c)
+                    if os.path.exists(p):
+                        ckpt_file = p
+                        break
+
+    ckpt = torch.load(ckpt_file, map_location='cpu', weights_only=False)
+
+    def _build_critic(state_dict):
+        """Build a critic MLP from a state dict by inferring layer shapes."""
+        if state_dict is None:
+            return None
+        weight_keys = sorted([k for k in state_dict.keys() if 'weight' in k])
+        layer_dims = []
+        for k in weight_keys:
+            w = state_dict[k]
+            if w.dim() == 2:
+                if not layer_dims:
+                    layer_dims.append(w.shape[1])
+                layer_dims.append(w.shape[0])
+
+        if not layer_dims:
+            return None
+
+        layers = []
+        for i in range(len(layer_dims) - 1):
+            layers.append(nn.Linear(layer_dims[i], layer_dims[i + 1]))
+            if i < len(layer_dims) - 2:
+                layers.append(nn.Tanh())
+        critic = nn.Sequential(*layers)
+        critic.load_state_dict(state_dict, strict=False)
+        critic.eval()
+        return critic
+
+    v_r = _build_critic(ckpt.get('vr', None))
+    v_c = _build_critic(ckpt.get('vc', None))
+
+    return v_r, v_c
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +1642,11 @@ def generate_report(
 # ---------------------------------------------------------------------------
 def main() -> None:
     args = parse_args()
+
+    # Set environment variables for CityLearn
+    os.environ.setdefault('CITYLEARN_CENTRAL_AGENT', '1')
+    os.environ.setdefault('CITYLEARN_TEMPORAL_WINDOW', str(TEMPORAL_WINDOW))
+    os.environ.setdefault('CITYLEARN_NUM_BUILDINGS', str(NUM_BUILDINGS))
 
     # Resolve output directory
     if args.output_dir is None:
@@ -1004,36 +1665,151 @@ def main() -> None:
     print(f"  Skip env:     {args.skip_env}")
     print(f"  Rollout data: {args.rollout_data or '(none)'}")
     print()
-    print("  Scaffold loaded successfully.")
-    print("  Individual tests are not yet implemented (NotImplementedError).")
-    print()
-    print(f"  Constants:")
-    print(f"    NUM_BUILDINGS          = {NUM_BUILDINGS}")
-    print(f"    OBS_DIM                = {OBS_DIM}")
-    print(f"    ACT_DIM                = {ACT_DIM}")
-    print(f"    CURRENT_OBS_DIM        = {CURRENT_OBS_DIM}")
-    print(f"    TEMPORAL_WINDOW        = {TEMPORAL_WINDOW}")
-    print(f"    TEMPORAL_FEATURES/STEP = {TEMPORAL_FEATURES_PER_STEP}")
-    print(f"    GAMMA                  = {GAMMA}")
-    print(f"    PRICE_IDX              = {PRICE_IDX}")
-    print(f"    SOC_INDICES            = {SOC_INDICES}")
-    print(f"    HISTORY_START          = {HISTORY_START}")
-    print(f"    HISTORY_END            = {HISTORY_END}")
-    print("=" * 60)
 
-    # Write a marker file so tests can verify the output dir was created
-    marker = os.path.join(output_dir, "scaffold_ok.json")
-    with open(marker, "w") as f:
-        json.dump(
-            {
-                "status": "scaffold",
-                "checkpoint": args.checkpoint,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            },
-            f,
-            indent=2,
-        )
-    print(f"  Wrote marker: {marker}")
+    # ---------------------------------------------------------------
+    # Step 1: Load actor + critics from checkpoint
+    # ---------------------------------------------------------------
+    print("Loading checkpoint...")
+    try:
+        actor, obs_norm = load_actor_from_checkpoint(args.checkpoint)
+        print(f"  Actor loaded: {type(actor).__name__}")
+    except Exception as e:
+        print(f"  WARNING: Could not load actor: {e}")
+        actor, obs_norm = None, None
+
+    v_r_critic, v_c_critic = None, None
+    try:
+        v_r_critic, v_c_critic = load_critics_from_checkpoint(args.checkpoint)
+        if v_r_critic is not None:
+            print(f"  Reward critic loaded: {type(v_r_critic).__name__}")
+        if v_c_critic is not None:
+            print(f"  Cost critic loaded: {type(v_c_critic).__name__}")
+    except Exception as e:
+        print(f"  WARNING: Could not load critics: {e}")
+
+    # ---------------------------------------------------------------
+    # Step 2: Collect or load rollout data
+    # ---------------------------------------------------------------
+    import torch
+
+    data = None
+    baseline_data = None
+
+    if args.rollout_data is not None:
+        print(f"Loading pre-saved rollout from {args.rollout_data}...")
+        npz = np.load(args.rollout_data, allow_pickle=True)
+        data = {k: npz[k] for k in npz.files}
+        print(f"  Loaded {len(data['rewards'])} timesteps")
+
+        # Check for baseline in same directory
+        base_dir = os.path.dirname(args.rollout_data)
+        baseline_path = os.path.join(base_dir, 'baseline_data.npz')
+        if os.path.exists(baseline_path):
+            npz_b = np.load(baseline_path, allow_pickle=True)
+            baseline_data = {k: npz_b[k] for k in npz_b.files}
+            print(f"  Loaded baseline: {len(baseline_data['rewards'])} timesteps")
+
+    elif not args.skip_env:
+        print("Instantiating environment and collecting rollouts...")
+        try:
+            # Import environment setup
+            from omnisafe.common.env import make as omnisafe_make
+
+            env = omnisafe_make('CityLearnEnv-v0', config=args.config)
+
+            print("  Collecting policy rollout...")
+            data = collect_rollout(actor, env, deterministic=True)
+            print(f"  Policy rollout: {len(data['rewards'])} timesteps")
+
+            print("  Collecting zero-action baseline...")
+            baseline_data = collect_zero_action_rollout(env)
+            print(f"  Baseline rollout: {len(baseline_data['rewards'])} timesteps")
+
+            # Save rollout data
+            rollout_path = os.path.join(output_dir, 'rollout_data.npz')
+            np.savez_compressed(rollout_path, **data)
+            baseline_path = os.path.join(output_dir, 'baseline_data.npz')
+            np.savez_compressed(baseline_path, **baseline_data)
+            print(f"  Saved rollout data to {rollout_path}")
+        except Exception as e:
+            print(f"  ERROR collecting rollouts: {e}")
+            print("  Falling back to skip-env mode.")
+
+    if data is None:
+        print("ERROR: No rollout data available. Use --rollout-data or remove --skip-env.")
+        sys.exit(1)
+
+    # ---------------------------------------------------------------
+    # Step 3: Compute value predictions using critics
+    # ---------------------------------------------------------------
+    v_reward = None
+    v_cost = None
+    if v_r_critic is not None:
+        print("Computing reward value predictions...")
+        obs_t = torch.as_tensor(data['obs'], dtype=torch.float32)
+        with torch.no_grad():
+            v_reward = v_r_critic(obs_t).squeeze(-1).numpy()
+
+    if v_c_critic is not None:
+        print("Computing cost value predictions...")
+        obs_t = torch.as_tensor(data['obs'], dtype=torch.float32)
+        with torch.no_grad():
+            v_cost = v_c_critic(obs_t).squeeze(-1).numpy()
+
+    # ---------------------------------------------------------------
+    # Step 4: Run all tests
+    # ---------------------------------------------------------------
+    print()
+    print("Running diagnostic tests...")
+    print("-" * 40)
+    results = run_all_tests(
+        data, baseline_data,
+        actor=actor, v_reward=v_reward, v_cost=v_cost,
+        checkpoint_path=args.checkpoint,
+    )
+
+    # ---------------------------------------------------------------
+    # Step 5: Compute PHI + diagnosis
+    # ---------------------------------------------------------------
+    print()
+    print("-" * 40)
+    phi = compute_phi(results)
+    diagnosis_str = diagnose(results)
+    print(f"PHI Score: {phi:.3f}")
+    print(f"Diagnosis: {diagnosis_str}")
+
+    # ---------------------------------------------------------------
+    # Step 6: Generate report
+    # ---------------------------------------------------------------
+    print()
+    print("Generating report...")
+    report_path = generate_report(results, phi, diagnosis_str, output_dir)
+    print(f"  Report: {report_path}")
+
+    # Save MI matrix if available
+    mi_matrix = results.get('test2', {}).get('mi_matrix', None)
+    if mi_matrix is not None:
+        mi_path = os.path.join(output_dir, 'mi_matrix.npy')
+        np.save(mi_path, mi_matrix)
+        print(f"  MI matrix: {mi_path}")
+
+    # ---------------------------------------------------------------
+    # Step 7: Summary
+    # ---------------------------------------------------------------
+    print()
+    print("=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"  PHI Score:  {phi:.3f}")
+    print(f"  Diagnosis:  {diagnosis_str}")
+    print()
+    for tkey in [f'test{i}' for i in range(1, 9)]:
+        tdata = results.get(tkey, {})
+        st = tdata.get('status', 'unknown')
+        print(f"  {tkey}: {st}")
+    print()
+    print(f"  Output directory: {output_dir}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

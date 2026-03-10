@@ -233,20 +233,18 @@ class TestScaffold:
         assert HISTORY_END == OBS_DIM
         assert len(SOC_INDICES) == NUM_BUILDINGS
 
-    def test_placeholder_functions_raise(self) -> None:
-        """Remaining placeholder test functions should raise NotImplementedError."""
+    def test_core_functions_importable(self) -> None:
+        """compute_phi, diagnose, generate_report should be importable and callable."""
         from scripts.diagnose_policy_health import (
             compute_phi,
             diagnose,
             generate_report,
+            run_all_tests,
         )
-
-        with pytest.raises(NotImplementedError):
-            compute_phi({})
-        with pytest.raises(NotImplementedError):
-            diagnose("dummy", "/tmp")
-        with pytest.raises(NotImplementedError):
-            generate_report({}, "/tmp")
+        assert callable(compute_phi)
+        assert callable(diagnose)
+        assert callable(generate_report)
+        assert callable(run_all_tests)
 
 
 # ---------------------------------------------------------------------------
@@ -433,3 +431,117 @@ class TestHeadroom:
         result = test_headroom(data, baseline)
         assert result['total_reward_vs_baseline'] < 0
         assert result['status'] in ['broken', 'warning']
+
+
+# ---------------------------------------------------------------------------
+# Task 9: PHI Score, Diagnosis, Report Generation tests
+# ---------------------------------------------------------------------------
+class TestPHIAndDiagnosis:
+    def test_phi_returns_0_to_1(self):
+        from scripts.diagnose_policy_health import compute_phi
+        results = {f'test{i}': {} for i in range(1, 9)}
+        results['test1'] = {'ev_reward': 0.7, 'ev_cost': 0.6}
+        results['test2'] = {'mean_mi_top5': 0.15}
+        results['test3'] = {'mean_rho_top5': 0.1}
+        results['test4'] = {'mean_abs_corr': 0.3, 'spatial_variance_ratio': 0.15}
+        results['test5'] = {'temporal_fraction': 0.15, 'price_gradient': 0.02}
+        results['test6'] = {'tps': 0.08, 'perturbation_effects': {'zero_history': 0.06}}
+        results['test7'] = {'total_behavioral_vr': 0.2}
+        phi = compute_phi(results)
+        assert 0.0 <= phi <= 1.0 and phi > 0.3
+
+    def test_phi_empty_results_returns_valid(self):
+        from scripts.diagnose_policy_health import compute_phi
+        results = {f'test{i}': {} for i in range(1, 9)}
+        phi = compute_phi(results)
+        assert 0.0 <= phi <= 1.0
+
+    def test_broken_critic_diagnosed(self):
+        from scripts.diagnose_policy_health import diagnose
+        results = {f'test{i}': {} for i in range(1, 9)}
+        results['test1'] = {'ev_reward': 0.05, 'ev_cost': 0.02}
+        results['test8'] = {'total_reward_vs_baseline': -500}
+        d = diagnose(results)
+        assert 'CRITIC BROKEN' in d
+
+    def test_gcn_dead_diagnosed(self):
+        from scripts.diagnose_policy_health import diagnose
+        results = {f'test{i}': {} for i in range(1, 9)}
+        results['test1'] = {'ev_reward': 0.5, 'ev_cost': 0.5}
+        results['test2'] = {'mean_mi_top5': 0.1}
+        results['test4'] = {'mean_abs_corr': 0.95}
+        d = diagnose(results)
+        assert 'GCN DEAD' in d
+
+    def test_architecture_works_diagnosed(self):
+        from scripts.diagnose_policy_health import diagnose
+        results = {f'test{i}': {} for i in range(1, 9)}
+        results['test1'] = {'ev_reward': 0.7, 'ev_cost': 0.6}
+        results['test2'] = {'mean_mi_top5': 0.15}
+        results['test4'] = {'mean_abs_corr': 0.3}
+        results['test5'] = {'temporal_fraction': 0.15, 'price_gradient': 0.02}
+        results['test6'] = {'tps': 0.08}
+        results['test7'] = {'total_behavioral_vr': 0.1}
+        results['test8'] = {'total_reward_vs_baseline': 100}
+        d = diagnose(results)
+        assert 'ARCHITECTURE WORKS' in d
+
+    def test_report_generation(self, tmp_path):
+        from scripts.diagnose_policy_health import generate_report, compute_phi, diagnose
+        results = {f'test{i}': {'status': 'healthy'} for i in range(1, 9)}
+        results['test2']['mi_matrix'] = np.random.rand(330, 9).astype(np.float32)
+        results['test4']['battery_corr_matrix'] = np.eye(5)
+        results['test4']['acf'] = {j: np.random.rand(49) for j in range(5)}
+        results['test6']['cross_temporal_corr'] = {t: 0.01 * t for t in range(-6, 25)}
+        results['test6']['tps'] = 0.05
+        results['test7']['per_constraint'] = {
+            c: {'violation_rate': 0.1, 'violation_magnitude': 1.0, 'total_cost': 100,
+                'hourly_violation_rate': [0.1] * 24, 'concentration_top10pct': 0.5}
+            for c in ['C1', 'C2', 'C3', 'C4']
+        }
+        phi = 0.5
+        report = generate_report(results, phi, "TEST DIAGNOSIS", str(tmp_path))
+        assert os.path.exists(report)
+        assert os.path.exists(os.path.join(str(tmp_path), 'figures', 'mi_heatmap.png'))
+        assert os.path.exists(os.path.join(str(tmp_path), 'phi_score.json'))
+
+    def test_report_contains_phi_and_diagnosis(self, tmp_path):
+        from scripts.diagnose_policy_health import generate_report
+        results = {f'test{i}': {'status': 'healthy'} for i in range(1, 9)}
+        report_path = generate_report(results, 0.42, "TEST DIAG", str(tmp_path))
+        with open(report_path) as f:
+            content = f.read()
+        assert '0.42' in content
+        assert 'TEST DIAG' in content
+
+
+# ---------------------------------------------------------------------------
+# Task 10: Full Pipeline tests
+# ---------------------------------------------------------------------------
+class TestFullPipeline:
+    def test_synthetic_pipeline(self, tmp_path):
+        from scripts.diagnose_policy_health import run_all_tests, compute_phi, diagnose, generate_report
+        data = make_synthetic_rollout(T=500)
+        baseline = make_synthetic_rollout(T=500)
+        results = run_all_tests(data, baseline, actor=None)
+        assert len(results) == 8
+        phi = compute_phi(results)
+        assert 0.0 <= phi <= 1.0
+        diag = diagnose(results)
+        assert isinstance(diag, str) and len(diag) > 10
+        report = generate_report(results, phi, diag, str(tmp_path))
+        assert os.path.exists(report)
+
+    def test_run_all_tests_returns_8_keys(self):
+        from scripts.diagnose_policy_health import run_all_tests
+        data = make_synthetic_rollout(T=200)
+        results = run_all_tests(data, baseline_data=None, actor=None)
+        for i in range(1, 9):
+            assert f'test{i}' in results
+            assert 'status' in results[f'test{i}']
+
+    def test_run_all_tests_skips_gradient_without_actor(self):
+        from scripts.diagnose_policy_health import run_all_tests
+        data = make_synthetic_rollout(T=200)
+        results = run_all_tests(data, baseline_data=None, actor=None)
+        assert results['test5']['status'] == 'skipped'

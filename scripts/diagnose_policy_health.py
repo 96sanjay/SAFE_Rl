@@ -559,34 +559,397 @@ def test_action_correlation(data):
 
 
 def test_gradient_attribution(
-    rollout: Dict[str, np.ndarray], actor: Any
+    data: Dict[str, np.ndarray], actor: Any, n_samples: int = 200
 ) -> Dict[str, Any]:
-    """Test 5: Gradient-based feature attribution."""
-    raise NotImplementedError(
-        "test_gradient_attribution — to be implemented in Task 6"
+    """Test 5: Gradient-based feature attribution.
+
+    Computes mean |d action_j / d obs_i| across samples and action dims,
+    then groups by pathway (temporal, current, global, price, building).
+
+    Parameters
+    ----------
+    data : dict
+        Rollout data with 'obs' key of shape (T, OBS_DIM).
+    actor : torch.nn.Module
+        Policy network that maps obs tensor -> action tensor (T, ACT_DIM).
+    n_samples : int
+        Number of observations to use for gradient estimation.
+
+    Returns
+    -------
+    dict with temporal_fraction, current_fraction, global_fraction,
+         price_gradient, building_gradient, total_gradient, status.
+    """
+    import torch
+
+    obs = data['obs']
+    n_samples = min(n_samples, len(obs))
+    obs_np = obs[:n_samples]
+
+    obs_t = torch.as_tensor(obs_np, dtype=torch.float32)
+    grad_accum = torch.zeros(obs_t.shape[1])
+
+    for j in range(ACT_DIM):
+        obs_t_j = obs_t.detach().clone().requires_grad_(True)
+        out_j = actor(obs_t_j)[:, j].sum()
+        out_j.backward()
+        grad_accum += obs_t_j.grad.abs().mean(dim=0)
+
+    grad_accum /= ACT_DIM
+    grad_np = grad_accum.detach().numpy()
+
+    total_gradient = float(grad_np.sum())
+
+    # Pathway groupings
+    temporal_grad = float(grad_np[HISTORY_START:HISTORY_END].sum())
+    current_grad = float(grad_np[:HISTORY_START].sum())
+    global_indices = [PRICE_IDX, HOUR_COS_IDX, HOUR_SIN_IDX]
+    global_grad = float(grad_np[global_indices].sum())
+    price_gradient = float(grad_np[PRICE_IDX])
+    building_gradient = float(grad_np[SOC_INDICES].sum())
+
+    # Fractions
+    temporal_fraction = temporal_grad / (total_gradient + 1e-12)
+    current_fraction = current_grad / (total_gradient + 1e-12)
+    global_fraction = global_grad / (total_gradient + 1e-12)
+
+    # Status
+    if temporal_fraction < 0.01 or price_gradient < 0.001:
+        status = 'broken'
+    elif temporal_fraction < 0.10 or price_gradient < 0.01:
+        status = 'warning'
+    else:
+        status = 'healthy'
+
+    return {
+        'temporal_fraction': float(temporal_fraction),
+        'current_fraction': float(current_fraction),
+        'global_fraction': float(global_fraction),
+        'price_gradient': float(price_gradient),
+        'building_gradient': float(building_gradient),
+        'total_gradient': float(total_gradient),
+        'status': status,
+    }
+
+
+def test_temporal_planning(
+    data: Dict[str, np.ndarray], actor: Any = None, max_lag: int = 24
+) -> Dict[str, Any]:
+    """Test 6: Temporal planning horizon analysis.
+
+    Sub-tests:
+      6a. Cross-temporal correlation between battery actions and shifted price.
+      6b. TPS (Temporal Planning Score) — exponentially weighted future corr.
+      6c. Perturbation tests (only if actor is provided).
+
+    Parameters
+    ----------
+    data : dict
+        Rollout data with 'obs' (T, OBS_DIM) and 'actions' (T, ACT_DIM).
+    actor : torch.nn.Module or None
+        If provided, run perturbation tests (zero/shuffle/reverse history).
+    max_lag : int
+        Maximum forward lag for cross-temporal correlation.
+
+    Returns
+    -------
+    dict with tps, cross_temporal_corr, perturbation_effects, lag0_corr, status.
+    """
+    obs = data['obs']
+    actions = data['actions']
+    T = len(obs)
+    price = obs[:, PRICE_IDX]
+    n_batt = min(NUM_BUILDINGS, actions.shape[1])
+
+    # 6a. Cross-temporal correlation: tau from -6 to +max_lag
+    cross_temporal_corr = {}
+    for tau in range(-6, max_lag + 1):
+        corrs = []
+        for j in range(n_batt):
+            shifted_price = np.roll(price, -tau)
+            # Trim edges to avoid wrap-around artifacts
+            margin = abs(tau) + 1 if tau != 0 else 0
+            if margin > 0 and margin < T:
+                c = np.corrcoef(actions[margin:T - margin, j],
+                                shifted_price[margin:T - margin])[0, 1]
+            else:
+                c = np.corrcoef(actions[:, j], shifted_price)[0, 1]
+            if np.isnan(c):
+                c = 0.0
+            corrs.append(c)
+        cross_temporal_corr[tau] = float(np.mean(corrs))
+
+    lag0_corr = cross_temporal_corr.get(0, 0.0)
+
+    # 6b. TPS: sum(|corr[tau]| * exp(-tau/6) for tau=1..max_lag) / sum(exp(-tau/6))
+    weights_sum = 0.0
+    weighted_corr_sum = 0.0
+    for tau in range(1, max_lag + 1):
+        w = np.exp(-tau / 6.0)
+        weights_sum += w
+        corr_val = cross_temporal_corr.get(tau, 0.0)
+        weighted_corr_sum += abs(corr_val) * w
+    tps = weighted_corr_sum / (weights_sum + 1e-12)
+
+    # 6c. Perturbation tests (only if actor is provided)
+    perturbation_effects = {}
+    if actor is not None:
+        import torch
+
+        n_test = min(500, T)
+        obs_t = torch.as_tensor(obs[:n_test], dtype=torch.float32)
+
+        with torch.no_grad():
+            base_actions = actor(obs_t).detach().numpy()
+
+            # Zero history
+            obs_zero = obs_t.clone()
+            obs_zero[:, HISTORY_START:HISTORY_END] = 0.0
+            zero_actions = actor(obs_zero).detach().numpy()
+            perturbation_effects['zero_history'] = float(
+                np.mean(np.abs(base_actions - zero_actions))
+            )
+
+            # Shuffle history: permute TEMPORAL_WINDOW timesteps randomly
+            obs_shuffle = obs_t.clone().numpy()
+            rng = np.random.RandomState(99)
+            for i in range(n_test):
+                # Reshape history into (TEMPORAL_WINDOW, TEMPORAL_FEATURES_PER_STEP)
+                hist = obs_shuffle[i, HISTORY_START:HISTORY_END].reshape(
+                    TEMPORAL_WINDOW, TEMPORAL_FEATURES_PER_STEP
+                )
+                perm = rng.permutation(TEMPORAL_WINDOW)
+                obs_shuffle[i, HISTORY_START:HISTORY_END] = hist[perm].flatten()
+            shuffle_actions = actor(
+                torch.as_tensor(obs_shuffle, dtype=torch.float32)
+            ).detach().numpy()
+            perturbation_effects['shuffle_history'] = float(
+                np.mean(np.abs(base_actions - shuffle_actions))
+            )
+
+            # Reverse history: flip timestep order
+            obs_reverse = obs_t.clone().numpy()
+            for i in range(n_test):
+                hist = obs_reverse[i, HISTORY_START:HISTORY_END].reshape(
+                    TEMPORAL_WINDOW, TEMPORAL_FEATURES_PER_STEP
+                )
+                obs_reverse[i, HISTORY_START:HISTORY_END] = hist[::-1].flatten()
+            reverse_actions = actor(
+                torch.as_tensor(obs_reverse, dtype=torch.float32)
+            ).detach().numpy()
+            perturbation_effects['reverse_history'] = float(
+                np.mean(np.abs(base_actions - reverse_actions))
+            )
+
+    # Status
+    zero_hist_effect = perturbation_effects.get('zero_history', None)
+    if tps < 0.02 and (zero_hist_effect is not None and zero_hist_effect < 0.01):
+        status = 'broken'
+    elif tps < 0.02 and zero_hist_effect is None:
+        # No actor provided but TPS is very low
+        status = 'broken'
+    elif tps < 0.05:
+        status = 'warning'
+    else:
+        status = 'healthy'
+
+    return {
+        'tps': float(tps),
+        'cross_temporal_corr': cross_temporal_corr,
+        'perturbation_effects': perturbation_effects,
+        'lag0_corr': float(lag0_corr),
+        'status': status,
+    }
+
+
+def test_constraint_decomposition(data: Dict[str, np.ndarray]) -> Dict[str, Any]:
+    """Test 7: Per-constraint cost decomposition and diagnosis.
+
+    For each constraint (C1..C4), computes:
+      - violation_rate: fraction of steps with cost > 0
+      - violation_magnitude: mean cost when cost > 0
+      - total_cost: sum of costs
+      - hourly_violation_rate: 24-element array (violation rate per hour)
+      - concentration_top10pct: fraction of total cost from top 10% violating steps
+
+    C1 (EV departure) and C4 (grid power) are behavioral constraints.
+    C2 (battery) and C3 (building power) have structural floors.
+
+    Parameters
+    ----------
+    data : dict
+        Rollout data with cost_C1, cost_C2, cost_C3, cost_C4 keys.
+
+    Returns
+    -------
+    dict with per_constraint, total_behavioral_vr, status.
+    """
+    T = len(data['costs'])
+    constraint_names = ['C1', 'C2', 'C3', 'C4']
+    per_constraint = {}
+
+    for cname in constraint_names:
+        costs = data[f'cost_{cname}']
+
+        # Violation rate
+        violating_mask = costs > 0
+        violation_rate = float(np.mean(violating_mask))
+
+        # Violation magnitude (mean cost when violating)
+        if np.any(violating_mask):
+            violation_magnitude = float(np.mean(costs[violating_mask]))
+        else:
+            violation_magnitude = 0.0
+
+        # Total cost
+        total_cost = float(np.sum(costs))
+
+        # Hourly violation rate (24 bins, using step_idx % 24)
+        hourly_vr = np.zeros(24, dtype=np.float64)
+        for h in range(24):
+            hour_mask = (np.arange(T) % 24) == h
+            if np.any(hour_mask):
+                hourly_vr[h] = float(np.mean(violating_mask[hour_mask]))
+
+        # Concentration: fraction of total cost from top 10% of violating steps
+        if np.any(violating_mask) and total_cost > 0:
+            violating_costs = costs[violating_mask]
+            n_violating = len(violating_costs)
+            n_top10 = max(1, int(np.ceil(n_violating * 0.1)))
+            sorted_costs = np.sort(violating_costs)[::-1]
+            concentration_top10pct = float(np.sum(sorted_costs[:n_top10]) / total_cost)
+        else:
+            concentration_top10pct = 0.0
+
+        per_constraint[cname] = {
+            'violation_rate': violation_rate,
+            'violation_magnitude': violation_magnitude,
+            'total_cost': total_cost,
+            'hourly_violation_rate': hourly_vr,
+            'concentration_top10pct': concentration_top10pct,
+        }
+
+    # Behavioral violation rate: mean of C1 and C4
+    total_behavioral_vr = float(
+        np.mean([per_constraint['C1']['violation_rate'],
+                 per_constraint['C4']['violation_rate']])
     )
 
+    # Status
+    if total_behavioral_vr > 0.5:
+        status = 'broken'
+    elif total_behavioral_vr > 0.3:
+        status = 'warning'
+    else:
+        status = 'healthy'
 
-def test_temporal_planning(rollout: Dict[str, np.ndarray]) -> Dict[str, Any]:
-    """Test 6: Temporal planning horizon analysis."""
-    raise NotImplementedError(
-        "test_temporal_planning — to be implemented in Task 7"
-    )
-
-
-def test_constraint_decomposition(rollout: Dict[str, np.ndarray]) -> Dict[str, Any]:
-    """Test 7: Per-constraint cost decomposition and diagnosis."""
-    raise NotImplementedError(
-        "test_constraint_decomposition — to be implemented in Task 8"
-    )
+    return {
+        'per_constraint': per_constraint,
+        'total_behavioral_vr': total_behavioral_vr,
+        'status': status,
+    }
 
 
 def test_headroom(
-    rollout: Dict[str, np.ndarray],
-    zero_rollout: Optional[Dict[str, np.ndarray]] = None,
+    data: Dict[str, np.ndarray],
+    baseline_data: Optional[Dict[str, np.ndarray]] = None,
 ) -> Dict[str, Any]:
-    """Test 8: Safety headroom relative to do-nothing baseline."""
-    raise NotImplementedError("test_headroom — to be implemented in Task 9")
+    """Test 8: Safety headroom relative to do-nothing baseline.
+
+    Compares per-component reward and cost between agent and baseline.
+    For rewards, higher is better. For costs, lower is better.
+
+    Parameters
+    ----------
+    data : dict
+        Agent rollout data.
+    baseline_data : dict
+        Baseline (e.g. zero-action) rollout data. Must have same keys.
+
+    Returns
+    -------
+    dict with reward_headroom, cost_headroom, total_reward_vs_baseline,
+         total_cost_vs_baseline, agent/baseline totals, status.
+    """
+    if baseline_data is None:
+        return {
+            'reward_headroom': {},
+            'cost_headroom': {},
+            'total_reward_vs_baseline': 0.0,
+            'total_cost_vs_baseline': 0.0,
+            'agent_total_reward': float(np.sum(data['rewards'])),
+            'baseline_total_reward': 0.0,
+            'agent_total_cost': float(np.sum(data['costs'])),
+            'baseline_total_cost': 0.0,
+            'status': 'warning',
+        }
+
+    # Reward components
+    reward_components = ['economic', 'stability_grid', 'stability_building', 'ramp', 'renewable']
+    reward_headroom = {}
+    for comp in reward_components:
+        key = f'reward_{comp}'
+        agent_val = float(np.sum(data[key]))
+        baseline_val = float(np.sum(baseline_data[key]))
+        delta = agent_val - baseline_val
+        reward_headroom[comp] = {
+            'agent_val': agent_val,
+            'baseline_val': baseline_val,
+            'delta': delta,
+            'better_than_baseline': agent_val > baseline_val,
+        }
+
+    # Cost components
+    cost_components = ['C1', 'C2', 'C3', 'C4']
+    cost_headroom = {}
+    for comp in cost_components:
+        key = f'cost_{comp}'
+        agent_val = float(np.sum(data[key]))
+        baseline_val = float(np.sum(baseline_data[key]))
+        delta = agent_val - baseline_val
+        cost_headroom[comp] = {
+            'agent_val': agent_val,
+            'baseline_val': baseline_val,
+            'delta': delta,
+            'better_than_baseline': agent_val < baseline_val,  # lower cost is better
+        }
+
+    # Totals
+    agent_total_reward = float(np.sum(data['rewards']))
+    baseline_total_reward = float(np.sum(baseline_data['rewards']))
+    total_reward_vs_baseline = agent_total_reward - baseline_total_reward
+
+    agent_total_cost = float(np.sum(data['costs']))
+    baseline_total_cost = float(np.sum(baseline_data['costs']))
+    total_cost_vs_baseline = agent_total_cost - baseline_total_cost
+
+    # Status: based on reward improvement
+    if total_reward_vs_baseline < 0:
+        status = 'broken'
+    elif baseline_total_reward != 0:
+        improvement_frac = total_reward_vs_baseline / (abs(baseline_total_reward) + 1e-12)
+        if improvement_frac < 0.05:
+            status = 'warning'
+        else:
+            status = 'healthy'
+    else:
+        # Baseline total reward is zero
+        if total_reward_vs_baseline > 0:
+            status = 'healthy'
+        else:
+            status = 'warning'
+
+    return {
+        'reward_headroom': reward_headroom,
+        'cost_headroom': cost_headroom,
+        'total_reward_vs_baseline': total_reward_vs_baseline,
+        'total_cost_vs_baseline': total_cost_vs_baseline,
+        'agent_total_reward': agent_total_reward,
+        'baseline_total_reward': baseline_total_reward,
+        'agent_total_cost': agent_total_cost,
+        'baseline_total_cost': baseline_total_cost,
+        'status': status,
+    }
 
 
 # ---------------------------------------------------------------------------

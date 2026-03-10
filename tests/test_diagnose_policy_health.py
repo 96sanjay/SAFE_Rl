@@ -239,22 +239,8 @@ class TestScaffold:
             compute_phi,
             diagnose,
             generate_report,
-            test_constraint_decomposition,
-            test_gradient_attribution,
-            test_headroom,
-            test_temporal_planning,
         )
 
-        rollout = make_synthetic_rollout(T=10)
-
-        with pytest.raises(NotImplementedError):
-            test_gradient_attribution(rollout, None)
-        with pytest.raises(NotImplementedError):
-            test_temporal_planning(rollout)
-        with pytest.raises(NotImplementedError):
-            test_constraint_decomposition(rollout)
-        with pytest.raises(NotImplementedError):
-            test_headroom(rollout)
         with pytest.raises(NotImplementedError):
             compute_phi({})
         with pytest.raises(NotImplementedError):
@@ -344,3 +330,106 @@ class TestActionCorrelation:
         result = test_action_correlation(data)
         assert result['mean_abs_corr'] > 0.95
         assert result['status'] == 'broken'
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Gradient Attribution tests
+# ---------------------------------------------------------------------------
+class TestGradientAttribution:
+    def _make_mock_actor(self):
+        import torch.nn as nn
+
+        class MockActor(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(330, 64), nn.ReLU(), nn.Linear(64, 9), nn.Tanh()
+                )
+
+            def forward(self, x):
+                if x.dim() == 1:
+                    x = x.unsqueeze(0)
+                return self.net(x)
+
+        return MockActor()
+
+    def test_returns_pathway_fractions(self):
+        from scripts.diagnose_policy_health import test_gradient_attribution
+        data = make_synthetic_rollout(T=100)
+        actor = self._make_mock_actor()
+        result = test_gradient_attribution(data, actor)
+        assert 'temporal_fraction' in result and 'current_fraction' in result
+        assert 'price_gradient' in result and 'status' in result
+        assert 0.0 <= result['temporal_fraction'] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Task 6: Temporal Planning tests
+# ---------------------------------------------------------------------------
+class TestTemporalPlanning:
+    def test_detects_forward_correlation(self):
+        from scripts.diagnose_policy_health import test_temporal_planning
+        np.random.seed(42)
+        data = make_synthetic_rollout(T=2000)
+        price = data['obs'][:, 22]  # PRICE_IDX
+        for j in range(5):
+            future_price = np.roll(price, -3)
+            data['actions'][:, j] = np.clip(
+                -0.5 * future_price + 0.3 * np.random.randn(2000), -1, 1
+            ).astype(np.float32)
+        result = test_temporal_planning(data)
+        assert 'tps' in result and 'cross_temporal_corr' in result
+        assert result['tps'] > 0.02
+
+    def test_myopic_low_tps(self):
+        from scripts.diagnose_policy_health import test_temporal_planning
+        data = make_synthetic_rollout(T=2000)
+        price = data['obs'][:, 22]
+        for j in range(5):
+            data['actions'][:, j] = np.clip(
+                -0.5 * price + 0.5 * np.random.randn(2000), -1, 1
+            ).astype(np.float32)
+        result = test_temporal_planning(data)
+        # Myopic agent still shows some TPS due to price autocorrelation,
+        # but should be well below a truly forward-looking agent.
+        assert result['tps'] < 0.20
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Constraint Decomposition tests
+# ---------------------------------------------------------------------------
+class TestConstraintDecomposition:
+    def test_computes_violation_metrics(self):
+        from scripts.diagnose_policy_health import test_constraint_decomposition
+        data = make_synthetic_rollout(T=500)
+        result = test_constraint_decomposition(data)
+        assert 'per_constraint' in result
+        for c in ['C1', 'C2', 'C3', 'C4']:
+            assert c in result['per_constraint']
+            assert 0.0 <= result['per_constraint'][c]['violation_rate'] <= 1.0
+        assert 'total_behavioral_vr' in result and 'status' in result
+
+
+# ---------------------------------------------------------------------------
+# Task 8: Headroom tests
+# ---------------------------------------------------------------------------
+class TestHeadroom:
+    def test_computes_per_component(self):
+        from scripts.diagnose_policy_health import test_headroom
+        data = make_synthetic_rollout(T=500)
+        baseline = make_synthetic_rollout(T=500)
+        baseline['rewards'] = data['rewards'] + 2.0
+        result = test_headroom(data, baseline)
+        assert 'reward_headroom' in result and 'cost_headroom' in result
+        for k in ['economic', 'stability_grid', 'stability_building', 'ramp', 'renewable']:
+            assert k in result['reward_headroom']
+        assert 'status' in result
+
+    def test_worse_than_baseline_detected(self):
+        from scripts.diagnose_policy_health import test_headroom
+        data = make_synthetic_rollout(T=500)
+        baseline = make_synthetic_rollout(T=500)
+        data['rewards'] = baseline['rewards'] - 10.0
+        result = test_headroom(data, baseline)
+        assert result['total_reward_vs_baseline'] < 0
+        assert result['status'] in ['broken', 'warning']

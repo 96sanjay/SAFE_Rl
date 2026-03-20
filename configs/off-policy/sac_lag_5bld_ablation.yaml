@@ -12,7 +12,7 @@ env_id: CityLearnSafety-V2G-v2
 seed: 42
 
 train_cfgs:
-  total_steps: 787110           # 90 epochs x 8759 (same as R21)
+  total_steps: 788310           # 90 epochs x 8759 = 788310 (must be divisible)
   vector_env_nums: 1
   parallel: 1
 

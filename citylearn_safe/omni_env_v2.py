@@ -48,6 +48,33 @@ class CityLearnCMDPv2(CMDP):
         safety = CityLearnSafetyEnvV3(base)
         forecast = ForecastObsWrapper(safety, forecast_horizon=24)
 
+        # P0.5: Add temporal history if STEMS v3 requested
+        temporal_window = int(os.environ.get("CITYLEARN_TEMPORAL_WINDOW", "0"))
+        if temporal_window > 0:
+            from citylearn_safe.temporal_obs_wrapper import TemporalHistoryWrapper
+            from citylearn_safe.schema_index import build_index
+            # Auto-detect building count
+            _e = safety
+            _n_bld = 0
+            for _ in range(20):
+                if hasattr(_e, 'buildings') and len(getattr(_e, 'buildings', [])) > 0:
+                    _n_bld = len(_e.buildings)
+                    break
+                _e = getattr(_e, 'env', getattr(_e, 'base', None))
+                if _e is None:
+                    break
+            if _n_bld == 0:
+                _n_bld = 5
+            obs_idx = build_index(safety, expected_buildings=_n_bld)
+            history_indices = []
+            for _i in range(_n_bld):
+                history_indices.append(obs_idx.electrical_storage_soc[_i])
+                history_indices.append(obs_idx.net_electricity_consumption[_i])
+            history_indices.append(obs_idx.electricity_pricing)
+            forecast = TemporalHistoryWrapper(forecast, history_indices, temporal_window)
+            print(f"[CMDPv2] Temporal history ENABLED "
+                  f"(T={temporal_window}, +{len(history_indices)*temporal_window} dims)")
+
         # P0: Add spatial observations (per-building C3 headroom, SoC spread, etc.)
         if os.environ.get("CITYLEARN_SPATIAL_OBS", "0") == "1":
             p_bmax = float(os.environ.get("CITYLEARN_STEMS_P_BUILDING_MAX", "4.6083"))
@@ -71,11 +98,32 @@ class CityLearnCMDPv2(CMDP):
         else:
             env_final = forecast
 
+        # Sauté MDP: budget-aware obs augmentation for C1 (EV charging)
+        if os.environ.get("CITYLEARN_EV_SAUTE", "0") == "1":
+            from citylearn_safe.saute_ev_wrapper import SauteEVBudgetWrapper
+            env_final = SauteEVBudgetWrapper(env_final)
+
+
+        # R29: Action mask wrapper (rescales actions to satisfy C3 power constraints)
+        if os.environ.get("CITYLEARN_ACTION_MASK", "0") == "1":
+            from citylearn_safe.action_mask_wrapper import ActionMaskWrapper
+            env_final = ActionMaskWrapper(env_final)
+            print("[CMDPv2] ActionMaskWrapper ENABLED")
+
         self._env = env_final
         self._observation_space = env_final.observation_space
         self._action_space = env_final.action_space
         self._num_envs = 1
         self._max_episode_steps = 8759
+
+        # Beta actor mode: action space is (0, 1) not (-1, 1)
+        self._beta_mode = os.environ.get("CITYLEARN_BETA_ACTOR", "0") == "1"
+        if self._beta_mode:
+            act_dim = self._action_space.shape[0]
+            self._action_space = gym.spaces.Box(
+                low=0.0, high=1.0, shape=(act_dim,), dtype=np.float32
+            )
+            print(f"[CMDPv2] Beta actor mode — action_space=(0,1) dim={act_dim}")
 
         # STEMS reward weights (safety-first)
         self.mu_economic = float(os.environ.get("STEMS_MU_ECONOMIC", "0.3"))
@@ -83,25 +131,109 @@ class CityLearnCMDPv2(CMDP):
         self.alpha_build = float(os.environ.get("STEMS_ALPHA_BUILD", "2.0"))
         self.beta_ramp = float(os.environ.get("STEMS_BETA_RAMP", "0.5"))
         self.xi_renewable = float(os.environ.get("STEMS_XI_RENEWABLE", "0.2"))
-        self.lambda_ev = float(os.environ.get("STEMS_LAMBDA_EV", "5.0"))
+        self.lambda_ev = float(os.environ.get("STEMS_LAMBDA_EV", "0.0"))
+        self.alpha_barrier = float(os.environ.get("STEMS_ALPHA_BARRIER", "0.5"))
+
+        # R16: New reward components (battery-only price arbitrage + gentle grid awareness)
+        self.alpha_load_shift = float(os.environ.get("STEMS_ALPHA_LOAD_SHIFT", "0.0"))
+        self.alpha_grid_mild = float(os.environ.get("STEMS_ALPHA_GRID_MILD", "0.0"))
+
+        # Simple battery price arbitrage: R_batt = -action * price (AL-SAC style)
+        self.alpha_price_arb = float(os.environ.get("STEMS_ALPHA_PRICE_ARB", "0.0"))
+
+        # R30: NEC-sign reward — align storage actions with exogenous load direction
+        self.alpha_nec_sign = float(os.environ.get("STEMS_ALPHA_NEC_SIGN", "0.0"))
+
+        # R17: Threshold r_sg — only penalize imports above fraction of P_grid_max
+        # 0.0 = original (penalize all imports), 0.5 = penalize above 50% P_grid_max
+        self.sg_threshold_frac = float(os.environ.get("STEMS_SG_THRESHOLD", "0.0"))
+
+        # Compute mean_price from actual pricing data (adapts to any schema)
+        self.mean_price = self._compute_mean_price(safety)
+
+        # V2G-aware reward flags (R13+)
+        # Fix 1: r_sb only penalizes imports, not exports (enables V2G)
+        self.sb_asymmetric = os.environ.get("STEMS_SB_ASYMMETRIC", "0") == "1"
+        # Fix 4: r_sg gives partial credit for net exports
+        self.sg_export_credit = float(os.environ.get("STEMS_SG_EXPORT_CREDIT", "0.0"))
 
         # CMDP cost weights (C1 boosted, C3 dampened)
         self.w_c1 = float(os.environ.get("COST_W_C1", "10.0"))
         self.w_c1_dense = float(os.environ.get("COST_W_C1_DENSE", "5.0"))
-        self.w_c2 = float(os.environ.get("COST_W_C2", "1.0"))
+        self.w_c2 = float(os.environ.get("COST_W_C2", "0.0"))  # SoC clamp + barrier make C2 redundant
         self.w_c3 = float(os.environ.get("COST_W_C3", "0.1"))
         self.w_c4 = float(os.environ.get("COST_W_C4", "5.0"))
 
-        self.P_building_max = float(os.environ.get("CITYLEARN_STEMS_P_BUILDING_MAX", "2.273834"))
-        self.P_grid_max = float(os.environ.get("CITYLEARN_STEMS_P_GRID_MAX", "27.127751"))
+        # Use safety env's auto-calibrated values (adapts to any building count)
+        self.P_building_max = float(os.environ.get(
+            "CITYLEARN_STEMS_P_BUILDING_MAX", str(safety.P_building_max)))
+        self.P_grid_max = float(os.environ.get(
+            "CITYLEARN_STEMS_P_GRID_MAX", str(safety.P_grid_max)))
 
         self._prev_net = None
         self._step_count = 0
 
+        # Discover battery action indices and pair with buildings
+        self._batt_action_map = self._discover_battery_actions(safety)
+
+        # EV charger action map (R15a+)
+        self._ev_action_map = self._discover_ev_charger_actions(safety)
+        self._ev_clamp_enabled = os.environ.get("CITYLEARN_EV_ACTION_CLAMP", "0") == "1"
+        self._ev_clamp_margin = float(os.environ.get("CITYLEARN_EV_CLAMP_MARGIN", "0.1"))
+        self.alpha_ev_guard = float(os.environ.get("STEMS_ALPHA_EV_GUARD", "0.0"))
+        self.alpha_v2g_context = float(os.environ.get("STEMS_ALPHA_V2G_CONTEXT", "0.0"))
+        self.alpha_peak_shave = float(os.environ.get("STEMS_ALPHA_PEAK_SHAVE", "0.0"))
+        self.alpha_ev_solar = float(os.environ.get("STEMS_ALPHA_EV_SOLAR", "0.0"))
+        self.alpha_solar_store = float(os.environ.get("STEMS_ALPHA_SOLAR_STORE", "0.0"))
+        self._solar_store_batt_only = os.environ.get("STEMS_SOLAR_STORE_BATT_ONLY", "0") == "1"
+        self.ev_slack_arb_scale = float(os.environ.get("STEMS_EV_SLACK_ARB_SCALE", "0.0"))
+        self.alpha_headroom = float(os.environ.get("STEMS_ALPHA_HEADROOM", "0.0"))
+        self.alpha_grid_penalty = float(os.environ.get("STEMS_ALPHA_GRID_PENALTY", "0.0"))
+        self._ev_saute_shaped_alpha = float(os.environ.get("CITYLEARN_EV_SAUTE_SHAPED_ALPHA", "0.0"))
+        self._ev_clamp_count = 0
+
+        # R23: Solar capacity for r_ev_solar normalization
+        self._solar_capacity = 0.0
+        _city_init = self._get_citylearn()
+        if _city_init is not None:
+            for b in _city_init.buildings:
+                pv = getattr(b, 'pv', None)
+                if pv is not None:
+                    self._solar_capacity += abs(float(getattr(pv, 'nominal_power', 0.0) or 0.0))
+        if self._solar_capacity <= 0:
+            self._solar_capacity = 20.0  # fallback for 5-building schema
+
+        # R18: Washing machine disable (clamp WM action to 0)
+        # Diagnostic showed WM draws 46 kW (10x C3 threshold), causing top 15 worst violations
+        self._wm_disable = os.environ.get("CITYLEARN_WM_DISABLE", "0") == "1"
+        self._wm_action_indices = self._discover_wm_actions(safety)
+
+        # R18: Battery clamp optional (CityLearn handles physical SoC bounds)
+        self._batt_clamp_enabled = os.environ.get("CITYLEARN_BATT_CLAMP", "1") == "1"
+
+        # Configurable SoC upper clamp (default 0.94 = legacy, set to 0.88 for R12b)
+        self._SOC_UPPER = float(os.environ.get(
+            "CITYLEARN_BATT_SOC_UPPER_CLAMP", str(self._SOC_UPPER_DEFAULT)))
+
+        # R18: V2G discharge tracking (proves agent is exploring V2G)
+        self._v2g_discharge_count = 0
+
         print(f"[CMDPv2] obs={self._observation_space.shape} act={self._action_space.shape}")
+        print(f"[CMDPv2] Battery clamp: {len(self._batt_action_map)} batteries, "
+              f"enabled={self._batt_clamp_enabled}, SOC_UPPER={self._SOC_UPPER:.2f}")
+        print(f"[CMDPv2] EV clamp: {len(self._ev_action_map)} chargers, "
+              f"enabled={self._ev_clamp_enabled}, margin={self._ev_clamp_margin}, "
+              f"guard={self.alpha_ev_guard}, v2g_ctx={self.alpha_v2g_context}, "
+              f"peak_shave={self.alpha_peak_shave}, "
+              f"ev_solar={self.alpha_ev_solar} (PV_cap={self._solar_capacity:.1f}kW)")
+        print(f"[CMDPv2] Sauté shaped_alpha={self._ev_saute_shaped_alpha} "
+              f"(0=binary penalty, >0=smooth gradient)")
         print(f"[CMDPv2] STEMS: eco={self.mu_economic} grid={self.alpha_grid} "
               f"build={self.alpha_build} ramp={self.beta_ramp} renew={self.xi_renewable} "
-              f"ev={self.lambda_ev}")
+              f"ev={self.lambda_ev} barrier={self.alpha_barrier}")
+        print(f"[CMDPv2] WM disable: {self._wm_disable}, indices={self._wm_action_indices}")
+        print(f"[CMDPv2] R16: load_shift={self.alpha_load_shift} grid_mild={self.alpha_grid_mild} "
+              f"mean_price={self.mean_price:.4f} sg_threshold={self.sg_threshold_frac}")
         print(f"[CMDPv2] Cost: C1={self.w_c1} C1d={self.w_c1_dense} "
               f"C2={self.w_c2} C3={self.w_c3} C4={self.w_c4}")
 
@@ -123,6 +255,195 @@ class CityLearnCMDPv2(CMDP):
             else:
                 break
         return None
+
+    def _get_action_mask_max(self, action_idx: int):
+        """Get the action mask upper bound for a given action index.
+
+        The ActionMaskWrapper stores bounds on the CityLearn env object
+        as _action_mask_safe_max. Returns None if no mask is active.
+        """
+        city = self._get_citylearn()
+        if city is not None:
+            safe_max = getattr(city, '_action_mask_safe_max', None)
+            if safe_max is not None and action_idx < len(safe_max):
+                return float(safe_max[action_idx])
+        return None
+
+    def _compute_mean_price(self, safety_env) -> float:
+        """Compute mean electricity price from actual data at init (adapts to any schema)."""
+        city = None
+        cur = safety_env
+        for _ in range(20):
+            if cur is None:
+                break
+            if hasattr(cur, 'buildings') and hasattr(cur, 'action_names'):
+                city = cur
+                break
+            cur = getattr(cur, 'env', getattr(cur, 'base', None))
+        if city is None:
+            return 0.17  # fallback
+        try:
+            buildings = list(city.buildings)
+            if not buildings:
+                return 0.17
+            pr = buildings[0].pricing.electricity_pricing
+            prices = np.asarray(pr, dtype=float)
+            mean_p = float(np.mean(prices[prices > 0])) if np.any(prices > 0) else 0.17
+            return mean_p
+        except Exception:
+            return 0.17
+
+    def _load_shift_reward(self, action_np: np.ndarray, price: float) -> float:
+        """R27: Solar-aware battery price arbitrage.
+
+        Per-building effective cost = price - solar_credit.
+        Solar credit = max(0, solar_gen - load) / P_bmax (EXOGENOUS).
+
+        During solar surplus: effective cost is deeply negative → charge rewarded.
+        During expensive + no solar: effective cost is positive → discharge rewarded.
+        Signal clipped to [-1, 1] to prevent solar hours dominating 30:1.
+
+        Linear SoC gate: discharge reward scales with SoC (not saturating).
+        This forces the critic to learn SoC-dependent value → lookahead emerges.
+        """
+        if self.alpha_load_shift <= 0 or not self._batt_action_map:
+            return 0.0
+
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+        t_idx = max(0, int(getattr(city, 'time_step', 0)) - 1)
+        buildings = list(getattr(city, 'buildings', []))
+
+        n_batt = len(self._batt_action_map)
+        r_ls = 0.0
+
+        for act_idx, bld_idx, cap, p_max, eta in self._batt_action_map:
+            if act_idx >= len(action_np) or bld_idx >= len(buildings):
+                continue
+            b = buildings[bld_idx]
+            act = float(action_np[act_idx])
+
+            # Per-building solar credit (EXOGENOUS — not affected by agent actions)
+            solar_credit = 0.0
+            try:
+                sg = getattr(b, 'solar_generation', None)
+                nsl = getattr(b, '_Building__energy_to_non_shiftable_load', None)
+                if sg is not None and nsl is not None:
+                    sg_val = abs(float(sg[t_idx])) if hasattr(sg, '__len__') and len(sg) > t_idx else 0.0
+                    nsl_val = float(nsl[t_idx]) if hasattr(nsl, '__len__') and len(nsl) > t_idx else 0.0
+                    solar_surplus = max(0.0, sg_val - nsl_val)
+                    solar_credit = solar_surplus / max(1e-6, self.P_building_max)
+            except Exception:
+                pass
+
+            # Effective cost: price deviation minus solar credit
+            eff_cost = price / max(1e-8, self.mean_price) - 1.0 - solar_credit
+            eff_cost_signal = max(-1.0, min(1.0, eff_cost))  # CLIP to [-1, 1]
+
+            # Linear SoC gate (forces SoC-dependent value learning)
+            soc = 0.5
+            try:
+                es = getattr(b, 'electrical_storage', None)
+                if es is not None and hasattr(es, 'soc') and hasattr(es.soc, '__len__') and len(es.soc) > t_idx:
+                    soc = float(np.clip(es.soc[t_idx], 0.01, 0.99))
+            except Exception:
+                pass
+
+            if act < 0:  # discharge
+                gate = max(0.2, soc)  # R28: floor at 0.2 — always penalizes wrong-time discharge
+            else:  # charge
+                gate = max(0.2, 1.0 - soc)  # R28: floor at 0.2 — always rewards right-time charge
+
+            r_ls += -act * gate * eff_cost_signal
+
+        return self.alpha_load_shift * r_ls / max(1, n_batt)
+
+    def _simple_price_reward(self, action_np: np.ndarray, price: float) -> float:
+        """Simple battery price arbitrage: R_batt = -action * normalized_price.
+
+        charge (act>0) at low price  -> positive reward (good)
+        discharge (act<0) at high price -> positive reward (good)
+        charge (act>0) at high price -> negative reward (bad)
+        discharge (act<0) at low price -> negative reward (bad)
+        """
+        if self.alpha_price_arb <= 0 or not self._batt_action_map:
+            return 0.0
+
+        norm_price = price / max(1e-8, self.mean_price)
+        n_batt = len(self._batt_action_map)
+        total = 0.0
+
+        for act_idx, _bld_idx, _cap, _p_max, _eta in self._batt_action_map:
+            if act_idx >= len(action_np):
+                continue
+            act = float(action_np[act_idx])
+            total += -act * (norm_price - 1.0)  # centered: <0 when cheap, >0 when expensive
+
+        return self.alpha_price_arb * total / max(1, n_batt)
+
+    def _nec_sign_reward(self, action_np: np.ndarray) -> float:
+        """R30: NEC-sign reward — align storage actions with exogenous NEC direction.
+
+        Uses EXOGENOUS NEC (load + solar only, before storage actions) to determine
+        whether a building is importing or exporting:
+          - Importing (exo_nec > 0): discharge helps (reward = -act), charge hurts
+          - Exporting (exo_nec < 0): charge helps (reward = +act), discharge hurts
+        Actions in deadzone (|act| < 0.05) are skipped.
+        Averaged over all active devices, scaled by alpha_nec_sign.
+        """
+        if self.alpha_nec_sign <= 0:
+            return 0.0
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+
+        t_now = int(getattr(city, 'time_step', 0))
+        t_idx = max(0, t_now - 1)
+        buildings = list(getattr(city, 'buildings', []))
+        total = 0.0
+        count = 0
+
+        # Battery actions
+        n_devices = 0
+        for act_idx, bld_idx, _cap, _p_max, _eta in self._batt_action_map:
+            if act_idx >= len(action_np) or bld_idx >= len(buildings):
+                continue
+            act = float(action_np[act_idx])
+            if abs(act) < 0.05:
+                n_devices += 1  # count idle devices in denominator to prevent exploit
+                continue  # deadzone
+            b = buildings[bld_idx]
+            try:
+                nsl = getattr(b, '_Building__energy_to_non_shiftable_load', None)
+                sg = getattr(b, '_Building__solar_generation', None)
+                if nsl is None or sg is None:
+                    continue
+                if not hasattr(nsl, '__len__') or len(nsl) <= t_idx:
+                    continue
+                if not hasattr(sg, '__len__') or len(sg) <= t_idx:
+                    continue
+                exo_nec = float(nsl[t_idx]) + float(sg[t_idx])
+                if exo_nec > 0:
+                    # Building importing: discharge helps, charge hurts
+                    total += -act
+                elif exo_nec < 0:
+                    # Building exporting: charge helps, discharge hurts
+                    total += act
+                count += 1
+            except Exception:
+                pass
+
+        # R30d: NEC-sign does NOT apply to EVs.
+        # EVs are driven by urgency + V2G arb only.
+        # Reason: NEC-sign penalizes EV charging during peak (import hours),
+        # but EVs may NEED to charge then to meet departure SoC.
+        # Applying NEC-sign to EVs creates an unsolvable conflict.
+
+        denom = count + n_devices
+        if denom == 0:
+            return 0.0
+        return self.alpha_nec_sign * total / denom
 
     def _ev_reward(self, action_np: np.ndarray) -> float:
         """Penalize under-charging of connected EVs proportional to urgency."""
@@ -192,10 +513,16 @@ class CityLearnCMDPv2(CMDP):
                     tau = max(1, int(dh)) if np.isfinite(dh) and dh > 0 else 999
                     if ec > 0 and mp > 0:
                         mps = (mp * 0.95) / ec
-                        urgency = min(1.0, (deficit / max(mps, 1e-9)) / tau)
+                        urgency = max(0.3, min(1.0, (deficit / max(mps, 1e-9)) / tau))
                         min_act = min(1.0, deficit / (tau * mps))
                     else:
                         urgency, min_act = 1.0, 1.0
+                    # R29: Cap min_act at mask upper bound if action masking is active.
+                    # Without this, the agent is penalized for not charging enough
+                    # when the mask physically prevents the required charge level.
+                    mask_max = self._get_action_mask_max(gidx)
+                    if mask_max is not None:
+                        min_act = min(min_act, max(0.0, mask_max))
                     shortfall = max(0.0, min_act - float(action_np[gidx]))
                     penalty += urgency * shortfall
                 except Exception:
@@ -203,13 +530,617 @@ class CityLearnCMDPv2(CMDP):
                 li += 1
         return -self.lambda_ev * penalty
 
-    def _stems_reward(self, info: dict, action_np: np.ndarray) -> float:
+    def _ev_guard_penalty(self, action_np: np.ndarray) -> float:
+        """Penalize discharge when EV SoC < required (uses pre-clamp action for gradient).
+
+        Returns negative penalty proportional to urgency * |discharge_action|.
+        """
+        if self.alpha_ev_guard <= 0 or not self._ev_action_map:
+            return 0.0
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+
+        t_now = int(getattr(city, 'time_step', 0))
+        t_idx = max(0, t_now - 1)
+        buildings = list(getattr(city, 'buildings', []))
+        penalty = 0.0
+
+        for gidx, b_idx, ch_idx in self._ev_action_map:
+            if gidx >= len(action_np) or b_idx >= len(buildings):
+                continue
+            act = float(action_np[gidx])
+            if act >= 0:
+                continue  # Charging — no penalty
+            chargers = getattr(buildings[b_idx], 'electric_vehicle_chargers', None) or []
+            if ch_idx >= len(chargers):
+                continue
+            ch = chargers[ch_idx]
+            sim = getattr(ch, 'charger_simulation',
+                          getattr(ch, '_Charger__charger_simulation', None))
+            if sim is None:
+                continue
+            try:
+                sa = np.asarray(getattr(sim, '_electric_vehicle_charger_state'), dtype=float)
+                if t_now >= len(sa) or float(sa[t_now]) != 1.0:
+                    continue
+                ra = np.asarray(getattr(sim, '_electric_vehicle_required_soc_departure'), dtype=float)
+                rs = float(ra[t_now]) if t_now < len(ra) else 1.0
+                if not np.isfinite(rs):
+                    rs = 1.0
+                ev_obj = getattr(ch, 'connected_electric_vehicle', None)
+                if ev_obj is None:
+                    continue
+                bt = getattr(ev_obj, 'battery', None)
+                if bt is None:
+                    continue
+                soc_arr = getattr(bt, 'soc', None)
+                if soc_arr is None:
+                    continue
+                sn = np.asarray(soc_arr, dtype=float)
+                current_soc = float(np.clip(sn[t_idx], 0, 1)) if 0 <= t_idx < len(sn) else 0.0
+                if current_soc >= rs + self._ev_clamp_margin:
+                    continue  # Surplus — discharge OK
+                deficit = rs - current_soc
+                urgency = min(1.0, deficit * 2.0)  # 0.5 deficit → urgency 1.0
+                penalty += urgency * abs(act)
+            except Exception:
+                pass
+        return -self.alpha_ev_guard * penalty
+
+    def _ev_v2g_context_reward(self, action_np: np.ndarray,
+                                total_net: float, imp: float, solar: float) -> float:
+        """Context-aware V2G reward for EVs with surplus SoC (R15b+).
+
+        Only fires for EVs with soc >= required + margin.
+        Rewards: V2G during grid import, charging during solar.
+        Penalizes: discharge during solar abundance.
+        """
+        if self.alpha_v2g_context <= 0 or not self._ev_action_map:
+            return 0.0
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+
+        t_now = int(getattr(city, 'time_step', 0))
+        t_idx = max(0, t_now - 1)
+        buildings = list(getattr(city, 'buildings', []))
+        r_v2g = 0.0
+
+        for gidx, b_idx, ch_idx in self._ev_action_map:
+            if gidx >= len(action_np) or b_idx >= len(buildings):
+                continue
+            chargers = getattr(buildings[b_idx], 'electric_vehicle_chargers', None) or []
+            if ch_idx >= len(chargers):
+                continue
+            ch = chargers[ch_idx]
+            sim = getattr(ch, 'charger_simulation',
+                          getattr(ch, '_Charger__charger_simulation', None))
+            if sim is None:
+                continue
+            try:
+                sa = np.asarray(getattr(sim, '_electric_vehicle_charger_state'), dtype=float)
+                if t_now >= len(sa) or float(sa[t_now]) != 1.0:
+                    continue
+                ra = np.asarray(getattr(sim, '_electric_vehicle_required_soc_departure'), dtype=float)
+                rs = float(ra[t_now]) if t_now < len(ra) else 1.0
+                if not np.isfinite(rs):
+                    rs = 1.0
+                ev_obj = getattr(ch, 'connected_electric_vehicle', None)
+                if ev_obj is None:
+                    continue
+                bt = getattr(ev_obj, 'battery', None)
+                if bt is None:
+                    continue
+                soc_arr = getattr(bt, 'soc', None)
+                if soc_arr is None:
+                    continue
+                sn = np.asarray(soc_arr, dtype=float)
+                current_soc = float(np.clip(sn[t_idx], 0, 1)) if 0 <= t_idx < len(sn) else 0.0
+
+                # ONLY surplus EVs get V2G context rewards
+                if current_soc < rs + self._ev_clamp_margin:
+                    continue
+
+                act = float(action_np[gidx])
+
+                # V2G during grid import: discharge helps reduce grid stress
+                if total_net > 0 and act < 0:
+                    grid_need = min(total_net / max(1e-6, self.P_grid_max), 1.0)
+                    r_v2g += abs(act) * grid_need
+
+                # Charging during solar: use clean cheap energy
+                if solar > 0 and act > 0:
+                    solar_frac = min(solar / (solar + imp + 1e-6), 1.0)
+                    r_v2g += abs(act) * solar_frac
+
+                # Penalize discharge during solar (should charge instead)
+                if solar > 0 and act < 0:
+                    solar_frac = min(solar / (solar + imp + 1e-6), 1.0)
+                    r_v2g -= 0.5 * abs(act) * solar_frac
+            except Exception:
+                pass
+        return self.alpha_v2g_context * r_v2g
+
+    def _ev_solar_reward(self, action_np: np.ndarray, solar: float) -> float:
+        """R23: Reward EV charging during solar abundance.
+
+        r = alpha * mean_over_EVs(max(0, action_i) * solar_norm)
+
+        Only rewards positive actions (charging), scaled by normalized solar.
+        Fires for ALL connected EVs, not just surplus.
+        """
+        if not self._ev_action_map or solar <= 0:
+            return 0.0
+
+        solar_norm = min(solar / self._solar_capacity, 1.0) if self._solar_capacity > 0 else 0.0
+
+        total = 0.0
+        count = 0
+        for act_idx, bld_idx, _ in self._ev_action_map:
+            if act_idx < len(action_np):
+                charge = max(0.0, float(action_np[act_idx]))  # only reward charging
+                total += charge * solar_norm
+                count += 1
+
+        if count == 0:
+            return 0.0
+
+        return self.alpha_ev_solar * (total / count)
+
+    def _solar_store_reward(self, action_np: np.ndarray) -> float:
+        """R24: Reward charging storage devices during REAL solar surplus.
+
+        r = alpha * mean_over_surplus_devices(max(0, action_i) * surplus_norm_i)
+
+        Key design choices (each addressing a specific bug or failure mode):
+        1. Requires actual solar generation > 0 at the building (prevents fake
+           surplus from battery discharge at night — Bug 1 fix)
+        2. Surplus capped at solar generation (cannot exceed what sun provides)
+        3. Only counts devices at surplus buildings in the mean (prevents
+           dilution from non-surplus buildings — Bug 3 fix)
+        4. EV chargers require connected EV (prevents phantom reward for
+           actions CityLearn ignores — Bug 2 fix)
+        5. Only rewards charging (action > 0), NEVER discharge (Rule 5)
+        6. Uses POST-action NEC: self-correcting if charge overshoots surplus
+        """
+        if self.alpha_solar_store <= 0:
+            return 0.0
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+
+        t_now = int(getattr(city, 'time_step', 0))
+        t_idx = max(0, t_now - 1)
+        buildings = list(getattr(city, 'buildings', []))
+        total = 0.0
+        count = 0
+
+        # Battery actions
+        for act_idx, bld_idx, cap, p_max, eta in self._batt_action_map:
+            if act_idx >= len(action_np) or bld_idx >= len(buildings):
+                continue
+            b = buildings[bld_idx]
+            try:
+                # Gate 1: building must have actual solar generation
+                sg = getattr(b, 'solar_generation', None)
+                if sg is None or not hasattr(sg, '__len__') or len(sg) <= t_idx:
+                    continue
+                solar_gen = abs(float(sg[t_idx]))
+                if solar_gen <= 0:
+                    continue  # no solar at this building right now
+
+                nec = getattr(b, 'net_electricity_consumption', None)
+                if nec is None or not hasattr(nec, '__len__') or len(nec) <= t_idx:
+                    continue
+                nec_val = float(nec[t_idx])
+
+                # Surplus = negative NEC, but capped at actual solar generation
+                # This prevents discharge-created fake surplus
+                surplus = min(max(0.0, -nec_val), solar_gen)
+                if surplus <= 0:
+                    continue  # no real solar surplus
+
+                surplus_norm = min(surplus / max(1e-6, self.P_building_max), 2.0)
+                charge = max(0.0, float(action_np[act_idx]))
+                total += charge * surplus_norm
+                count += 1
+            except Exception:
+                pass  # don't inflate count on error
+
+        # EV charger actions (only connected EVs, skip if battery-only mode)
+        if self._solar_store_batt_only:
+            if count == 0:
+                return 0.0
+            return self.alpha_solar_store * total / count
+        for gidx, b_idx, ch_idx in self._ev_action_map:
+            if gidx >= len(action_np) or b_idx >= len(buildings):
+                continue
+            b = buildings[b_idx]
+            try:
+                # Gate 1: building must have actual solar generation
+                sg = getattr(b, 'solar_generation', None)
+                if sg is None or not hasattr(sg, '__len__') or len(sg) <= t_idx:
+                    continue
+                solar_gen = abs(float(sg[t_idx]))
+                if solar_gen <= 0:
+                    continue
+
+                # Gate 2: EV must be connected (prevents phantom reward)
+                chargers = getattr(b, 'electric_vehicle_chargers', None) or []
+                if ch_idx >= len(chargers):
+                    continue
+                ch = chargers[ch_idx]
+                sim = getattr(ch, 'charger_simulation',
+                              getattr(ch, '_Charger__charger_simulation', None))
+                if sim is None:
+                    continue
+                sa = np.asarray(
+                    getattr(sim, '_electric_vehicle_charger_state'), dtype=float)
+                if t_now >= len(sa) or float(sa[t_now]) != 1.0:
+                    continue  # EV not connected — action has no effect
+
+                nec = getattr(b, 'net_electricity_consumption', None)
+                if nec is None or not hasattr(nec, '__len__') or len(nec) <= t_idx:
+                    continue
+                nec_val = float(nec[t_idx])
+
+                surplus = min(max(0.0, -nec_val), solar_gen)
+                if surplus <= 0:
+                    continue
+
+                surplus_norm = min(surplus / max(1e-6, self.P_building_max), 2.0)
+                charge = max(0.0, float(action_np[gidx]))
+                total += charge * surplus_norm
+                count += 1
+            except Exception:
+                pass  # don't inflate count on error
+
+        if count == 0:
+            return 0.0
+        return self.alpha_solar_store * total / count
+
+    def _ev_slack_arbitrage_reward(self, action_np: np.ndarray, price: float) -> float:
+        """R25: Slack-gated EV price arbitrage — EV as mobile battery.
+
+        When slack is HIGH (plenty of time to charge before departure):
+          → Full price signal: charge cheap, V2G during expensive
+        When slack is LOW (must charge soon or miss departure):
+          → Gate → 0: price signal fades, only r_ev urgency drives charging
+
+        For V2G discharge, requires BOTH slack AND surplus SoC (above required + margin).
+        This prevents the R4 failure where EV arbitrage penalized evening charging.
+
+        slack = hours_until_departure - hours_needed_to_full_charge
+        hours_needed = deficit / (max_charge_power * efficiency / battery_capacity)
+        gate = clip(slack / hours_until_departure, 0, 1)
+
+        Charge reward: scale * gate * action * cheapness
+        V2G reward:    scale * gate * surplus_gate * |action| * expensiveness
+        """
+        if self.ev_slack_arb_scale <= 0 or not self._ev_action_map:
+            return 0.0
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+
+        t_now = int(getattr(city, 'time_step', 0))
+        t_idx = max(0, t_now - 1)
+        buildings = list(getattr(city, 'buildings', []))
+
+        # R27: Solar-aware price signal computed per-building inside the loop
+        total = 0.0
+        count = 0
+
+        for gidx, b_idx, ch_idx in self._ev_action_map:
+            if gidx >= len(action_np) or b_idx >= len(buildings):
+                continue
+            chargers = getattr(buildings[b_idx], 'electric_vehicle_chargers', None) or []
+            if ch_idx >= len(chargers):
+                continue
+            ch = chargers[ch_idx]
+            sim = getattr(ch, 'charger_simulation',
+                          getattr(ch, '_Charger__charger_simulation', None))
+            if sim is None:
+                continue
+            try:
+                # Check EV connected
+                sa = np.asarray(
+                    getattr(sim, '_electric_vehicle_charger_state'), dtype=float)
+                if t_now >= len(sa) or float(sa[t_now]) != 1.0:
+                    continue  # not connected
+
+                # Get departure time, required SoC, current SoC
+                da = np.asarray(
+                    getattr(sim, '_electric_vehicle_departure_time'), dtype=float)
+                ra = np.asarray(
+                    getattr(sim, '_electric_vehicle_required_soc_departure'), dtype=float)
+                dep_hours = float(da[t_now]) if t_now < len(da) else 1.0
+                req_soc = float(ra[t_now]) if t_now < len(ra) else 1.0
+                if not np.isfinite(dep_hours) or dep_hours <= 0:
+                    dep_hours = 1.0
+                if not np.isfinite(req_soc):
+                    req_soc = 1.0
+
+                # Get current SoC
+                ev_obj = getattr(ch, 'connected_electric_vehicle', None)
+                if ev_obj is None:
+                    continue
+                bt = getattr(ev_obj, 'battery', None)
+                if bt is None:
+                    continue
+                soc_arr = getattr(bt, 'soc', None)
+                if soc_arr is None:
+                    continue
+                sn = np.asarray(soc_arr, dtype=float)
+                current_soc = float(np.clip(sn[t_idx], 0, 1)) if 0 <= t_idx < len(sn) else 0.0
+
+                # Compute max charge rate in SoC/hour (charger-specific)
+                mp = float(getattr(ch, 'max_charging_power', 0) or 0)
+                if isinstance(mp, np.ndarray):
+                    mp = float(mp.ravel()[0])
+                ec = float(getattr(bt, 'capacity', 0) or 0)
+                eff = float(getattr(ch, 'efficiency', 0.95) or 0.95)
+                if ec <= 0 or mp <= 0:
+                    continue
+                soc_per_hour = (mp * eff) / ec  # charger-specific charge rate
+
+                # Compute slack
+                deficit = max(0.0, req_soc - current_soc)
+                hours_needed = deficit / max(soc_per_hour, 1e-9)
+                slack = max(0.0, dep_hours - hours_needed)
+                gate = min(1.0, slack / max(dep_hours, 1e-9))
+
+                # R27: Per-building solar-aware effective cost (same as battery arb)
+                solar_credit = 0.0
+                try:
+                    b = buildings[b_idx]
+                    sg = getattr(b, 'solar_generation', None)
+                    nsl = getattr(b, '_Building__energy_to_non_shiftable_load', None)
+                    if sg is not None and nsl is not None:
+                        sg_val = abs(float(sg[t_idx])) if hasattr(sg, '__len__') and len(sg) > t_idx else 0.0
+                        nsl_val = float(nsl[t_idx]) if hasattr(nsl, '__len__') and len(nsl) > t_idx else 0.0
+                        solar_surplus = max(0.0, sg_val - nsl_val)
+                        solar_credit = solar_surplus / max(1e-6, self.P_building_max)
+                except Exception:
+                    pass
+                eff_cost = price / max(1e-8, self.mean_price) - 1.0 - solar_credit
+                price_signal = max(-1.0, min(1.0, eff_cost))  # CLIP [-1, 1]
+
+                act = float(action_np[gidx])
+                hour = t_now % 24
+
+                if act >= 0:
+                    # CHARGING: reward when effective cost is negative (cheap/solar)
+                    total += gate * act * max(0.0, -price_signal)
+                    count += 1
+                else:
+                    # C0 fix: no V2G arb reward for deficit EVs
+                    # Charging branch (line 904) still active for price-timing
+                    if current_soc < req_soc:
+                        count += 1
+                        continue
+                    # R29: V2G DISCHARGE — time-gated to peak hours (17-23) ONLY.
+                    # Root cause: during solar hours price_signal is weakly positive,
+                    # so V2G gives small positive reward with zero urgency penalty.
+                    # Agent V2Gs "for free" at solar, depleting SoC for peak hours.
+                    # Fix: zero V2G arb reward outside peak → agent charges during solar.
+                    if hour < 17:
+                        # Non-peak: no V2G arb reward (agent should charge or idle)
+                        count += 1
+                        continue
+
+                    # Peak hours (17-23): time-slack gate
+                    soc_after_v2g = current_soc - soc_per_hour
+                    new_deficit = max(0.0, req_soc - soc_after_v2g)
+                    hours_to_recharge = new_deficit / max(soc_per_hour, 1e-9)
+                    v2g_slack = dep_hours * 0.7 - hours_to_recharge
+
+                    if dep_hours < 2.0:
+                        v2g_gate = 0.0  # hard block: no V2G in last 2 hours
+                    else:
+                        v2g_gate = float(np.clip(v2g_slack / 2.0, 0.0, 1.0))
+
+                    # RAW price_signal: rewards peak V2G (price_signal > 0 at peak)
+                    total += gate * v2g_gate * abs(act) * price_signal
+                    count += 1
+            except Exception:
+                pass
+
+        if count == 0:
+            return 0.0
+        return self.ev_slack_arb_scale * total / count
+
+    def _headroom_penalty(self, action_np: np.ndarray) -> float:
+        """R26: Direction-aware headroom penalty for charging actions.
+
+        C3 uses abs(NEC), so BOTH excess import AND excess export violate.
+        The penalty must understand the DIRECTION:
+
+        IMPORT violation (NEC > +P_bmax): charging WORSENS it → PENALIZE
+        EXPORT violation (NEC < -P_bmax): charging HELPS it → DO NOT penalize
+        Within safe zone (|NEC| < P_bmax):  no violation → no penalty
+
+        For discharge (action < 0):
+        IMPORT violation: discharge helps → no penalty
+        EXPORT violation: discharge worsens → PENALIZE
+        Within safe zone: no penalty
+
+        This correctly handles the solar absorption case:
+        NEC = -11 kW (export violation), agent charges 5 kW → NEC = -6 → BETTER
+        → no penalty (charging reduces export violation)
+
+        NEC = +2 kW (within limit), agent charges 5 kW → NEC = +7 → VIOLATION
+        → penalty (charging caused import violation)
+        """
+        if self.alpha_headroom <= 0:
+            return 0.0
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+
+        t_idx = max(0, int(getattr(city, 'time_step', 0)) - 1)
+        buildings = list(getattr(city, 'buildings', []))
+        total_penalty = 0.0
+        count = 0
+
+        def _compute_penalty(nec_val, act):
+            """Compute directional headroom penalty for one device."""
+            abs_nec = abs(nec_val)
+            overshoot = max(0.0, abs_nec - self.P_building_max)
+            if overshoot <= 0:
+                return 0.0  # within safe zone
+
+            if nec_val > 0:
+                # IMPORT violation: charge worsens, discharge helps
+                if act > 0:
+                    return -(overshoot / self.P_building_max) ** 2
+                # discharge → no penalty (it helps)
+                return 0.0
+            else:
+                # EXPORT violation: charge helps, discharge worsens
+                if act < 0:
+                    return -(overshoot / self.P_building_max) ** 2
+                # charge → no penalty (it helps by absorbing solar)
+                return 0.0
+
+        # Battery actions
+        for act_idx, bld_idx, cap, p_max, eta in self._batt_action_map:
+            if act_idx >= len(action_np) or bld_idx >= len(buildings):
+                continue
+            act = float(action_np[act_idx])
+            if act == 0:
+                count += 1
+                continue
+            b = buildings[bld_idx]
+            try:
+                nec = getattr(b, 'net_electricity_consumption', None)
+                if nec is None or not hasattr(nec, '__len__') or len(nec) <= t_idx:
+                    count += 1
+                    continue
+                nec_val = float(nec[t_idx])
+                total_penalty += _compute_penalty(nec_val, act)
+                count += 1
+            except Exception:
+                count += 1
+
+        # EV charger actions (only connected EVs)
+        t_now = int(getattr(city, 'time_step', 0))
+        for gidx, b_idx, ch_idx in self._ev_action_map:
+            if gidx >= len(action_np) or b_idx >= len(buildings):
+                continue
+            act = float(action_np[gidx])
+            if act == 0:
+                count += 1
+                continue
+            b = buildings[b_idx]
+            try:
+                chargers = getattr(b, 'electric_vehicle_chargers', None) or []
+                if ch_idx >= len(chargers):
+                    count += 1
+                    continue
+                ch = chargers[ch_idx]
+                sim = getattr(ch, 'charger_simulation',
+                              getattr(ch, '_Charger__charger_simulation', None))
+                if sim is None:
+                    count += 1
+                    continue
+                sa = np.asarray(
+                    getattr(sim, '_electric_vehicle_charger_state'), dtype=float)
+                if t_now >= len(sa) or float(sa[t_now]) != 1.0:
+                    count += 1
+                    continue  # not connected
+
+                nec = getattr(b, 'net_electricity_consumption', None)
+                if nec is None or not hasattr(nec, '__len__') or len(nec) <= t_idx:
+                    count += 1
+                    continue
+                nec_val = float(nec[t_idx])
+                total_penalty += _compute_penalty(nec_val, act)
+                count += 1
+            except Exception:
+                count += 1
+
+        if count == 0:
+            return 0.0
+        return self.alpha_headroom * total_penalty / count
+
+    def _peak_shave_reward(self, action_np: np.ndarray) -> float:
+        """Reward battery discharge during building power peaks (C3 correlation).
+
+        Explicitly connects battery actions (C2) with building power (C3):
+        - Building near peak + battery discharging → positive (helping reduce C3)
+        - Building near peak + battery charging → negative (worsening C3)
+        - Building off-peak + battery charging → small positive (storing for later)
+        """
+        if self.alpha_peak_shave <= 0 or not self._batt_action_map:
+            return 0.0
+        city = self._get_citylearn()
+        if city is None:
+            return 0.0
+
+        t_idx = max(0, int(getattr(city, 'time_step', 0)) - 1)
+        buildings = list(getattr(city, 'buildings', []))
+        r_ps = 0.0
+
+        for act_idx, bld_idx, cap, p_max, eta in self._batt_action_map:
+            if act_idx >= len(action_np) or bld_idx >= len(buildings):
+                continue
+            b = buildings[bld_idx]
+            try:
+                nec = getattr(b, 'net_electricity_consumption', None)
+                if nec is None or not hasattr(nec, '__len__') or len(nec) <= t_idx:
+                    continue
+                net_power = float(nec[t_idx])
+                ratio = net_power / max(1e-6, self.P_building_max)
+                act = float(action_np[act_idx])
+
+                if ratio > 0.7:  # Building approaching/exceeding C3 threshold
+                    urgency = min(1.0, (ratio - 0.7) / 0.3)  # 0→1 over 70-100%
+                    if act < 0:  # Discharging — reducing peak
+                        r_ps += urgency * abs(act)
+                    elif act > 0:  # Charging — worsening peak
+                        r_ps -= 0.5 * urgency * act
+                elif ratio < 0.3 and act > 0:  # Off-peak charging — storing for later
+                    r_ps += 0.2 * act
+            except Exception:
+                pass
+
+        n_batt = len(self._batt_action_map)
+        return self.alpha_peak_shave * r_ps / max(1, n_batt)
+
+    def _grid_penalty(self, total_net: float) -> float:
+        """R29: Simple quadratic grid penalty. Penalizes high total grid consumption."""
+        if self.alpha_grid_penalty <= 0:
+            return 0.0
+        ratio = abs(total_net) / max(1e-6, self.P_grid_max)
+        return -self.alpha_grid_penalty * ratio * ratio
+
+    def _stems_reward(self, info: dict, action_np: np.ndarray,
+                      action_pre_ev_clamp: np.ndarray = None) -> float:
         """Custom STEMS with tuned weights + EV component."""
         city = self._get_citylearn()
         if city is None:
             return 0.0
         t_idx = max(0, int(getattr(city, 'time_step', 0)) - 1)
         buildings = list(getattr(city, 'buildings', []))
+
+        # R29: Check if action mask is active (used to disable redundant terms)
+        mask_active = os.environ.get("CITYLEARN_ACTION_MASK", "0") == "1"
+
+        # Beta actor fix: convert x ∈ (0,1) to physical action for reward computation.
+        # The agent outputs x, the mask transforms x → physical via affine mapping.
+        # Reward functions need physical actions to correctly detect charge vs discharge.
+        # This does NOT affect the gradient path (reward is a scalar, not differentiable).
+        beta_mode = os.environ.get("CITYLEARN_BETA_ACTOR", "0") == "1"
+        if beta_mode and mask_active:
+            _city = self._get_citylearn()
+            _smin = getattr(_city, '_action_mask_safe_min', None) if _city else None
+            _smax = getattr(_city, '_action_mask_safe_max', None) if _city else None
+            if _smin is not None and _smax is not None:
+                action_np = _smin + action_np * (_smax - _smin)
+                if action_pre_ev_clamp is not None:
+                    action_pre_ev_clamp = _smin + action_pre_ev_clamp * (_smax - _smin)
 
         # Economic
         try:
@@ -231,15 +1162,34 @@ class CityLearnCMDPv2(CMDP):
         r_eco = -self.mu_economic * price * (imp - ef * exp)
 
         # Grid stability
-        r_sg = self.alpha_grid * (1.0 - min((imp / max(1e-6, self.P_grid_max)) ** 2, 4.0))
+        # Fix 4 (STEMS_SG_EXPORT_CREDIT>0): partial credit for net exports.
+        # Reduces the quadratic asymmetry that punishes charging more than
+        # V2G benefits, enabling grid-based price arbitrage.
+        # imp_eff = max(0, net) - credit * max(0, -net)
+        imp_eff = imp
+        if self.sg_export_credit > 0 and exp > 0:
+            imp_eff = max(0.0, imp - self.sg_export_credit * exp)
+        # R17: threshold r_sg — only penalize imports above threshold
+        if self.sg_threshold_frac > 0:
+            sg_thresh = self.P_grid_max * self.sg_threshold_frac
+            imp_above = max(0.0, imp_eff - sg_thresh)
+        else:
+            imp_above = imp_eff
+        r_sg = self.alpha_grid * (1.0 - min((imp_above / max(1e-6, self.P_grid_max)) ** 2, 4.0))
 
         # Building stability
+        # Fix 1 (STEMS_SB_ASYMMETRIC=1): only penalize imports, not exports.
+        # This enables V2G: exporting power from a building is not penalized.
         bs, bc = 0.0, 0
         for b in buildings:
             try:
                 nec = getattr(b, 'net_electricity_consumption', None)
                 if nec is not None and hasattr(nec, '__len__') and len(nec) > t_idx:
-                    ratio = abs(float(nec[t_idx])) / max(1e-6, self.P_building_max)
+                    nec_val = float(nec[t_idx])
+                    if self.sb_asymmetric:
+                        ratio = max(0.0, nec_val) / max(1e-6, self.P_building_max)
+                    else:
+                        ratio = abs(nec_val) / max(1e-6, self.P_building_max)
                     bs += 1.0 - min(ratio, 4.0); bc += 1
             except Exception:
                 pass
@@ -248,7 +1198,13 @@ class CityLearnCMDPv2(CMDP):
         # Ramp
         rd = abs(total_net - self._prev_net) if self._prev_net is not None else 0.0
         self._prev_net = total_net
-        r_ramp = -self.beta_ramp * (rd / max(1e-6, self.P_grid_max))
+        # R29: Disable r_ramp when action mask is active. The mask changes
+        # executed actions based on state-dependent bounds, creating NEC ramps
+        # the agent didn't intend. Penalizing these spurious ramps hurts learning.
+        if mask_active:
+            r_ramp = 0.0
+        else:
+            r_ramp = -self.beta_ramp * (rd / max(1e-6, self.P_grid_max))
 
         # Renewable
         sg = 0.0
@@ -261,10 +1217,98 @@ class CityLearnCMDPv2(CMDP):
                 pass
         r_ren = self.xi_renewable * min(sg / (sg + imp), 1.0) if (sg + imp) > 0 else 0.0
 
-        # EV (NEW)
-        r_ev = self._ev_reward(action_np)
+        # EV shaping: dense urgency×shortfall reward (complementary to Sauté budget)
+        # STEMS_LAMBDA_EV=0: disabled (R11b/R12a). >0: provides dense gradient for EV charging.
+        r_ev = self._ev_reward(action_np) if self.lambda_ev > 0 else 0.0
 
-        return float(r_eco + r_sg + r_sb + r_ramp + r_ren + r_ev)
+        # R15a: Anti-discharge penalty (uses pre-clamp action for gradient signal)
+        r_ev_guard = self._ev_guard_penalty(
+            action_pre_ev_clamp if action_pre_ev_clamp is not None else action_np)
+
+        # R15b: Context-aware V2G signal (smart discharge timing)
+        r_v2g_ctx = self._ev_v2g_context_reward(action_np, total_net, imp, sg)
+
+        # R15c: Peak-shaving reward (battery C2 ↔ building C3 correlation)
+        r_peak_shave = self._peak_shave_reward(action_np)
+
+        # R16: Battery-only price arbitrage (replaces r_eco for battery intelligence)
+        r_load_shift = self._load_shift_reward(action_np, price)
+
+        # R16: Gentle linear grid awareness (replaces quadratic r_sg)
+        r_grid_mild = -self.alpha_grid_mild * (imp / max(1e-6, self.P_grid_max)) if self.alpha_grid_mild > 0 else 0.0
+
+        # R23: Solar-aligned EV charging reward
+        r_ev_solar = self._ev_solar_reward(action_np, solar=sg) if self.alpha_ev_solar > 0 else 0.0
+
+        # R24: Solar storage — charge batteries+EVs during solar surplus
+        r_solar_store = self._solar_store_reward(action_np) if self.alpha_solar_store > 0 else 0.0
+
+        # R25: Slack-gated EV price arbitrage — EV as mobile battery
+        r_ev_slack_arb = self._ev_slack_arbitrage_reward(action_np, price) if self.ev_slack_arb_scale > 0 else 0.0
+
+        # R26: Headroom penalty — penalize charging that exceeds building power limit
+        # R29: Redundant when action mask is active (mask prevents violations by construction)
+        if mask_active:
+            r_headroom = 0.0
+        else:
+            r_headroom = self._headroom_penalty(action_np) if self.alpha_headroom > 0 else 0.0
+
+        # SoC barrier reward (smooth penalty near battery SoC boundaries)
+        r_barrier = 0.0
+        n_batt = len(self._batt_action_map)
+        if self.alpha_barrier > 0 and n_batt > 0:
+            for b_i in range(1, n_batt + 1):
+                soc = float(info.get(f'battery_soc_b{b_i}', 0.5))
+                # Safe zone [0.10, 0.85]: zero penalty
+                # Transition [0.05, 0.10] and [0.85, 0.90]: linear
+                # Outside [0.05] or [0.90]: max penalty = -1
+                if soc < 0.05:
+                    pen = -1.0
+                elif soc < 0.10:
+                    pen = -(0.10 - soc) / 0.05  # linear 0→-1
+                elif soc > 0.90:
+                    pen = -1.0
+                elif soc > 0.85:
+                    pen = -(soc - 0.85) / 0.05  # linear 0→-1
+                else:
+                    pen = 0.0
+                r_barrier += pen
+            r_barrier *= self.alpha_barrier / n_batt  # normalize by num buildings
+
+        # R29: Simple quadratic grid penalty
+        r_grid_penalty = self._grid_penalty(total_net) if self.alpha_grid_penalty > 0 else 0.0
+
+        # Simple battery price arbitrage (AL-SAC style): R = -action * norm_price
+        r_price_arb = self._simple_price_reward(action_np, price) if self.alpha_price_arb > 0 else 0.0
+
+        # R30: NEC-sign reward — align storage with exogenous load direction
+        r_nec_sign = self._nec_sign_reward(action_np) if self.alpha_nec_sign > 0 else 0.0
+
+        # Log individual reward components for ablation analysis
+        info['r_eco'] = float(r_eco)
+        info['r_sg'] = float(r_sg)
+        info['r_sb'] = float(r_sb)
+        info['r_ramp'] = float(r_ramp)
+        info['r_ren'] = float(r_ren)
+        info['r_ev'] = float(r_ev)
+        info['r_ev_guard'] = float(r_ev_guard)
+        info['r_v2g_ctx'] = float(r_v2g_ctx)
+        info['r_peak_shave'] = float(r_peak_shave)
+        info['r_load_shift'] = float(r_load_shift)
+        info['r_grid_mild'] = float(r_grid_mild)
+        info['r_barrier'] = float(r_barrier)
+        info['r_ev_solar'] = float(r_ev_solar)
+        info['r_solar_store'] = float(r_solar_store)
+        info['r_ev_slack_arb'] = float(r_ev_slack_arb)
+        info['r_headroom'] = float(r_headroom)
+        info['r_grid_penalty'] = float(r_grid_penalty)
+        info['r_price_arb'] = float(r_price_arb)
+        info['r_nec_sign'] = float(r_nec_sign)
+
+        return float(r_eco + r_sg + r_sb + r_ramp + r_ren + r_ev + r_ev_guard
+                     + r_v2g_ctx + r_peak_shave + r_load_shift + r_grid_mild + r_barrier
+                     + r_ev_solar + r_solar_store + r_ev_slack_arb + r_headroom
+                     + r_grid_penalty + r_price_arb + r_nec_sign)
 
     def _rebalanced_cost(self, info: dict) -> float:
         """Rebalanced: C1×10 + C1_dense×5 + C2×1 + C3×0.1 + C4×5"""
@@ -283,6 +1327,221 @@ class CityLearnCMDPv2(CMDP):
         self._step_count = 0
         return torch.as_tensor(obs, dtype=torch.float32), info
 
+    _SOC_UPPER_DEFAULT = 0.94   # legacy default (validated MAE=0.009, true limit 0.95)
+    _BATT_DT = 1.0              # hours per step
+
+    def _discover_battery_actions(self, safety_env) -> list:
+        """Discover (action_index, building_index, cap, p_max, eta) for each battery.
+
+        Returns list of tuples: (act_idx, bld_idx, capacity, nominal_power, efficiency)
+        """
+        city = None
+        cur = safety_env
+        for _ in range(20):
+            if cur is None:
+                break
+            if hasattr(cur, 'buildings') and hasattr(cur, 'action_names'):
+                city = cur
+                break
+            cur = getattr(cur, 'env', getattr(cur, 'base', None))
+        if city is None:
+            return []
+
+        buildings = list(city.buildings)
+        names_raw = getattr(city, 'action_names', [])
+        if isinstance(names_raw, list) and len(names_raw) == 1 and isinstance(names_raw[0], list):
+            flat_names = names_raw[0]
+        elif isinstance(names_raw, list):
+            flat_names = []
+            for sub in names_raw:
+                flat_names.extend(sub) if isinstance(sub, list) else flat_names.append(sub)
+        else:
+            return []
+
+        # Map each battery action to its building
+        batt_key = 'electrical_storage'
+        batt_pos = [i for i, n in enumerate(flat_names) if str(n).lower() == batt_key]
+
+        result = []
+        for b_idx, b in enumerate(buildings):
+            es = getattr(b, 'electrical_storage', None)
+            if es is None:
+                continue
+            # Find this building's battery action index
+            # Battery actions appear in building order, one per building
+            if b_idx < len(batt_pos):
+                act_idx = batt_pos[b_idx]
+            else:
+                continue
+            cap = float(getattr(es, 'capacity', 6.4) or 6.4)
+            p_max = float(getattr(es, 'nominal_power', 5.0) or 5.0)
+            eta = float(getattr(es, 'efficiency', 0.9) or 0.9)
+            result.append((act_idx, b_idx, cap, p_max, eta))
+
+        return result
+
+    def _discover_ev_charger_actions(self, safety_env) -> list:
+        """Discover (global_action_idx, building_idx, charger_local_idx) for each EV charger."""
+        city = None
+        cur = safety_env
+        for _ in range(20):
+            if cur is None:
+                break
+            if hasattr(cur, 'buildings') and hasattr(cur, 'action_names'):
+                city = cur
+                break
+            cur = getattr(cur, 'env', getattr(cur, 'base', None))
+        if city is None:
+            return []
+
+        buildings = list(city.buildings)
+        names_raw = getattr(city, 'action_names', [])
+        if isinstance(names_raw, list) and len(names_raw) == 1 and isinstance(names_raw[0], list):
+            flat_names = names_raw[0]
+        elif isinstance(names_raw, list):
+            flat_names = []
+            for sub in names_raw:
+                flat_names.extend(sub) if isinstance(sub, list) else flat_names.append(sub)
+        else:
+            return []
+
+        ev_key = "electric_vehicle_storage_charger_"
+        batt_key = "electrical_storage"
+        batt_pos = [i for i, n in enumerate(flat_names) if str(n).lower() == batt_key]
+        if len(batt_pos) != len(buildings):
+            print(f"[CMDPv2] WARNING: battery count ({len(batt_pos)}) != building count "
+                  f"({len(buildings)}). EV charger discovery disabled.")
+            return []
+
+        result = []
+        for b_idx in range(len(buildings)):
+            start = batt_pos[b_idx]
+            end = batt_pos[b_idx + 1] if b_idx + 1 < len(buildings) else len(flat_names)
+            chargers = getattr(buildings[b_idx], 'electric_vehicle_chargers', None) or []
+            li = 0
+            for i, n in enumerate(flat_names[start:end]):
+                if ev_key not in str(n).lower():
+                    continue
+                if li < len(chargers):
+                    result.append((start + i, b_idx, li))
+                li += 1
+        return result
+
+    def _discover_wm_actions(self, safety_env) -> list:
+        """Discover action indices for washing machines."""
+        city = None
+        cur = safety_env
+        for _ in range(20):
+            if cur is None:
+                break
+            if hasattr(cur, 'buildings') and hasattr(cur, 'action_names'):
+                city = cur
+                break
+            cur = getattr(cur, 'env', getattr(cur, 'base', None))
+        if city is None:
+            return []
+
+        names_raw = getattr(city, 'action_names', [])
+        if isinstance(names_raw, list) and len(names_raw) == 1 and isinstance(names_raw[0], list):
+            flat_names = names_raw[0]
+        elif isinstance(names_raw, list):
+            flat_names = []
+            for sub in names_raw:
+                flat_names.extend(sub) if isinstance(sub, list) else flat_names.append(sub)
+        else:
+            return []
+
+        return [i for i, n in enumerate(flat_names) if "washing_machine" in str(n).lower()]
+
+    def _clamp_battery_actions(self, a: np.ndarray) -> np.ndarray:
+        """Clamp battery actions to prevent SoC violations."""
+        if not self._batt_action_map:
+            return a
+        city = self._get_citylearn()
+        if city is None:
+            return a
+        buildings = list(getattr(city, 'buildings', []))
+        t_idx = max(0, int(getattr(city, 'time_step', 0)) - 1)
+
+        a_clamped = a.copy()
+        for act_idx, bld_idx, cap, p_max, eta in self._batt_action_map:
+            if act_idx >= len(a_clamped) or bld_idx >= len(buildings):
+                continue
+            es = getattr(buildings[bld_idx], 'electrical_storage', None)
+            if es is None:
+                continue
+            soc_arr = getattr(es, 'soc', None)
+            if soc_arr is None or not hasattr(soc_arr, '__len__') or len(soc_arr) <= t_idx:
+                continue
+            soc = float(np.clip(soc_arr[t_idx], 0.0, 1.0))
+
+            # Max safe charge: positive action = charge
+            denom_charge = p_max * self._BATT_DT * eta
+            max_charge = (self._SOC_UPPER - soc) * cap / denom_charge if denom_charge > 0 else 1.0
+
+            # Max safe discharge: negative action = discharge
+            denom_discharge = p_max * self._BATT_DT
+            max_discharge = soc * cap * eta / denom_discharge if denom_discharge > 0 else 1.0
+
+            a_clamped[act_idx] = float(np.clip(a_clamped[act_idx], -max_discharge, max_charge))
+
+        return a_clamped
+
+    def _clamp_ev_actions(self, a: np.ndarray) -> np.ndarray:
+        """Prevent EV discharge when SoC < required_soc + margin.
+
+        When SoC >= required + margin: full [-1, 1] range (V2G of surplus OK).
+        When SoC < required + margin: clamp to [0, 1] (charge only).
+        """
+        if not self._ev_action_map:
+            return a
+        city = self._get_citylearn()
+        if city is None:
+            return a
+
+        t_now = int(getattr(city, 'time_step', 0))
+        t_idx = max(0, t_now - 1)
+        buildings = list(getattr(city, 'buildings', []))
+        a_clamped = a.copy()
+
+        for gidx, b_idx, ch_idx in self._ev_action_map:
+            if gidx >= len(a_clamped) or b_idx >= len(buildings):
+                continue
+            chargers = getattr(buildings[b_idx], 'electric_vehicle_chargers', None) or []
+            if ch_idx >= len(chargers):
+                continue
+            ch = chargers[ch_idx]
+            sim = getattr(ch, 'charger_simulation',
+                          getattr(ch, '_Charger__charger_simulation', None))
+            if sim is None:
+                continue
+            try:
+                sa = np.asarray(getattr(sim, '_electric_vehicle_charger_state'), dtype=float)
+                if t_now >= len(sa) or float(sa[t_now]) != 1.0:
+                    continue  # No EV connected
+                ra = np.asarray(getattr(sim, '_electric_vehicle_required_soc_departure'), dtype=float)
+                rs = float(ra[t_now]) if t_now < len(ra) else 1.0
+                if not np.isfinite(rs):
+                    rs = 1.0
+                ev_obj = getattr(ch, 'connected_electric_vehicle', None)
+                if ev_obj is None:
+                    continue
+                bt = getattr(ev_obj, 'battery', None)
+                if bt is None:
+                    continue
+                soc_arr = getattr(bt, 'soc', None)
+                if soc_arr is None:
+                    continue
+                sn = np.asarray(soc_arr, dtype=float)
+                current_soc = float(np.clip(sn[t_idx], 0, 1)) if 0 <= t_idx < len(sn) else 0.0
+                if current_soc < rs + self._ev_clamp_margin:
+                    if a_clamped[gidx] < 0:
+                        self._ev_clamp_count += 1
+                    a_clamped[gidx] = float(np.clip(a_clamped[gidx], 0.0, 1.0))
+            except Exception:
+                pass
+        return a_clamped
+
     def step(self, action):
         """Returns 6 values: (obs, reward, cost, terminated, truncated, info)"""
         if isinstance(action, torch.Tensor):
@@ -290,10 +1549,45 @@ class CityLearnCMDPv2(CMDP):
         else:
             a = np.asarray(action, dtype=np.float32).ravel()
 
+        # R18: Disable washing machine (clamp action to 0)
+        if self._wm_disable:
+            for wm_idx in self._wm_action_indices:
+                if wm_idx < len(a):
+                    a[wm_idx] = 0.0
+
+        # Safety clamp: prevent battery SoC violations (optional in R18)
+        if self._batt_clamp_enabled:
+            a = self._clamp_battery_actions(a)
+
+        # R15a: EV action clamp (prevent discharge when under-charged)
+        a_pre_ev_clamp = a.copy() if self._ev_clamp_enabled else a
+        if self._ev_clamp_enabled:
+            a = self._clamp_ev_actions(a)
+
+        # R18: Track V2G discharge attempts (proves agent is exploring V2G)
+        for gidx, b_idx, ch_idx in self._ev_action_map:
+            if gidx < len(a) and float(a[gidx]) < -0.1:
+                self._v2g_discharge_count += 1
+
         obs, _reward_base, terminated, truncated, info = self._env.step(a)
         self._step_count += 1
 
-        reward = self._stems_reward(info, a)
+        reward = self._stems_reward(info, a, a_pre_ev_clamp)
+
+        # Sauté MDP reward reshaping (per Sootla et al., ICML 2022):
+        # When safety budget is exhausted, penalize the agent.
+        # shaped_alpha > 0: smooth gradient (reward - alpha * |deficit|)
+        #   Keeps ALL reward signals alive — agent can still learn from
+        #   r_eco, r_sb, r_ev_guard, r_v2g_ctx even after budget depletion.
+        # shaped_alpha = 0: legacy binary penalty (reward = -5.0)
+        #   Kills all gradient for 93%+ of episode when budget is too small.
+        if info.get("ev_saute_unsafe", 0.0) > 0.5:
+            if self._ev_saute_shaped_alpha > 0:
+                ev_deficit = min(abs(float(info.get("ev_saute_budget", 0.0))), 2.0)
+                reward = reward - self._ev_saute_shaped_alpha * ev_deficit
+            else:
+                reward = -float(info.get("ev_saute_penalty", 5.0))
+
         cost = self._rebalanced_cost(info)
 
         obs_t = torch.as_tensor(obs, dtype=torch.float32)
@@ -310,7 +1604,9 @@ class CityLearnCMDPv2(CMDP):
         if self._step_count <= 5 or self._step_count % 2000 == 0:
             print(f"  [CMDPv2] t={self._step_count} r={reward:.3f} cost={cost:.3f} "
                   f"C1={info.get('cost_ev_departure',0):.2f} "
-                  f"C4={info.get('cost_stems_grid_power',0):.2f}")
+                  f"C4={info.get('cost_stems_grid_power',0):.2f} "
+                  f"ev_clamp={self._ev_clamp_count} "
+                  f"v2g_discharge={self._v2g_discharge_count}")
 
         return obs_t, reward_t, cost_t, terminated_t, truncated_t, info
 

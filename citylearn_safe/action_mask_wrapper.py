@@ -257,7 +257,13 @@ class ActionMaskWrapper(gym.Wrapper):
                 soc = getattr(es, 'soc', None)
                 if soc is not None:
                     if hasattr(soc, '__len__') and len(soc) > 0:
-                        socs.append(float(soc[-1]))
+                        # Read actual current SoC, not end of pre-allocated array
+                        t = int(getattr(self._city, 'time_step', 0))
+                        idx = max(0, t - 1)
+                        if idx < len(soc):
+                            socs.append(float(soc[idx]))
+                        else:
+                            socs.append(float(soc[-1]))
                     else:
                         socs.append(float(soc))
                 else:

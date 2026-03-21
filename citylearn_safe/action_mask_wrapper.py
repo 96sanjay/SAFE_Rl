@@ -70,6 +70,9 @@ class ActionMaskWrapper(gym.Wrapper):
     def __init__(self, env: gym.Env):
         super().__init__(env)
 
+        # Beta actor mode: x ∈ (0,1) → affine transform to [safe_min, safe_max]
+        self._beta_mode = os.environ.get("CITYLEARN_BETA_ACTOR", "0") == "1"
+
         self._p_bmax = float(os.environ.get(
             "CITYLEARN_STEMS_P_BUILDING_MAX", "4.6083"))
         self._soc_low = float(os.environ.get(
@@ -408,81 +411,12 @@ class ActionMaskWrapper(gym.Wrapper):
             safe_max[idx] = 1.0
 
         # ── C4: Grid-level aggregate import constraint ──
-        # C4 cost = max(0, grid_import - P_grid_max) where grid_import = max(0, sum(NEC))
-        # The mask tightens the CHARGE side only (import = charge increases NEC).
-        # Discharge reduces NEC → never violates C4 → safe_min unchanged.
-        #
-        # Two-pass slack redistribution:
-        #   Pass 1: Equal C4 share per building. Effective = min(C3_charge, C4_share).
-        #   Pass 2: Redistribute slack from buildings that can't use their share.
-
-        total_exo_import = sum(max(0.0, e) for e in exo_nec)
-        self._last_total_exo_import = total_exo_import
-        grid_headroom = max(0.0, self._p_gmax - total_exo_import)
-
-        # Check if C4 is binding (worst-case charge power exceeds grid headroom)
-        worst_case_charge = sum(
-            max(0.0, safe_max[self._building_batt_act[b]]) * self._batt_powers[b]
-            + (max(0.0, safe_max[self._building_ev_act[b]]) * self._ev_max_charge.get(b, 0.0)
-               if b in self._building_ev_act else 0.0)
-            for b in self._building_batt_act
-        )
-
-        if worst_case_charge > grid_headroom:
-            # C4 is binding — need to tighten charge limits
-
-            # Compute each building's max charge power from current safe_max
-            bld_charge_power = {}
-            for b in self._building_batt_act:
-                p = max(0.0, safe_max[self._building_batt_act[b]]) * self._batt_powers[b]
-                if b in self._building_ev_act:
-                    p += max(0.0, safe_max[self._building_ev_act[b]]) * self._ev_max_charge.get(b, 0.0)
-                bld_charge_power[b] = p
-
-            n_bld = len(bld_charge_power)
-
-            # Pass 1: equal share
-            equal_share = grid_headroom / max(n_bld, 1)
-            alloc = {}
-            slack = 0.0
-            slack_receivers = []
-            for b, cp in bld_charge_power.items():
-                if cp <= equal_share:
-                    alloc[b] = cp
-                    slack += equal_share - cp
-                else:
-                    alloc[b] = equal_share
-                    slack_receivers.append(b)
-
-            # Pass 2: redistribute slack to buildings that need more
-            if slack > 0 and slack_receivers:
-                extra_per = slack / len(slack_receivers)
-                for b in slack_receivers:
-                    alloc[b] = min(bld_charge_power[b], alloc[b] + extra_per)
-
-            # Apply C4 allocation: tighten safe_max for charge side
-            for b in self._building_batt_act:
-                if b not in alloc:
-                    continue
-                c4_limit_kw = alloc[b]
-                batt_act_idx = self._building_batt_act[b]
-                p_batt = self._batt_powers[b]
-
-                if b in self._building_ev_act:
-                    ev_act_idx = self._building_ev_act[b]
-                    ev_max_ch = self._ev_max_charge.get(b, 0.0)
-                    total_dev = p_batt + ev_max_ch if ev_max_ch > 0 else p_batt + 1e-6
-                    batt_share = c4_limit_kw * (p_batt / total_dev)
-                    ev_share = c4_limit_kw - batt_share
-
-                    c4_batt_smax = batt_share / p_batt if p_batt > 0 else 0.0
-                    safe_max[batt_act_idx] = min(safe_max[batt_act_idx], c4_batt_smax)
-
-                    c4_ev_smax = ev_share / ev_max_ch if ev_max_ch > 0 else 0.0
-                    safe_max[ev_act_idx] = min(safe_max[ev_act_idx], c4_ev_smax)
-                else:
-                    c4_batt_smax = c4_limit_kw / p_batt if p_batt > 0 else 0.0
-                    safe_max[batt_act_idx] = min(safe_max[batt_act_idx], c4_batt_smax)
+        # DISABLED: C4 mask over-restricts EV charging headroom, causing C0 (EV departure)
+        # violations to spike from 16% to 86%. The per-building C4 allocation (grid_headroom/5
+        # ≈ 2kW per building) is too small for EV chargers (11-22kW nominal).
+        # C4 is left to the Lagrangian, which handles it at the policy level.
+        # C2 (SoC bounds) and C3 (per-building power) are structurally enforced by the mask.
+        self._last_total_exo_import = sum(max(0.0, e) for e in exo_nec)
 
         return safe_min, safe_max, interventions
 
@@ -529,7 +463,13 @@ class ActionMaskWrapper(gym.Wrapper):
         safe_min, safe_max, interventions = self._compute_safe_bounds(
             exo_nec, socs)
 
-        safe_action = self._rescale(action, safe_min, safe_max)
+        if self._beta_mode:
+            # Beta mode: x ∈ (0,1) → affine transform to [safe_min, safe_max]
+            x = np.clip(action, 1e-6, 1 - 1e-6)
+            safe_action = safe_min + x * (safe_max - safe_min)
+            safe_action = np.clip(safe_action, safe_min, safe_max)
+        else:
+            safe_action = self._rescale(action, safe_min, safe_max)
 
         self._last_safe_min = safe_min.copy()
         self._last_safe_max = safe_max.copy()

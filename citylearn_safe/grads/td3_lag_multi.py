@@ -446,20 +446,17 @@ class TD3LagMulti(TD3):
     def _loss_pi(self, obs: torch.Tensor) -> torch.Tensor:
         """Compute actor loss with DiffProjector and penalty critic.
 
-        Eq. 30 (corrected sign):
+        Eq. 30:
             u       = pi_theta(s)
             u_phi   = Phi(s, u)           (differentiable projection)
-            h       = w * ||u - u_phi||^2
-            L = (-min(Q1_r, Q2_r)(s, u_phi)
-                 + lam_0 * Q_C0(s, u_phi)
-                 + lam_1 * Q_C1(s, u_phi)
-                 + Q_pen(s, u)
-                ) / (1 + lam_0 + lam_1)
+            L = -min(Q1_r, Q2_r)(s, u_phi)   # reward (through projector)
+                + lam_0 * Q_C0(s, u)          # C0 cost (NOT through projector)
+                + lam_1 * Q_C1(s, u)          # C1 cost (NOT through projector)
+                + Q_pen(s, u)                  # penalty (NOT through projector)
 
-        The reward/cost critics receive the projected action (gradients flow
-        through the projector back to the actor). The penalty critic receives
-        the raw action (gradients bypass the projector, penalizing the actor
-        directly for producing unsafe actions).
+        The reward critic receives the projected action (gradients flow through
+        the projector back to the actor). The cost and penalty critics receive
+        the raw action (gradients bypass the projector) to avoid action aliasing.
         """
         # 1. Raw action from actor
         u = self._actor_critic.actor.predict(obs, deterministic=True)
@@ -476,11 +473,14 @@ class TD3LagMulti(TD3):
         q1_r, q2_r = self._actor_critic.reward_critic(obs, u_phi)
         loss_reward = -torch.min(q1_r, q2_r).mean()
 
-        # 4. Per-constraint cost Q-values (through projector)
+        # 4. Per-constraint cost Q-values (NOT through projector -- uses raw u)
+        # C0/C1 are Lagrangian constraints, not projection constraints.
+        # Evaluating through the projector would cause action aliasing on the
+        # cost critics (same issue as PSF).
         lam_0 = self._get_lambda(0)
         lam_1 = self._get_lambda(1)
-        q_c0 = self._cost_q_critics[0](obs, u_phi)[0]
-        q_c1 = self._cost_q_critics[1](obs, u_phi)[0]
+        q_c0 = self._cost_q_critics[0](obs, u)[0]
+        q_c1 = self._cost_q_critics[1](obs, u)[0]
         loss_c0 = lam_0 * q_c0.mean()
         loss_c1 = lam_1 * q_c1.mean()
 
@@ -490,9 +490,8 @@ class TD3LagMulti(TD3):
         q_pen = self._penalty_critic(obs, u)[0]
         loss_pen = q_pen.mean()
 
-        # 6. Combined loss (Eq. 30), normalized by (1 + sum_lambda)
-        denom = 1.0 + lam_0 + lam_1
-        total_loss = (loss_reward + loss_c0 + loss_c1 + loss_pen) / denom
+        # 6. Combined loss (Eq. 30, no normalization -- paper has no denominator)
+        total_loss = loss_reward + loss_c0 + loss_c1 + loss_pen
 
         # Log diagnostics
         proj_norm = (u - u_phi).pow(2).sum(dim=-1).mean().item()
@@ -577,7 +576,7 @@ class TD3LagMulti(TD3):
     def _update_per_cost_critic(
         self,
         obs: torch.Tensor,
-        act_safe: torch.Tensor,
+        act_unsafe: torch.Tensor,
         cost_i: torch.Tensor,
         done: torch.Tensor,
         next_obs: torch.Tensor,
@@ -585,14 +584,16 @@ class TD3LagMulti(TD3):
     ) -> None:
         """Update a per-constraint cost Q-critic via TD learning.
 
-        Uses the SAFE (projected) action for both current and target Q-values.
-        Target action uses TD3-style noise smoothing on the projected target action.
+        Uses the UNSAFE (raw) action for both current and target Q-values.
+        C0/C1 are Lagrangian constraints -- their critics must see raw actions
+        to avoid action aliasing through the projector.
+        Target action uses TD3-style noise smoothing on the raw target action.
         """
         with torch.no_grad():
             next_action_raw = self._actor_critic.target_actor.predict(
                 next_obs, deterministic=True
             )
-            # TD3 target noise smoothing
+            # TD3 target noise smoothing (no projection for cost critics)
             policy_noise = self._cfgs.algo_cfgs.policy_noise
             policy_noise_clip = self._cfgs.algo_cfgs.policy_noise_clip
             noise = (torch.randn_like(next_action_raw) * policy_noise).clamp(
@@ -600,22 +601,14 @@ class TD3LagMulti(TD3):
             )
             next_action_noisy = (next_action_raw + noise).clamp(-1.0, 1.0)
 
-            # Project target action
-            if self._projector is not None:
-                next_action_safe, _ = self._projector.project(
-                    next_obs, next_action_noisy
-                )
-            else:
-                next_action_safe = next_action_noisy
-
             next_q_c = self._cost_q_critic_targets[idx](
-                next_obs, next_action_safe
+                next_obs, next_action_noisy
             )[0]
             target_q_c = (
                 cost_i + self._cfgs.algo_cfgs.gamma * (1 - done) * next_q_c
             )
 
-        q_c = self._cost_q_critics[idx](obs, act_safe)[0]
+        q_c = self._cost_q_critics[idx](obs, act_unsafe)[0]
         loss = F.mse_loss(q_c, target_q_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
@@ -728,11 +721,12 @@ class TD3LagMulti(TD3):
             if self._cfgs.algo_cfgs.use_cost:
                 self._update_cost_critic(obs, act_safe, cost, done, next_obs)
 
-            # 3. Per-constraint cost critics: trained on (obs, act_safe, cost_i)
+            # 3. Per-constraint cost critics: trained on (obs, act_unsafe, cost_i)
+            #    C0/C1 are Lagrangian constraints -- critics see raw actions
             for i in range(NUM_COSTS):
                 cost_i = data[f'cost_{i}']
                 self._update_per_cost_critic(
-                    obs, act_safe, cost_i, done, next_obs, i
+                    obs, act_unsafe, cost_i, done, next_obs, i
                 )
 
             # 4. Penalty critic: trained on (obs, act_unsafe, penalty_h)

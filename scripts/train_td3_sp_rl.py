@@ -132,18 +132,17 @@ def main(cfg_path: str) -> None:
     try:
         from citylearn_safe.diff_projector import DiffProjector
 
-        obs_dim = agent._env.observation_space.shape[0]
-        act_dim = agent._env.action_space.shape[0]
+        # Pass the adapter (which wraps the CMDP/CityLearn env chain);
+        # DiffProjector._unwrap_to_citylearn walks ._env/.env/.unwrapped to
+        # find the CityLearn env with .buildings and .time_step.
         projector = DiffProjector(
-            obs_dim=obs_dim,
-            act_dim=act_dim,
+            env=agent._env,
             solver_eps=solver_eps,
             solver_max_iters=solver_max_iters,
-            device=agent._device,
         )
         projector.build()
         agent._projector = projector
-        print(f"[train_td3_sp_rl] DiffProjector built: obs={obs_dim}, act={act_dim}")
+        print(f"[train_td3_sp_rl] DiffProjector built successfully")
         print(f"[train_td3_sp_rl] Solver: eps={solver_eps}, max_iters={solver_max_iters}")
     except ImportError:
         print("[train_td3_sp_rl] WARNING: DiffProjector not available. "

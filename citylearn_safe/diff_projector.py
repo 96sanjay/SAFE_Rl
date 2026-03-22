@@ -443,44 +443,66 @@ class DiffProjector:
         batt_gain_t = torch.tensor(state["batt_gain"], dtype=dtype, device=device)
         ev_gain_t = torch.tensor(state["ev_gain"], dtype=dtype, device=device)
 
-        # Solve for each sample in the batch
-        safe_actions = []
-        total_delta = 0.0
-        all_feasible = True
+        # Solve the batch using cvxpylayers batch support.
+        # cvxpylayers interprets 2D parameters as (batch, dim) and solves
+        # all samples in parallel via vectorized SCS calls.
+        # State parameters (base, soc, etc.) are the SAME for all samples
+        # in the batch (from current env state), so we broadcast them.
 
         t0 = time.monotonic()
+        all_feasible = True
 
-        for i in range(batch_size):
-            u_i = unsafe_action[i]  # shape (act_dim,), keeps grad
+        try:
+            # Broadcast state params: shape (dim,) → (batch, dim) via expand
+            base_batch = base_t.unsqueeze(0).expand(batch_size, -1)
+            soc0_batch = soc0_t.unsqueeze(0).expand(batch_size, -1)
+            soc_scale_batch = soc_scale_t.unsqueeze(0).expand(batch_size, -1)
+            batt_gain_batch = batt_gain_t.unsqueeze(0).expand(batch_size, -1)
+            ev_gain_batch = ev_gain_t.unsqueeze(0).expand(batch_size, -1)
 
-            try:
-                (z_opt,) = self._layer(
-                    u_i, base_t, soc0_t, soc_scale_t, batt_gain_t, ev_gain_t,
-                    solver_args={
-                        "eps": self.solver_eps,
-                        "max_iters": self.solver_max_iters,
-                    },
-                )
+            # Batched solve: unsafe_action is already (batch, act_dim)
+            (z_opt,) = self._layer(
+                unsafe_action, base_batch, soc0_batch,
+                soc_scale_batch, batt_gain_batch, ev_gain_batch,
+                solver_args={
+                    "eps": self.solver_eps,
+                    "max_iters": self.solver_max_iters,
+                },
+            )
 
-                # Guard against NaN from solver failure
-                if torch.isnan(z_opt).any() or torch.isinf(z_opt).any():
-                    raise RuntimeError("Solver returned NaN/Inf")
+            # Guard against NaN/Inf
+            if torch.isnan(z_opt).any() or torch.isinf(z_opt).any():
+                raise RuntimeError("Batched solver returned NaN/Inf")
 
-                safe_actions.append(z_opt)
+            with torch.no_grad():
+                total_delta = torch.norm(z_opt - unsafe_action, dim=-1).mean().item()
+
+            result = z_opt
+
+        except Exception:
+            # Fallback: solve one at a time (slower but handles infeasibility)
+            all_feasible = False
+            safe_actions = []
+            total_delta = 0.0
+            for i in range(batch_size):
+                u_i = unsafe_action[i]
+                try:
+                    (z_i,) = self._layer(
+                        u_i, base_t, soc0_t, soc_scale_t, batt_gain_t, ev_gain_t,
+                        solver_args={"eps": self.solver_eps, "max_iters": self.solver_max_iters},
+                    )
+                    if torch.isnan(z_i).any() or torch.isinf(z_i).any():
+                        raise RuntimeError("NaN")
+                    safe_actions.append(z_i)
+                except Exception:
+                    safe_actions.append(self._fallback_clamp(u_i, state))
                 with torch.no_grad():
-                    total_delta += torch.norm(z_opt - u_i).item()
-
-            except Exception:
-                # Infeasible or solver error: fall back to clamping
-                all_feasible = False
-                clamped = self._fallback_clamp(u_i, state)
-                safe_actions.append(clamped)
-                with torch.no_grad():
-                    total_delta += torch.norm(clamped - u_i).item()
+                    total_delta += torch.norm(safe_actions[-1] - u_i).item()
+            total_delta /= max(1, batch_size)
+            result = torch.stack(safe_actions, dim=0)
 
         solve_ms = (time.monotonic() - t0) * 1000.0
 
-        result = torch.stack(safe_actions, dim=0)
         if squeeze_output:
             result = result.squeeze(0)
 

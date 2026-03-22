@@ -1110,10 +1110,16 @@ class CityLearnCMDPv2(CMDP):
         return self.alpha_peak_shave * r_ps / max(1, n_batt)
 
     def _grid_penalty(self, total_net: float) -> float:
-        """R29: Simple quadratic grid penalty. Penalizes high total grid consumption."""
+        """Quadratic grid penalty. Penalizes high grid IMPORT only (not export).
+
+        Changed from abs(total_net) to max(0, total_net) because abs() penalizes
+        solar export and V2G discharge, creating a severe gradient conflict with
+        r_ren (cosine = -0.82 in diagnostic). Import-only preserves the grid peak
+        penalty without fighting renewable self-consumption.
+        """
         if self.alpha_grid_penalty <= 0:
             return 0.0
-        ratio = abs(total_net) / max(1e-6, self.P_grid_max)
+        ratio = max(0.0, total_net) / max(1e-6, self.P_grid_max)
         return -self.alpha_grid_penalty * ratio * ratio
 
     def _stems_reward(self, info: dict, action_np: np.ndarray,

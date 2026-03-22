@@ -1,0 +1,170 @@
+# scripts/train_td3_sp_rl.py
+"""Training script for TD3LagMulti (SP-RL: Safety Projection for RL).
+
+TD3 with per-constraint Lagrange multipliers (C0, C1 via PID) and DiffProjector
+(C2/C3/C4 hard constraints via differentiable QP projection).
+
+Bypasses omnisafe.Agent (which needs a default config YAML per algorithm)
+and directly instantiates TD3LagMulti with the merged config.
+
+Usage:
+    python scripts/train_td3_sp_rl.py --cfg configs/off-policy/td3_sp_rl_1bld.yaml
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+
+import yaml
+
+# Register environments FIRST
+import citylearn_safe.omni_env       # noqa: F401
+import citylearn_safe.omni_env_v2    # noqa: F401
+
+from omnisafe.utils.config import Config
+
+# Import TD3LagMulti (triggers @registry.register)
+from citylearn_safe.grads.td3_lag_multi import TD3LagMulti
+
+
+def load_td3_defaults() -> dict:
+    """Load TD3 default config from OmniSafe's installed configs.
+
+    We load TD3 (not TD3Lag) because TD3LagMulti handles Lagrangian itself.
+    """
+    import omnisafe
+    pkg_dir = os.path.dirname(os.path.abspath(omnisafe.__file__))
+    default_path = os.path.join(pkg_dir, 'configs', 'off-policy', 'TD3.yaml')
+    with open(default_path) as f:
+        raw = yaml.safe_load(f)
+    return raw.get('defaults', raw)
+
+
+def deep_update(base: dict, override: dict) -> dict:
+    """Recursively update base dict with override dict."""
+    result = copy.deepcopy(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = deep_update(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def main(cfg_path: str) -> None:
+    # 1. Load TD3 defaults
+    defaults = load_td3_defaults()
+
+    # 2. Load our custom config
+    with open(cfg_path) as f:
+        custom = yaml.safe_load(f)
+
+    algo = custom.pop('algo', 'TD3LagMulti')
+    env_id = custom.pop('env_id', 'CityLearnSafety-V2G-v2')
+    seed = custom.pop('seed', 42)
+
+    # 3. Merge: defaults + custom overrides
+    merged = deep_update(defaults, custom)
+    merged['seed'] = seed
+    merged['env_id'] = env_id
+    merged['algo'] = algo
+    merged['exp_name'] = f'{algo}-{{{env_id}}}'
+
+    # Compute epochs from total_steps
+    total_steps = merged['train_cfgs']['total_steps']
+    steps_per_epoch = merged['algo_cfgs']['steps_per_epoch']
+    merged['train_cfgs']['epochs'] = total_steps // steps_per_epoch
+
+    # Ensure device is set
+    if 'device' not in merged['train_cfgs']:
+        merged['train_cfgs']['device'] = 'cpu'
+
+    # 4. Convert to OmniSafe Config object
+    cfgs = Config(**merged)
+
+    # Extract projector config for display
+    proj_cfgs = getattr(cfgs, 'projector_cfgs', None)
+    penalty_w = float(getattr(proj_cfgs, 'penalty_w', 1.0)) if proj_cfgs else 1.0
+    solver_eps = float(getattr(proj_cfgs, 'solver_eps', 1e-4)) if proj_cfgs else 1e-4
+    solver_max_iters = int(getattr(proj_cfgs, 'solver_max_iters', 5000)) if proj_cfgs else 5000
+    pen_critic_lr = float(getattr(proj_cfgs, 'penalty_critic_lr', 3e-4)) if proj_cfgs else 3e-4
+
+    print(f"{'=' * 60}")
+    print(f"  TD3LagMulti Training (SP-RL: Safety Projection for RL)")
+    print(f"{'=' * 60}")
+    print(f"  Algo: {algo}")
+    print(f"  Env: {env_id}")
+    print(f"  Seed: {seed}")
+    print(f"  Epochs: {cfgs.train_cfgs.epochs}")
+    print(f"  Steps/epoch: {cfgs.algo_cfgs.steps_per_epoch}")
+    print(f"  Replay buffer: {cfgs.algo_cfgs.size}")
+    print(f"  Batch size: {cfgs.algo_cfgs.batch_size}")
+    print(f"  Start learning: {cfgs.algo_cfgs.start_learning_steps}")
+    print(f"  Policy delay: {cfgs.algo_cfgs.policy_delay}")
+    print(f"  Exploration noise: {cfgs.algo_cfgs.exploration_noise}")
+    print(f"  Warmup epochs: {cfgs.algo_cfgs.warmup_epochs}")
+    print(f"  --- Projection ---")
+    print(f"  Penalty weight (w): {penalty_w}")
+    print(f"  Solver eps: {solver_eps}")
+    print(f"  Solver max iters: {solver_max_iters}")
+    print(f"  Penalty critic LR: {pen_critic_lr}")
+    if hasattr(cfgs, 'multi_cfgs'):
+        print(f"  --- Lagrange (PID) ---")
+        print(f"  Softmax tau: {cfgs.multi_cfgs.tau}")
+        print(f"  Per-constraint cost limits:")
+        for i in range(2):
+            lim = float(getattr(cfgs.multi_cfgs, f'cost_limit_{i}', 5000.0))
+            kp = float(getattr(cfgs.multi_cfgs, f'pid_kp_{i}',
+                        getattr(cfgs.multi_cfgs, 'pid_kp', 0.1)))
+            ki = float(getattr(cfgs.multi_cfgs, f'pid_ki_{i}',
+                        getattr(cfgs.multi_cfgs, 'pid_ki', 0.01)))
+            print(f"    C{i}: limit={lim:.0f}, Kp={kp}, Ki={ki}")
+    print(f"  Lambda init: {cfgs.lagrange_cfgs.lagrangian_multiplier_init}")
+    ub = getattr(cfgs.lagrange_cfgs, 'lagrangian_upper_bound', None)
+    print(f"  Lambda upper bound: {'None (uncapped)' if ub is None else ub}")
+    print(f"{'=' * 60}")
+
+    # 5. Direct instantiation (bypasses omnisafe.Agent)
+    agent = TD3LagMulti(env_id=env_id, cfgs=cfgs)
+
+    # 6. Build DiffProjector (if available)
+    try:
+        from citylearn_safe.diff_projector import DiffProjector
+
+        obs_dim = agent._env.observation_space.shape[0]
+        act_dim = agent._env.action_space.shape[0]
+        projector = DiffProjector(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            solver_eps=solver_eps,
+            solver_max_iters=solver_max_iters,
+            device=agent._device,
+        )
+        projector.build()
+        agent._projector = projector
+        print(f"[train_td3_sp_rl] DiffProjector built: obs={obs_dim}, act={act_dim}")
+        print(f"[train_td3_sp_rl] Solver: eps={solver_eps}, max_iters={solver_max_iters}")
+    except ImportError:
+        print("[train_td3_sp_rl] WARNING: DiffProjector not available. "
+              "Running without safety projection (no C2/C3/C4 hard constraints).")
+    except Exception as e:
+        print(f"[train_td3_sp_rl] WARNING: DiffProjector build failed: {e}")
+        print("[train_td3_sp_rl] Running without safety projection.")
+
+    # 7. Train
+    ep_ret, ep_cost, ep_len = agent.learn()
+
+    print(f"\nTraining complete.")
+    print(f"  Final EpRet: {ep_ret:.1f}")
+    print(f"  Final EpCost: {ep_cost:.1f}")
+    print(f"  Final EpLen: {ep_len:.0f}")
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(
+        description='Train TD3LagMulti (SP-RL) on CityLearn V2G'
+    )
+    ap.add_argument('--cfg', required=True, help='Path to YAML config')
+    args = ap.parse_args()
+    main(args.cfg)

@@ -275,6 +275,13 @@ class ActionProjectionSERL(gym.Wrapper):
         info["serl_raw_action"] = raw_action.tolist()
         info["serl_n_infeasible"] = float(n_infeasible)  # dims where C3/C4 bounds conflict
         info["serl_structural_c4"] = float(getattr(self, '_last_structural_c4', 0))
+        # QP solve path diagnostics
+        qp_path = getattr(self, '_last_qp_path', 'unknown')
+        info["serl_qp_path"] = qp_path
+        info["serl_qp_solved"] = 1.0 if qp_path == "qp_solved" else 0.0
+        info["serl_qp_fastpath"] = 1.0 if qp_path == "fastpath" else 0.0
+        info["serl_qp_fallback"] = 1.0 if qp_path == "fallback" else 0.0
+        info["serl_qp_solve_ms"] = getattr(self, '_last_qp_ms', 0.0)
         info["serl_c0_c4_conflict"] = float(getattr(self, '_last_c0_c4_conflict', 0))
         info["serl_c0_c3_conflict"] = float(getattr(self, '_last_c0_c3_conflict', 0))
         info["serl_c4_relaxation_kw"] = float(getattr(self, '_last_c4_relaxation_kw', 0))
@@ -497,7 +504,12 @@ class ActionProjectionSERL(gym.Wrapper):
         Falls back to np.clip if cvxpy unavailable or QP fails.
         """
         if not _HAS_CVXPY:
+            self._last_qp_path = "no_cvxpy"
+            self._last_qp_ms = 0.0
             return np.clip(raw_action, safe_min, safe_max)
+
+        import time as _time
+        _t0 = _time.monotonic()
 
         # Fast path: check if raw_action is already feasible for all constraints
         clipped = np.clip(raw_action, -1.0, 1.0)
@@ -528,6 +540,8 @@ class ActionProjectionSERL(gym.Wrapper):
                 all_feasible = False
 
         if all_feasible:
+            self._last_qp_path = "fastpath"
+            self._last_qp_ms = (_time.monotonic() - _t0) * 1000
             return clipped
 
         # Not feasible — solve full QP
@@ -594,11 +608,15 @@ class ActionProjectionSERL(gym.Wrapper):
             prob.solve(solver=cp.SCS, verbose=False, max_iters=5000, eps=1e-4)
             if prob.status in ('optimal', 'optimal_inaccurate') and z.value is not None:
                 result = np.asarray(z.value, dtype=np.float32).flatten()
+                self._last_qp_path = "qp_solved"
+                self._last_qp_ms = (_time.monotonic() - _t0) * 1000
                 return np.clip(result, -1.0, 1.0)  # numerical safety
         except Exception:
             pass
 
         # Fallback: use pre-computed box bounds (C2+C3 enforced, C4 best-effort)
+        self._last_qp_path = "fallback"
+        self._last_qp_ms = (_time.monotonic() - _t0) * 1000
         return np.clip(raw_action, safe_min, safe_max)
 
     def _compute_safe_bounds(

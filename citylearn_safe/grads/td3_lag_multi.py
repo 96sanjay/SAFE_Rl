@@ -32,7 +32,7 @@ from __future__ import annotations
 import os
 import time
 from copy import deepcopy
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -109,11 +109,17 @@ class _SPRLOffPolicyAdapter(OffPolicyAdapter):
             else:
                 act_unsafe = agent.step(self._current_obs, deterministic=False)
 
-            # Project through DiffProjector (if available)
+            # Extract projection state BEFORE stepping (current env state)
             if projector is not None:
                 with torch.no_grad():
-                    act_safe, _ = projector.project(self._current_obs, act_unsafe)
+                    proj_state = projector.extract_state_tensor().unsqueeze(0).to(
+                        self._device
+                    )
+                    act_safe, _ = projector.project(
+                        self._current_obs, act_unsafe
+                    )
             else:
+                proj_state = None
                 act_safe = act_unsafe.clone()
 
             # Compute penalty: h = w * ||u - u_phi||^2
@@ -152,8 +158,16 @@ class _SPRLOffPolicyAdapter(OffPolicyAdapter):
                 self._per_ep_costs[i] += float(val)
 
             # Store in buffer: standard fields + per-constraint costs
-            # + safe action + penalty. The 'act' field stores the UNSAFE action
-            # (needed for penalty critic). We store safe action separately.
+            # + safe action + penalty + projection state.
+            # The 'act' field stores the UNSAFE action (needed for penalty critic).
+            # We store safe action and projection state separately.
+            extra_fields = dict(
+                act_safe=act_safe,
+                penalty_h=penalty_h,
+                **per_cost_vals,
+            )
+            if proj_state is not None:
+                extra_fields['proj_state'] = proj_state
             buffer.store(
                 obs=self._current_obs,
                 act=act_unsafe,
@@ -163,9 +177,7 @@ class _SPRLOffPolicyAdapter(OffPolicyAdapter):
                     terminated, torch.logical_xor(terminated, truncated)
                 ),
                 next_obs=real_next_obs,
-                act_safe=act_safe,
-                penalty_h=penalty_h,
-                **per_cost_vals,
+                **extra_fields,
             )
 
             self._current_obs = next_obs
@@ -176,11 +188,12 @@ class _SPRLOffPolicyAdapter(OffPolicyAdapter):
 # ===========================================================================
 class _SPRLOffPolicyBuffer(VectorOffPolicyBuffer):
     """Replay buffer for SP-RL: stores (obs, act_unsafe, act_safe, reward,
-    cost_c0, cost_c1, penalty_h, next_obs, done).
+    cost_c0, cost_c1, penalty_h, proj_state, next_obs, done).
 
     The standard 'act' field holds the unsafe action. Additional fields:
       - act_safe: projected safe action (used for reward/cost critic training)
       - penalty_h: projection penalty (used for penalty critic training)
+      - proj_state: DiffProjector state tensor per sample (for correct batch updates)
       - cost_0, cost_1: per-constraint costs
     """
 
@@ -192,6 +205,7 @@ class _SPRLOffPolicyBuffer(VectorOffPolicyBuffer):
         batch_size: int,
         num_envs: int,
         device: torch.device,
+        proj_state_dim: int = 0,
     ) -> None:
         super().__init__(
             obs_space=obs_space,
@@ -210,6 +224,11 @@ class _SPRLOffPolicyBuffer(VectorOffPolicyBuffer):
         self.data['penalty_h'] = torch.zeros(
             (size, num_envs), dtype=torch.float32, device=device
         )
+        # Projection state buffer (per-sample env state for correct batch projection)
+        if proj_state_dim > 0:
+            self.data['proj_state'] = torch.zeros(
+                (size, num_envs, proj_state_dim), dtype=torch.float32, device=device
+            )
         # Per-constraint cost buffers
         for i in range(NUM_COSTS):
             self.data[f'cost_{i}'] = torch.zeros(
@@ -330,6 +349,16 @@ class TD3LagMulti(TD3):
 
     def _init(self) -> None:
         """Initialize replay buffer, DiffProjector, Lagrange multipliers."""
+        # --- DiffProjector (built externally via agent._projector.build()) ---
+        # Imported lazily; the training script must set self._projector before learn()
+        self._projector = None
+
+        # Determine projection state dim (0 if projector not yet set;
+        # will be updated by training script before learn())
+        proj_state_dim = 0
+        if hasattr(self, '_projector') and self._projector is not None:
+            proj_state_dim = self._projector.state_tensor_dim
+
         # --- SP-RL replay buffer ---
         self._buf: _SPRLOffPolicyBuffer = _SPRLOffPolicyBuffer(
             obs_space=self._env.observation_space,
@@ -338,11 +367,8 @@ class TD3LagMulti(TD3):
             batch_size=self._cfgs.algo_cfgs.batch_size,
             num_envs=self._cfgs.train_cfgs.vector_env_nums,
             device=self._device,
+            proj_state_dim=proj_state_dim,
         )
-
-        # --- DiffProjector (built externally via agent._projector.build()) ---
-        # Imported lazily; the training script must set self._projector before learn()
-        self._projector = None
 
         # --- Projector config ---
         proj_cfgs = getattr(self._cfgs, 'projector_cfgs', None)
@@ -404,6 +430,27 @@ class TD3LagMulti(TD3):
 
         print(f"[TD3LagMulti] penalty_w={self._penalty_w}, tau={self._tau}")
 
+    def attach_projector(self, projector: Any) -> None:
+        """Attach DiffProjector and allocate proj_state buffer field.
+
+        Must be called after __init__ (which calls _init) and before learn().
+        The projector must already be built (projector.build() called).
+        """
+        self._projector = projector
+        if projector is not None:
+            dim = projector.state_tensor_dim
+            if dim > 0 and 'proj_state' not in self._buf.data:
+                self._buf.data['proj_state'] = torch.zeros(
+                    (
+                        self._cfgs.algo_cfgs.size,
+                        self._cfgs.train_cfgs.vector_env_nums,
+                        dim,
+                    ),
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+                print(f"[TD3LagMulti] Allocated proj_state buffer: dim={dim}")
+
     def _get_lambda(self, idx: int) -> float:
         """Get lambda value from PIDLagrange."""
         lam = self._per_lagranges[idx].lagrangian_multiplier
@@ -455,13 +502,20 @@ class TD3LagMulti(TD3):
         The reward critic receives the projected action (gradients flow through
         the projector back to the actor). The cost and penalty critics receive
         the raw action (gradients bypass the projector) to avoid action aliasing.
+
+        Uses self._current_proj_state (set by _update) for per-sample state
+        when projecting replay buffer samples.
         """
         # 1. Raw action from actor
         u = self._actor_critic.actor.predict(obs, deterministic=True)
 
         # 2. Project through DiffProjector (differentiable)
+        # Use stored per-sample state from replay buffer if available
+        proj_state = getattr(self, '_current_proj_state', None)
         if self._projector is not None:
-            u_phi, proj_info = self._projector.project(obs, u)
+            u_phi, proj_info = self._projector.project(
+                obs, u, state_tensors=proj_state,
+            )
         else:
             # Fallback: no projection (for testing without projector)
             u_phi = u
@@ -514,11 +568,17 @@ class TD3LagMulti(TD3):
         reward: torch.Tensor,
         done: torch.Tensor,
         next_obs: torch.Tensor,
+        proj_state: Optional[torch.Tensor] = None,
     ) -> None:
         """Update twin reward critics using TD3-style target noise smoothing.
 
         Uses the SAFE action for both current Q-value and target computation.
         Target action is the projected target actor output with clipped noise.
+
+        Args:
+            proj_state: Per-sample projector state from replay buffer. Used as
+                        approximate state for next-step target projection (state
+                        changes slowly between consecutive steps).
         """
         with torch.no_grad():
             # Target action from target actor
@@ -534,9 +594,10 @@ class TD3LagMulti(TD3):
             next_action_noisy = (next_action_raw + noise).clamp(-1.0, 1.0)
 
             # Project target action through DiffProjector
+            # Use stored per-sample state (approximate for next step)
             if self._projector is not None:
                 next_action_safe, _ = self._projector.project(
-                    next_obs, next_action_noisy
+                    next_obs, next_action_noisy, state_tensors=proj_state,
                 )
             else:
                 next_action_safe = next_action_noisy
@@ -711,9 +772,15 @@ class TD3LagMulti(TD3):
             done = data['done']
             next_obs = data['next_obs']
             penalty_h = data['penalty_h']
+            proj_state = data.get('proj_state', None)  # per-sample projector state
+
+            # Store proj_state for _loss_pi to access during actor update
+            self._current_proj_state = proj_state
 
             # 1. Reward critics: trained on (obs, act_safe, reward)
-            self._update_reward_critic(obs, act_safe, reward, done, next_obs)
+            self._update_reward_critic(
+                obs, act_safe, reward, done, next_obs, proj_state=proj_state,
+            )
 
             # 2. Standard cost critic (OmniSafe compatibility, uses aggregate cost)
             if self._cfgs.algo_cfgs.use_cost:

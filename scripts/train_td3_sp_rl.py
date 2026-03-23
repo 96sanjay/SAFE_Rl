@@ -128,28 +128,35 @@ def main(cfg_path: str) -> None:
     # 5. Direct instantiation (bypasses omnisafe.Agent)
     agent = TD3LagMulti(env_id=env_id, cfgs=cfgs)
 
-    # 6. Build DiffProjector (if available)
-    try:
-        from citylearn_safe.diff_projector import DiffProjector
+    # 5.5 Assert no double safety: SP-RL handles C2/C3/C4 via DiffProjector,
+    # so env-side projection/masking must be disabled to avoid conflicts.
+    for var_name, label in [
+        ("CITYLEARN_SERL_PROJECTION", "SE-RL projection"),
+        ("CITYLEARN_ACTION_MASK", "action mask"),
+        ("CITYLEARN_BETA_ACTOR", "beta actor"),
+    ]:
+        if os.environ.get(var_name, "0") == "1":
+            raise RuntimeError(
+                f"SP-RL cannot run with env-side projection/masking enabled. "
+                f"{var_name}=1 ({label}) conflicts with DiffProjector. "
+                f"Unset {var_name} or set it to '0'."
+            )
 
-        # Pass the adapter (which wraps the CMDP/CityLearn env chain);
-        # DiffProjector._unwrap_to_citylearn walks ._env/.env/.unwrapped to
-        # find the CityLearn env with .buildings and .time_step.
-        projector = DiffProjector(
-            env=agent._env,
-            solver_eps=solver_eps,
-            solver_max_iters=solver_max_iters,
-        )
-        projector.build()
-        agent._projector = projector
-        print(f"[train_td3_sp_rl] DiffProjector built successfully")
-        print(f"[train_td3_sp_rl] Solver: eps={solver_eps}, max_iters={solver_max_iters}")
-    except ImportError:
-        print("[train_td3_sp_rl] WARNING: DiffProjector not available. "
-              "Running without safety projection (no C2/C3/C4 hard constraints).")
-    except Exception as e:
-        print(f"[train_td3_sp_rl] WARNING: DiffProjector build failed: {e}")
-        print("[train_td3_sp_rl] Running without safety projection.")
+    # 6. Build DiffProjector (mandatory for SP-RL)
+    from citylearn_safe.diff_projector import DiffProjector
+
+    # Pass the adapter (which wraps the CMDP/CityLearn env chain);
+    # DiffProjector._unwrap_to_citylearn walks ._env/.env/.unwrapped to
+    # find the CityLearn env with .buildings and .time_step.
+    projector = DiffProjector(
+        env=agent._env,
+        solver_eps=solver_eps,
+        solver_max_iters=solver_max_iters,
+    )
+    projector.build()
+    agent.attach_projector(projector)
+    print(f"[train_td3_sp_rl] DiffProjector built and attached successfully")
+    print(f"[train_td3_sp_rl] Solver: eps={solver_eps}, max_iters={solver_max_iters}")
 
     # 7. Train
     ep_ret, ep_cost, ep_len = agent.learn()

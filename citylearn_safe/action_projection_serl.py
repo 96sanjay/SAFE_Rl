@@ -310,6 +310,31 @@ class ActionProjectionSERL(gym.Wrapper):
                 socs.append(0.5)
         return socs
 
+    def _is_ev_connected(self, b_idx: int) -> bool:
+        """Check if EV charger at building b_idx has a connected vehicle."""
+        if self._city is None or b_idx not in self._building_ev_act:
+            return False
+        try:
+            b = self._city.buildings[b_idx]
+            chargers = getattr(b, 'electric_vehicle_chargers',
+                       getattr(b, 'chargers', []))
+            if not chargers:
+                return False
+            ch = chargers[0]
+            sim = getattr(ch, 'charger_simulation',
+                  getattr(ch, '_Charger__charger_simulation', None))
+            if sim is None:
+                return True  # assume connected if can't check
+            state_arr = getattr(sim, '_electric_vehicle_charger_state', None)
+            if state_arr is None:
+                return True
+            t = int(getattr(self._city, 'time_step', 0))
+            if t < len(state_arr):
+                return float(state_arr[t]) == 1.0
+            return False
+        except Exception:
+            return True  # assume connected on error (conservative)
+
     def _compute_safe_bounds(
         self,
         exo_nec: list[float],
@@ -350,39 +375,49 @@ class ActionProjectionSERL(gym.Wrapper):
                 ev_min_dis = self._ev_min_discharge[b_idx]
                 ev_act_idx = self._building_ev_act[b_idx]
 
-                # Proportional split based on max device powers
-                total_power = p_batt + ev_max_ch if ev_max_ch > 0 else p_batt + 1.0
-                batt_frac = p_batt / total_power
-                ev_frac = 1.0 - batt_frac
+                # Check if EV is actually connected at this timestep
+                ev_connected = self._is_ev_connected(b_idx)
 
-                # Battery bounds
-                batt_import = import_headroom * batt_frac
-                batt_export = export_headroom * batt_frac
-                b_smin = max(-1.0, -batt_export / p_batt)
-                b_smax = min(1.0, batt_import / p_batt)
-
-                # EV bounds with min power enforcement
-                ev_import = import_headroom * ev_frac
-                ev_export = export_headroom * ev_frac
-
-                if ev_import >= ev_min_ch and ev_min_ch > 0:
-                    ev_smax = min(1.0, ev_import / ev_max_ch) if ev_max_ch > 0 else 0.0
-                elif ev_min_ch == 0 and ev_max_ch > 0:
-                    ev_smax = min(1.0, ev_import / ev_max_ch)
+                if not ev_connected:
+                    # EV disconnected: battery gets ALL headroom, EV bounds = [0, 0]
+                    b_smin = max(-1.0, -export_headroom / p_batt)
+                    b_smax = min(1.0, import_headroom / p_batt)
+                    safe_min[ev_act_idx] = 0.0
+                    safe_max[ev_act_idx] = 0.0
                 else:
-                    ev_smax = 0.0
+                    # EV connected: proportional split by nominal power
+                    total_power = p_batt + ev_max_ch if ev_max_ch > 0 else p_batt + 1.0
+                    batt_frac = p_batt / total_power
+                    ev_frac = 1.0 - batt_frac
 
-                if ev_export >= ev_min_dis and ev_min_dis > 0:
-                    ev_smin = max(-1.0, -ev_export / ev_max_dis) if ev_max_dis > 0 else 0.0
-                elif ev_min_dis == 0 and ev_max_dis > 0:
-                    ev_smin = max(-1.0, -ev_export / ev_max_dis)
-                else:
-                    ev_smin = 0.0
+                    # Battery bounds
+                    batt_import = import_headroom * batt_frac
+                    batt_export = export_headroom * batt_frac
+                    b_smin = max(-1.0, -batt_export / p_batt)
+                    b_smax = min(1.0, batt_import / p_batt)
 
-                if ev_smax < ev_smin:
-                    interventions += 1
-                safe_min[ev_act_idx] = ev_smin
-                safe_max[ev_act_idx] = ev_smax
+                    # EV bounds with min power enforcement (only when connected)
+                    ev_import = import_headroom * ev_frac
+                    ev_export = export_headroom * ev_frac
+
+                    if ev_import >= ev_min_ch and ev_min_ch > 0:
+                        ev_smax = min(1.0, ev_import / ev_max_ch) if ev_max_ch > 0 else 0.0
+                    elif ev_min_ch == 0 and ev_max_ch > 0:
+                        ev_smax = min(1.0, ev_import / ev_max_ch)
+                    else:
+                        ev_smax = 0.0
+
+                    if ev_export >= ev_min_dis and ev_min_dis > 0:
+                        ev_smin = max(-1.0, -ev_export / ev_max_dis) if ev_max_dis > 0 else 0.0
+                    elif ev_min_dis == 0 and ev_max_dis > 0:
+                        ev_smin = max(-1.0, -ev_export / ev_max_dis)
+                    else:
+                        ev_smin = 0.0
+
+                    if ev_smax < ev_smin:
+                        interventions += 1
+                    safe_min[ev_act_idx] = ev_smin
+                    safe_max[ev_act_idx] = ev_smax
             else:
                 # Battery-only: all headroom goes to battery
                 b_smin = max(-1.0, -export_headroom / p_batt)
@@ -394,24 +429,28 @@ class ActionProjectionSERL(gym.Wrapper):
             safe_max[batt_act_idx] = b_smax
 
             # C2: SoC bounds
+            # CityLearn formula: charge → SoC += energy × rte / cap
+            #                    discharge → SoC += energy / rte / cap
+            # where rte = round_trip_efficiency (0.9487 = sqrt(0.9) for this schema)
             soc = socs[b_idx] if b_idx < len(socs) else 0.5
-            eta = 0.95
-            soc_per_unit_action = (p_batt * eta) / 6.4
-
             try:
                 es = self._city.buildings[b_idx].electrical_storage
                 cap = float(getattr(es, 'capacity', 6.4) or 6.4)
-                if cap > 0:
-                    soc_per_unit_action = (p_batt * eta) / cap
+                rte = float(getattr(es, 'round_trip_efficiency', 0.9487))
             except Exception:
-                pass
+                cap = 6.4
+                rte = 0.9487
+
+            # SoC change per unit action differs for charge vs discharge
+            soc_per_unit_charge = (p_batt * rte) / max(cap, 1e-6)     # charging
+            soc_per_unit_discharge = (p_batt / rte) / max(cap, 1e-6)  # discharging
 
             remaining_charge = max(0.0, self._soc_high - soc)
-            max_charge_action = remaining_charge / max(soc_per_unit_action, 1e-9)
+            max_charge_action = remaining_charge / max(soc_per_unit_charge, 1e-9)
             safe_max[batt_act_idx] = min(safe_max[batt_act_idx], max_charge_action)
 
             remaining_discharge = max(0.0, soc - self._soc_low)
-            max_discharge_action = remaining_discharge / max(soc_per_unit_action, 1e-9)
+            max_discharge_action = remaining_discharge / max(soc_per_unit_discharge, 1e-9)
             safe_min[batt_act_idx] = max(safe_min[batt_act_idx], -max_discharge_action)
 
         # Passthrough indices keep [-1, 1]

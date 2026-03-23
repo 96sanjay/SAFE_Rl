@@ -343,17 +343,25 @@ class ActionProjectionSERL(gym.Wrapper):
         self,
         exo_nec: list[float],
         socs: list[float],
-    ) -> Tuple[np.ndarray, np.ndarray, int]:
-        """Compute per-action [safe_min, safe_max] bounds.
+    ) -> Tuple[np.ndarray, np.ndarray, int, int]:
+        """Compute per-action [safe_min, safe_max] bounds for C2/C3/C4.
+
+        Handles four building topologies:
+        - Battery + EV (connected): proportional headroom split
+        - Battery + EV (disconnected): battery gets all headroom, EV = [0, 0]
+        - Battery only: battery gets all headroom
+        - EV only: EV gets all headroom (no battery bounds computed)
 
         For EV chargers, respects min_charging_power / min_discharging_power:
-        - If remaining headroom < min_charging_power, EV action is forced to 0
-          (since any positive action would trigger at least min_charge kW).
-        - Otherwise, EV safe range allows actions that map to [min_charge, headroom].
+        - If remaining headroom < min_charging_power, EV action is forced to 0.
+        - Otherwise, EV safe range allows actions up to headroom.
 
         Returns:
-            safe_min, safe_max: arrays of shape (n_actions,)
-            interventions: count of collapsed ranges
+            safe_min: array of shape (n_actions,), per-action lower bounds
+            safe_max: array of shape (n_actions,), per-action upper bounds
+            interventions: count of collapsed/inverted ranges
+            n_infeasible: count of dimensions where C3/C4 bounds conflict
+                          (exogenous load exceeds limits — structurally unsolvable)
         """
         safe_min = np.full(self._n_actions, -1.0, dtype=np.float32)
         safe_max = np.full(self._n_actions, 1.0, dtype=np.float32)
@@ -378,7 +386,10 @@ class ActionProjectionSERL(gym.Wrapper):
             batt_act_idx = self._building_batt_act.get(b_idx, None)
             p_batt = self._batt_powers.get(b_idx, 0.0)
 
+            # ── Compute per-device bounds based on topology ──
             has_ev = b_idx in self._ev_max_charge
+            b_smin, b_smax = -1.0, 1.0  # defaults (overwritten below if has_batt)
+
             if has_ev:
                 ev_max_ch = self._ev_max_charge[b_idx]
                 ev_min_ch = self._ev_min_charge[b_idx]
@@ -386,31 +397,34 @@ class ActionProjectionSERL(gym.Wrapper):
                 ev_min_dis = self._ev_min_discharge[b_idx]
                 ev_act_idx = self._building_ev_act[b_idx]
 
-                # Check if EV is actually connected at this timestep
                 ev_connected = self._is_ev_connected(b_idx)
 
                 if not ev_connected:
-                    # EV disconnected: battery gets ALL headroom, EV bounds = [0, 0]
-                    b_smin = max(-1.0, -export_headroom / p_batt)
-                    b_smax = min(1.0, import_headroom / p_batt)
+                    # EV disconnected → EV idle, battery gets all headroom
                     safe_min[ev_act_idx] = 0.0
                     safe_max[ev_act_idx] = 0.0
+                    if has_batt and p_batt > 0:
+                        b_smin = max(-1.0, -export_headroom / p_batt)
+                        b_smax = min(1.0, import_headroom / p_batt)
                 else:
-                    # EV connected: proportional split by nominal power
-                    total_power = p_batt + ev_max_ch if ev_max_ch > 0 else p_batt + 1.0
-                    batt_frac = p_batt / total_power
-                    ev_frac = 1.0 - batt_frac
+                    # EV connected → split headroom between battery and EV
+                    if has_batt and p_batt > 0:
+                        # Proportional split
+                        total_power = p_batt + ev_max_ch if ev_max_ch > 0 else p_batt + 1.0
+                        batt_frac = p_batt / total_power
+                        ev_frac = 1.0 - batt_frac
+                        batt_import = import_headroom * batt_frac
+                        batt_export = export_headroom * batt_frac
+                        b_smin = max(-1.0, -batt_export / p_batt)
+                        b_smax = min(1.0, batt_import / p_batt)
+                        ev_import = import_headroom * ev_frac
+                        ev_export = export_headroom * ev_frac
+                    else:
+                        # EV-only building: EV gets all headroom
+                        ev_import = import_headroom
+                        ev_export = export_headroom
 
-                    # Battery bounds
-                    batt_import = import_headroom * batt_frac
-                    batt_export = export_headroom * batt_frac
-                    b_smin = max(-1.0, -batt_export / p_batt)
-                    b_smax = min(1.0, batt_import / p_batt)
-
-                    # EV bounds with min power enforcement (only when connected)
-                    ev_import = import_headroom * ev_frac
-                    ev_export = export_headroom * ev_frac
-
+                    # EV bounds with min power enforcement
                     if ev_import >= ev_min_ch and ev_min_ch > 0:
                         ev_smax = min(1.0, ev_import / ev_max_ch) if ev_max_ch > 0 else 0.0
                     elif ev_min_ch == 0 and ev_max_ch > 0:
@@ -429,13 +443,14 @@ class ActionProjectionSERL(gym.Wrapper):
                         interventions += 1
                     safe_min[ev_act_idx] = ev_smin
                     safe_max[ev_act_idx] = ev_smax
-            elif has_batt:
+
+            elif has_batt and p_batt > 0:
                 # Battery-only (no EV): all headroom goes to battery
                 b_smin = max(-1.0, -export_headroom / p_batt)
                 b_smax = min(1.0, import_headroom / p_batt)
 
-            # Apply battery bounds and C2 SoC (only if building has battery)
-            if has_batt and batt_act_idx is not None:
+            # ── Apply battery bounds + C2 SoC (only if building has battery) ──
+            if has_batt and batt_act_idx is not None and p_batt > 0:
                 if b_smax < b_smin:
                     interventions += 1
                 safe_min[batt_act_idx] = b_smin

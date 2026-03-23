@@ -262,10 +262,8 @@ class TD3LagMulti(TD3):
             // self._cfgs.train_cfgs.vector_env_nums
         )
         self._update_cycle: int = self._cfgs.algo_cfgs.update_cycle
-        assert (
-            self._steps_per_epoch % self._update_cycle == 0
-        ), 'steps_per_epoch must be divisible by update_cycle.'
-        self._samples_per_epoch: int = self._steps_per_epoch // self._update_cycle
+        # Allow non-divisible: last partial cycle just has fewer updates
+        self._samples_per_epoch: int = self._steps_per_epoch // max(1, self._update_cycle)
         self._update_count: int = 0
 
     def _init_model(self) -> None:

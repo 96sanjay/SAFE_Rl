@@ -106,23 +106,19 @@ class CityLearnSafetyEnvV3(gym.Env):
         self._prev_net_consumption = None  # For ramping penalty in STEMS reward
 
         # --- STEMS Reward Hyperparameters (economic + stability + renewable) ---
-        # Economic component weight
-        self.mu_economic = 1.0
-        
-        # Stability component weights
-        self.alpha_grid = 0.5      # Grid-level coordination weight
-        self.alpha_build = 0.3     # Building-level smoothness weight
-        self.beta_ramp = 0.2       # Power ramping penalty weight
-        
-        # Renewable component weight
-        self.xi_renewable = 0.6    # Solar utilization weight
+        # All configurable via env vars for tuning (defaults match original STEMS paper)
+        self.mu_economic = float(os.environ.get("CITYLEARN_STEMS_MU_ECONOMIC", "1.0"))
+        self.alpha_grid = float(os.environ.get("CITYLEARN_STEMS_ALPHA_GRID", "0.5"))
+        self.alpha_build = float(os.environ.get("CITYLEARN_STEMS_ALPHA_BUILD", "0.3"))
+        self.beta_ramp = float(os.environ.get("CITYLEARN_STEMS_BETA_RAMP", "0.2"))
+        self.xi_renewable = float(os.environ.get("CITYLEARN_STEMS_XI_RENEWABLE", "0.6"))
         
         # Comfort component weight (STEMS Equation 8)
         self.lambda_indoor = float(os.environ.get("CITYLEARN_STEMS_LAMBDA_INDOOR", "0.4"))
         
         # Building/grid limits (for normalization in stability reward)
-        self.P_building_max = 50.0  # kW per building (approximate)
-        self.P_grid_max = 500.0     # kW for entire district (17 buildings)
+        # Auto-calibrate from building data if env vars not explicitly set
+        self.P_building_max, self.P_grid_max = self._calibrate_power_limits()
         
         # Reward type: "bill" (old) or "stems" (new)
         self.reward_type = os.environ.get("CITYLEARN_REWARD_TYPE", "bill").strip().lower()
@@ -359,6 +355,61 @@ class CityLearnSafetyEnvV3(gym.Env):
                 break
 
         return None
+
+    def _calibrate_power_limits(self) -> tuple:
+        """Auto-calibrate P_building_max and P_grid_max from building data.
+
+        If env vars are explicitly set, uses those. Otherwise computes P95 of
+        per-building and total-grid non-shiftable load from the actual schema,
+        adapting automatically to any number of buildings.
+        """
+        # If explicitly set via env vars, use those
+        env_bld = os.environ.get("CITYLEARN_STEMS_P_BUILDING_MAX")
+        env_grid = os.environ.get("CITYLEARN_STEMS_P_GRID_MAX")
+        if env_bld is not None and env_grid is not None:
+            return float(env_bld), float(env_grid)
+
+        # Try to auto-calibrate from building data
+        try:
+            city = self._get_citylearn_env()
+            if city is None or not hasattr(city, 'buildings') or len(city.buildings) == 0:
+                raise ValueError("No buildings found")
+
+            building_p95s = []
+            total_load = None
+            for b in city.buildings:
+                nec = getattr(b, 'energy_simulation', None)
+                if nec is None:
+                    continue
+                load = getattr(nec, 'non_shiftable_load', None)
+                if load is None:
+                    continue
+                arr = np.array(load, dtype=np.float64)
+                building_p95s.append(float(np.percentile(np.abs(arr), 95)))
+                total_load = arr.copy() if total_load is None else total_load + arr
+
+            if not building_p95s or total_load is None:
+                raise ValueError("Could not read building load data")
+
+            p_bld = float(np.mean(building_p95s))
+            p_grid = float(np.percentile(np.abs(total_load), 95))
+
+            # Use env var if only one is set, auto for the other
+            if env_bld is not None:
+                p_bld = float(env_bld)
+            if env_grid is not None:
+                p_grid = float(env_grid)
+
+            n = len(city.buildings)
+            print(f"[SafeEnv] Auto-calibrated power limits ({n} buildings): "
+                  f"P_building_max={p_bld:.3f}, P_grid_max={p_grid:.3f}")
+            return p_bld, p_grid
+
+        except Exception:
+            # Fallback: use env vars with sensible defaults
+            p_bld = float(env_bld) if env_bld is not None else 4.6083
+            p_grid = float(env_grid) if env_grid is not None else 10.2352
+            return p_bld, p_grid
 
     # -------------------------------------------------------------------------
     # Store actions under the extractor's tau index
@@ -790,6 +841,7 @@ class CityLearnSafetyEnvV3(gym.Env):
             building_powers = []  # Track raw powers for debug logging
             idx_bp = self._state_time_index(citylearn_env)
             c3_controllable = os.environ.get("CITYLEARN_C3_CONTROLLABLE", "0") == "1"
+            c3_exogenous_only = os.environ.get("CITYLEARN_C3_EXOGENOUS_ONLY", "0") == "1"
             c3_structural_removed = 0.0  # cost removed by controllability filter
 
             for b in citylearn_env.buildings:
@@ -804,7 +856,33 @@ class CityLearnSafetyEnvV3(gym.Env):
 
                 building_powers.append(p_i)
 
-                if c3_controllable:
+                if c3_exogenous_only:
+                    # R29: C3 based on exogenous load ONLY (NSL + solar).
+                    # Makes C3 cost completely independent of battery/EV actions.
+                    # Lagrangian can't penalize charging → battery cycling emerges from reward.
+                    exo_i = 0.0
+                    try:
+                        nsl_arr = np.asarray(
+                            getattr(b, "_Building__energy_to_non_shiftable_load", []),
+                            dtype=float,
+                        )
+                        sg_arr = np.asarray(
+                            getattr(b, "_Building__solar_generation", []),
+                            dtype=float,
+                        )
+                        if len(nsl_arr) > idx_bp:
+                            exo_i = float(nsl_arr[idx_bp])
+                        if len(sg_arr) > idx_bp:
+                            exo_i += float(sg_arr[idx_bp])  # exogenous = NSL + solar
+                    except Exception:
+                        exo_i = 0.0  # fallback: no violation (agent not penalized)
+
+                    v_i = max(0.0, abs(exo_i) - p_building_max)
+
+                    # Track how much cost changed vs original NEC-based
+                    v_old = max(0.0, abs(p_i) - p_building_max)
+                    c3_structural_removed += abs(v_old - v_i)
+                elif c3_controllable:
                     # Agent-controllable C3: only penalize agent's contribution
                     nsl_i = 0.0
                     try:
@@ -852,6 +930,7 @@ class CityLearnSafetyEnvV3(gym.Env):
         info["building_power_violation"] = float(b_any_violation)
         # --- Agent-controllable C3 debug info ---
         info["c3_controllable_enabled"] = 1.0 if os.environ.get("CITYLEARN_C3_CONTROLLABLE", "0") == "1" else 0.0
+        info["c3_exogenous_only"] = 1.0 if os.environ.get("CITYLEARN_C3_EXOGENOUS_ONLY", "0") == "1" else 0.0
         info["c3_structural_cost_removed"] = float(c3_structural_removed) if "c3_structural_removed" in locals() else 0.0
         # --- Debug: log building power summary stats used for violations ---
         try:
@@ -1141,8 +1220,14 @@ class CityLearnSafetyEnvV3(gym.Env):
         info["comfort_tset"] = float(tset_out)
 
         # --- Dense EV signal (per-step penalty for not charging when needed) ---
-        ev_dense_scale = float(os.environ.get("CITYLEARN_EV_DENSE_COST_SCALE", "0.0"))
-        ev_dense_cost = ev_dense_scale * v3_missed_charge_soc  # v3_missed_charge_soc is non-zero ~36% of steps
+        # Sauté MDP path (returns None when CITYLEARN_EV_SAUTE != "1")
+        saute_cost = self._compute_saute_ev_cost(action_flat)
+        if saute_cost is not None:
+            ev_dense_cost = saute_cost
+        else:
+            # Legacy path: simple scale * missed_charge (backward compat for R11b etc.)
+            ev_dense_scale = float(os.environ.get("CITYLEARN_EV_DENSE_COST_SCALE", "0.0"))
+            ev_dense_cost = ev_dense_scale * v3_missed_charge_soc
         info["cost_ev_dense"] = float(ev_dense_cost)
         
         total_cost = float(w_ev * ev_cost_for_cmdp + ev_dense_cost + info.get("cost_comfort", 0.0) + w_soc * c_soc + w_bld * c_bld + w_grid * c_grid)
@@ -1376,6 +1461,120 @@ class CityLearnSafetyEnvV3(gym.Env):
     # -------------------------------------------------------------------------
     # Basic KPI helpers (district-level)
     # -------------------------------------------------------------------------
+
+    # === SAUTE EV COST (C1 dense) ===
+    def _compute_saute_ev_cost(self, action_flat: np.ndarray):
+        """
+        Per-step EV charging shortfall cost for Sauté MDP (C1 dense).
+
+        For each connected EV with a SoC deficit:
+          shortfall = max(0, min_required_action - actual_action)
+          where min_required_action = min(1, deficit / (dep_hours * max_soc_per_step))
+
+        Returns bounded per-step cost (0 to ~2 per charger).
+        The SauteEVBudgetWrapper handles budget tracking, obs augmentation,
+        and penalty switching per the Sauté MDP paper (Sootla et al., ICML 2022).
+
+        Gated by CITYLEARN_EV_SAUTE env var (default "0" = off).
+        When off, returns None so caller falls back to legacy path.
+        """
+        if os.environ.get("CITYLEARN_EV_SAUTE", "0") != "1":
+            return None  # signal caller to use old path
+
+        citylearn_env = self._get_citylearn_env()
+        if citylearn_env is None:
+            return 0.0
+
+        t_now = int(getattr(citylearn_env, "time_step", 0))
+        t_idx = max(0, t_now - 1)
+
+        total_cost = 0.0
+        ev_action_idx = 0
+
+        for b in getattr(citylearn_env, "buildings", []):
+            for ch in (getattr(b, "electric_vehicle_chargers", None) or []):
+                try:
+                    if ev_action_idx >= len(self._ev_charger_action_indices):
+                        import warnings
+                        warnings.warn(
+                            f"[SauteEV] ev_action_idx {ev_action_idx} >= "
+                            f"len(_ev_charger_action_indices) "
+                            f"{len(self._ev_charger_action_indices)}. "
+                            f"Some chargers skipped.",
+                            stacklevel=2,
+                        )
+                        return total_cost
+                    act_idx = self._ev_charger_action_indices[ev_action_idx]
+                    ev_action_idx += 1
+
+                    sim = getattr(ch, "charger_simulation",
+                                  getattr(ch, "_Charger__charger_simulation", None))
+                    if sim is None:
+                        continue
+
+                    state_arr = np.asarray(
+                        getattr(sim, "_electric_vehicle_charger_state"), dtype=float)
+                    if t_now >= len(state_arr) or float(state_arr[t_now]) != 1.0:
+                        continue  # no EV connected
+
+                    dep_arr = np.asarray(
+                        getattr(sim, "_electric_vehicle_departure_time"), dtype=float)
+                    req_arr = np.asarray(
+                        getattr(sim, "_electric_vehicle_required_soc_departure"), dtype=float)
+
+                    dep_hours = float(dep_arr[t_now])
+                    req_soc = float(req_arr[t_now])
+                    if not np.isfinite(dep_hours) or dep_hours <= 0:
+                        continue
+                    if not np.isfinite(req_soc):
+                        req_soc = 1.0
+                    req_soc = np.clip(req_soc, 0.0, 1.0)
+
+                    ev_obj = getattr(ch, "connected_electric_vehicle", None)
+                    if ev_obj is None:
+                        continue
+                    batt = getattr(ev_obj, "battery", None)
+                    if batt is None:
+                        continue
+
+                    ev_cap = float(getattr(batt, "capacity", 0) or 0)
+                    if ev_cap <= 0:
+                        continue
+
+                    soc_data = getattr(batt, "soc", None)
+                    if soc_data is None:
+                        continue
+                    soc_np = np.asarray(soc_data, dtype=float)
+                    ev_soc_now = float(np.clip(soc_np[t_idx], 0, 1)) if t_idx < len(soc_np) else 0.0
+
+                    deficit = max(0.0, req_soc - ev_soc_now)
+                    if deficit <= 1e-6:
+                        continue
+
+                    max_p = getattr(ch, "max_charging_power",
+                                    getattr(ch, "_Charger__max_charging_power", 0))
+                    if isinstance(max_p, np.ndarray):
+                        max_p = float(max_p.ravel()[0])
+                    else:
+                        max_p = float(max_p or 0)
+                    if max_p <= 0:
+                        continue
+
+                    max_soc_per_step = (max_p * 0.95) / ev_cap
+
+                    # Minimum charge rate needed to meet deadline
+                    min_required = min(1.0, deficit / (max(1.0, dep_hours) * max(max_soc_per_step, 1e-9)))
+
+                    # Agent's actual action
+                    actual = float(action_flat[act_idx]) if 0 <= act_idx < len(action_flat) else 0.0
+
+                    # Shortfall: bounded [0, 2] (2 = need max charge but doing max V2G)
+                    total_cost += max(0.0, min_required - actual)
+
+                except Exception:
+                    continue
+
+        return total_cost
 
     # === EV_REWARD_SHAPING_PATCH ===
     def _compute_ev_reward_shaping(self) -> float:

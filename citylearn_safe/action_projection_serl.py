@@ -1,17 +1,18 @@
 """
-Paper-exact SE-RL with closest-point projection and penalty.
+Paper-exact SE-RL with closest-point QP projection and penalty.
 
 Implements Markgraf et al. 2025 "Safe RL using Action Projection"
 Sections 5.1 (SE-RL) and 7.1 (penalty augmentation).
 
-Eq. 12: Phi(x, u) = clip(u, safe_min(x), safe_max(x))
+Eq. 12: Phi(x, u) = argmin_{ũ} ½||ũ - u||²  s.t. s(x, ũ) ≤ 0
+         Solved via cvxpy QP (non-differentiable, in environment).
 Eq. 23: r_aug = r - h
 Eq. 24: h = w * ||u - Phi(x,u)||^2  (zero when u is in the safe set)
 
 Constraints enforced:
     C2: Battery SoC in [soc_low, soc_high]
     C3: Per-building |NEC| <= P_building_max
-    C4: Grid import <= P_grid_max (battery-only, EV exempt for C1)
+    C4: Grid import <= P_grid_max (joint urgency-weighted allocation)
 
 C0/C1 (EV departure) handled by Lagrangian externally.
 
@@ -32,6 +33,12 @@ from typing import Tuple
 
 import gymnasium as gym
 import numpy as np
+
+try:
+    import cvxpy as cp
+    _HAS_CVXPY = True
+except ImportError:
+    _HAS_CVXPY = False
 
 
 def _unwrap_citylearn(env):
@@ -65,7 +72,7 @@ class ActionProjectionSERL(gym.Wrapper):
     Constraints enforced:
       C2: Battery SoC in [soc_low, soc_high]
       C3: Per-building |NEC| <= P_building_max
-      C4: Grid import <= P_grid_max (battery-only, EV exempt for C1)
+      C4: Grid import <= P_grid_max (joint urgency-weighted allocation)
 
     C0/C1 (EV departure) handled by Lagrangian externally.
     """
@@ -90,6 +97,11 @@ class ActionProjectionSERL(gym.Wrapper):
 
         # C4 grid mask toggle (cached, not per-step)
         self._c4_enabled = os.environ.get("MASK_C4_ENABLED", "0") == "1"
+
+        # Urgency-aware joint allocation config
+        self._urgency_alpha = float(os.environ.get("SERL_URGENCY_ALPHA", "5.0"))
+        self._infeasibility_policy = os.environ.get("SERL_INFEASIBILITY_POLICY", "safety")
+        self._mobility_overrides = 0  # cumulative count per episode
 
         # Beta actor incompatibility guard: SE-RL projection clips in [-1,1]
         # action space. Beta actor outputs in (0,1). These are incompatible.
@@ -210,10 +222,13 @@ class ActionProjectionSERL(gym.Wrapper):
         print(f"[SE-RL Projection] EV min discharge: {self._ev_min_discharge}")
         print(f"[SE-RL Projection] SoC bounds: [{self._soc_low}, {self._soc_high}], "
               f"margin={self._soc_margin}")
+        print(f"[SE-RL Projection] Urgency alpha={self._urgency_alpha}, "
+              f"infeasibility_policy={self._infeasibility_policy}")
 
     def reset(self, **kwargs):
         self._step_count = 0
         self._total_clipped = 0
+        self._mobility_overrides = 0
         return self.env.reset(**kwargs)
 
     def step(self, action):
@@ -224,8 +239,9 @@ class ActionProjectionSERL(gym.Wrapper):
         socs = self._get_battery_socs()
         safe_min, safe_max, interventions, n_infeasible = self._compute_safe_bounds(exo_nec, socs)
 
-        # Eq. 12: Closest-point projection (NOT rescaling)
-        safe_action = np.clip(raw_action, safe_min, safe_max)
+        # Eq. 12: Closest-point QP projection
+        # Phi(x, u) = argmin_{ũ} ½||ũ - u||²  s.t. constraints
+        safe_action = self._qp_project(raw_action, safe_min, safe_max, exo_nec)
 
         # Eq. 24: Penalty (zero when inside bounds)
         delta = raw_action - safe_action
@@ -251,6 +267,11 @@ class ActionProjectionSERL(gym.Wrapper):
         info["serl_safe_max"] = safe_max.tolist()
         info["serl_raw_action"] = raw_action.tolist()
         info["serl_n_infeasible"] = float(n_infeasible)  # dims where C3/C4 bounds conflict
+        info["serl_structural_c4"] = float(getattr(self, '_last_structural_c4', 0))
+        info["serl_c0_c4_conflict"] = float(getattr(self, '_last_c0_c4_conflict', 0))
+        info["serl_c0_c3_conflict"] = float(getattr(self, '_last_c0_c3_conflict', 0))
+        info["serl_c4_relaxation_kw"] = float(getattr(self, '_last_c4_relaxation_kw', 0))
+        info["serl_mobility_overrides"] = float(self._mobility_overrides)
 
         # Store bounds on CityLearn env for other wrappers to access
         if self._city is not None:
@@ -350,6 +371,175 @@ class ActionProjectionSERL(gym.Wrapper):
         except Exception:
             return True  # assume connected on error (conservative)
 
+    def _ev_has_deficit(self, b_idx: int) -> bool:
+        """Check if connected EV at building b_idx has SoC below required.
+
+        Uses _ev_state() to avoid duplicated access logic. Returns False if
+        EV state unavailable, t_dep <= 0 (departing/away), or no deficit.
+        """
+        state = self._ev_state(b_idx)
+        if state is None:
+            return False
+        soc_now, soc_req, t_dep, _, _ = state
+        if t_dep <= 0:
+            return False
+        return soc_now < soc_req - 0.01
+
+    def _ev_state(self, b_idx: int):
+        """Read EV state variables for building b_idx.
+
+        Returns (soc_now, soc_req, t_dep, cap_ev, eta_ch) or None if unavailable.
+        """
+        if not self._is_ev_connected(b_idx):
+            return None
+        try:
+            b = self._city.buildings[b_idx]
+            chargers = getattr(b, 'electric_vehicle_chargers',
+                       getattr(b, 'chargers', []))
+            if not chargers:
+                return None
+            ch = chargers[0]
+            ev = getattr(ch, 'connected_electric_vehicle', None)
+            if ev is None:
+                return None
+            bt = getattr(ev, 'battery', None)
+            if bt is None:
+                return None
+            t = int(getattr(self._city, 'time_step', 0))
+            soc_arr = getattr(bt, 'soc', None)
+            if soc_arr is None or not hasattr(soc_arr, '__len__') or max(0, t-1) >= len(soc_arr):
+                return None
+            soc_now = float(soc_arr[max(0, t - 1)])
+            cap_ev = float(getattr(bt, 'capacity', 60.0) or 60.0)
+            # Prefer charging_efficiency; fallback to sqrt(round_trip_efficiency)
+            eta_raw = getattr(bt, 'charging_efficiency', None)
+            if eta_raw is not None and float(eta_raw) > 0:
+                eta_ch = float(eta_raw)
+            else:
+                rte = float(getattr(bt, 'round_trip_efficiency', 0.9025) or 0.9025)
+                eta_ch = float(np.sqrt(max(rte, 0.01)))
+            sim = getattr(ch, 'charger_simulation',
+                  getattr(ch, '_Charger__charger_simulation', None))
+            if sim is None:
+                return None
+            req_arr = getattr(sim, '_electric_vehicle_required_soc_departure', None)
+            dep_arr = getattr(sim, '_electric_vehicle_departure_time', None)
+            if req_arr is None or dep_arr is None or t >= len(req_arr) or t >= len(dep_arr):
+                return None
+            soc_req = float(req_arr[t])
+            t_dep = float(dep_arr[t])
+            return soc_now, soc_req, t_dep, cap_ev, eta_ch
+        except Exception:
+            return None
+
+    def _ev_urgency(self, b_idx: int) -> float:
+        """Compute urgency ratio for EV at building b_idx.
+
+        Returns 0.0 if: EV not connected, no deficit, t_dep <= 0, or p_ev_max <= 0.
+        """
+        state = self._ev_state(b_idx)
+        if state is None:
+            return 0.0
+        soc_now, soc_req, t_dep, cap_ev, eta_ch = state
+        if t_dep <= 0 or soc_now >= soc_req - 0.01:
+            return 0.0
+        p_ev_max = self._ev_max_charge.get(b_idx, 0.0)
+        if p_ev_max <= 0:
+            return 0.0
+        energy_deficit = max(0.0, soc_req - soc_now) * cap_ev
+        input_deficit = energy_deficit / max(eta_ch, 0.01)
+        hours_needed = input_deficit / p_ev_max
+        return float(np.clip(hours_needed / t_dep, 0.0, 2.0))
+
+    def _ev_min_charge_kw(self, b_idx: int) -> float:
+        """Compute minimum charge rate (kW at charger input) to keep departure feasible.
+
+        Accounts for charging efficiency. Returns 0.0 if no deficit, t_dep <= 0,
+        or p_ev_max <= 0.
+        """
+        state = self._ev_state(b_idx)
+        if state is None:
+            return 0.0
+        soc_now, soc_req, t_dep, cap_ev, eta_ch = state
+        if t_dep <= 0 or soc_now >= soc_req - 0.01:
+            return 0.0
+        p_ev_max = self._ev_max_charge.get(b_idx, 0.0)
+        if p_ev_max <= 0:
+            return 0.0
+        energy_deficit = max(0.0, soc_req - soc_now) * cap_ev
+        input_deficit = energy_deficit / max(eta_ch, 0.01)
+        return min(input_deficit / t_dep, p_ev_max)
+
+    def _qp_project(
+        self,
+        raw_action: np.ndarray,
+        safe_min: np.ndarray,
+        safe_max: np.ndarray,
+        exo_nec: list,
+    ) -> np.ndarray:
+        """Eq. 12: Closest-point QP projection.
+
+        Solves:  min_{ũ} ½||ũ - u||²
+                 s.t. safe_min ≤ ũ ≤ safe_max          (C2, C3 per-dim)
+                      Σ_buildings(exo_b + Σ_devices(gain_b_d × ũ_d)) ≤ P_grid_max  (C4 coupled)
+
+        Falls back to np.clip if cvxpy is unavailable or QP fails.
+        """
+        # Fast path: if all actions are already inside bounds AND C4 not binding,
+        # no QP needed
+        clipped = np.clip(raw_action, safe_min, safe_max)
+        if not self._c4_enabled or not _HAS_CVXPY:
+            return clipped
+
+        # Check if C4 is binding with the clipped action
+        grid_total = sum(exo_nec)
+        for b_idx in self._building_batt_act:
+            act_idx = self._building_batt_act[b_idx]
+            grid_total += float(clipped[act_idx]) * self._batt_powers.get(b_idx, 0)
+        for b_idx in self._building_ev_act:
+            act_idx = self._building_ev_act[b_idx]
+            grid_total += float(clipped[act_idx]) * self._ev_max_charge.get(b_idx, 0)
+
+        if grid_total <= self._p_gmax:
+            # C4 not binding — np.clip is the correct projection
+            return clipped
+
+        # C4 is binding — solve QP
+        n = self._n_actions
+        z = cp.Variable(n)
+        objective = cp.Minimize(0.5 * cp.sum_squares(z - raw_action))
+
+        constraints = [
+            z >= safe_min,
+            z <= safe_max,
+        ]
+
+        # C4: grid aggregate constraint
+        # grid_import = Σ(exo_b + batt_gain_b × z_batt_b + ev_gain_b × z_ev_b) ≤ P_grid_max
+        grid_expr = float(sum(exo_nec))
+        for b_idx in self._building_batt_act:
+            act_idx = self._building_batt_act[b_idx]
+            grid_expr = grid_expr + self._batt_powers.get(b_idx, 0) * z[act_idx]
+        for b_idx in self._building_ev_act:
+            act_idx = self._building_ev_act[b_idx]
+            grid_expr = grid_expr + self._ev_max_charge.get(b_idx, 0) * z[act_idx]
+
+        constraints.append(grid_expr <= self._p_gmax)
+
+        prob = cp.Problem(objective, constraints)
+        try:
+            prob.solve(solver=cp.SCS, verbose=False, max_iters=5000, eps=1e-4)
+            if prob.status in ('optimal', 'optimal_inaccurate') and z.value is not None:
+                result = np.asarray(z.value, dtype=np.float32).flatten()
+                # Safety clamp (numerical precision)
+                result = np.clip(result, safe_min, safe_max)
+                return result
+        except Exception:
+            pass
+
+        # Fallback: np.clip (C4 not enforced but C2/C3 still are)
+        return clipped
+
     def _compute_safe_bounds(
         self,
         exo_nec: list[float],
@@ -389,9 +579,9 @@ class ActionProjectionSERL(gym.Wrapper):
 
             exo = exo_nec[b_idx]
 
-            # Total headroom for all controllable devices
-            import_headroom = self._p_bmax - exo
-            export_headroom = self._p_bmax + exo
+            # Total headroom for all controllable devices (clamped to 0)
+            import_headroom = max(0.0, self._p_bmax - exo)
+            export_headroom = max(0.0, self._p_bmax + exo)
 
             # Get battery info (may not exist for EV-only buildings)
             batt_act_idx = self._building_batt_act.get(b_idx, None)
@@ -399,7 +589,7 @@ class ActionProjectionSERL(gym.Wrapper):
 
             # ── Compute per-device bounds based on topology ──
             has_ev = b_idx in self._ev_max_charge
-            b_smin, b_smax = -1.0, 1.0  # defaults (overwritten below if has_batt)
+            b_smin, b_smax = -1.0, 1.0  # defaults
 
             if has_ev:
                 ev_max_ch = self._ev_max_charge[b_idx]
@@ -410,41 +600,80 @@ class ActionProjectionSERL(gym.Wrapper):
 
                 ev_connected = self._is_ev_connected(b_idx)
 
-                if not ev_connected:
-                    # EV disconnected → EV idle, battery gets all headroom
+                # Check departure time — departing EVs treated as disconnected
+                ev_state = self._ev_state(b_idx)
+                ev_departing = ev_connected and ev_state is not None and ev_state[2] <= 0
+
+                if not ev_connected or ev_departing:
+                    # EV disconnected or departing → EV idle, battery gets all headroom
                     safe_min[ev_act_idx] = 0.0
                     safe_max[ev_act_idx] = 0.0
                     if has_batt and p_batt > 0:
                         b_smin = max(-1.0, -export_headroom / p_batt)
                         b_smax = min(1.0, import_headroom / p_batt)
                 else:
-                    # EV connected → split headroom between battery and EV
-                    if has_batt and p_batt > 0:
-                        # Proportional split
-                        total_power = p_batt + ev_max_ch if ev_max_ch > 0 else p_batt + 1.0
-                        batt_frac = p_batt / total_power
-                        ev_frac = 1.0 - batt_frac
-                        batt_import = import_headroom * batt_frac
-                        batt_export = export_headroom * batt_frac
-                        b_smin = max(-1.0, -batt_export / p_batt)
-                        b_smax = min(1.0, batt_import / p_batt)
-                        ev_import = import_headroom * ev_frac
-                        ev_export = export_headroom * ev_frac
-                    else:
-                        # EV-only building: EV gets all headroom
-                        ev_import = import_headroom
-                        ev_export = export_headroom
+                    # EV connected — urgency-weighted C3 split
+                    urgency = self._ev_urgency(b_idx)
+                    has_deficit = self._ev_has_deficit(b_idx)
+                    alpha = self._urgency_alpha
 
-                    # EV bounds with min power enforcement
-                    if ev_import >= ev_min_ch and ev_min_ch > 0:
-                        ev_smax = min(1.0, ev_import / ev_max_ch) if ev_max_ch > 0 else 0.0
+                    # --- CHARGE (import) side ---
+                    if has_batt and p_batt > 0 and ev_max_ch > 0:
+                        if has_deficit and urgency > 1.0:
+                            # Behind schedule: EV-first
+                            ev_import = min(import_headroom, ev_max_ch)
+                            batt_import = max(0.0, import_headroom - ev_import)
+                        elif has_deficit:
+                            # Weighted split by urgency
+                            p_b = 1.0
+                            p_e = 1.0 + alpha * urgency
+                            total_p = p_b + p_e
+                            ev_import = min(import_headroom * p_e / total_p, ev_max_ch)
+                            batt_import = max(0.0, import_headroom - ev_import)
+                        else:
+                            # No deficit: proportional split
+                            total_power = p_batt + ev_max_ch
+                            ev_import = import_headroom * ev_max_ch / total_power
+                            batt_import = import_headroom * p_batt / total_power
+                        b_smax = min(1.0, batt_import / p_batt)
+                    elif ev_max_ch > 0:
+                        # EV-only building
+                        ev_import = import_headroom
+                        b_smax = 1.0  # no battery
+                    else:
+                        ev_import = 0.0
+
+                    # --- DISCHARGE (export) side ---
+                    if has_batt and p_batt > 0 and ev_max_dis > 0:
+                        if has_deficit:
+                            # ANY deficit: zero EV V2G. Charge first, V2G after.
+                            ev_export = 0.0
+                            batt_export = export_headroom
+                        else:
+                            # No deficit: proportional split (V2G fine)
+                            total_power = p_batt + ev_max_dis
+                            ev_export = export_headroom * ev_max_dis / total_power
+                            batt_export = export_headroom * p_batt / total_power
+                        b_smin = max(-1.0, -batt_export / p_batt)
+                    elif ev_max_dis > 0:
+                        # EV-only building: V2G only if no deficit
+                        ev_export = 0.0 if has_deficit else export_headroom
+                        b_smin = -1.0
+                    else:
+                        ev_export = 0.0
+                        if has_batt and p_batt > 0:
+                            b_smin = max(-1.0, -export_headroom / p_batt)
+
+                    # EV bounds from allocated headroom
+                    if ev_max_ch > 0 and ev_import >= ev_min_ch:
+                        ev_smax = min(1.0, ev_import / ev_max_ch)
                     elif ev_min_ch == 0 and ev_max_ch > 0:
                         ev_smax = min(1.0, ev_import / ev_max_ch)
                     else:
                         ev_smax = 0.0
 
-                    if ev_export >= ev_min_dis and ev_min_dis > 0:
-                        ev_smin = max(-1.0, -ev_export / ev_max_dis) if ev_max_dis > 0 else 0.0
+                    if ev_max_dis > 0 and ev_export >= ev_min_dis:
+                        ev_smin = max(-1.0, -ev_export / ev_max_dis)
                     elif ev_min_dis == 0 and ev_max_dis > 0:
                         ev_smin = max(-1.0, -ev_export / ev_max_dis)
                     else:
@@ -495,32 +724,108 @@ class ActionProjectionSERL(gym.Wrapper):
             safe_min[idx] = -1.0
             safe_max[idx] = 1.0
 
-        # C4: Grid-level aggregate import constraint (BATTERY ONLY)
+        # C4: Grid-level aggregate import constraint (JOINT: batteries + EVs)
+        # District net import: solar export at one building offsets import at another
         c4_enabled = self._c4_enabled
-        self._last_total_exo_import = sum(max(0.0, e) for e in exo_nec)
+        self._last_total_exo_import = max(0.0, sum(exo_nec))
+
+        # Infeasibility counters for this step
+        self._last_structural_c4 = 0
+        self._last_c0_c4_conflict = 0
+        self._last_c0_c3_conflict = 0
+        self._last_c4_relaxation_kw = 0.0
 
         if c4_enabled:
             total_exo_import = self._last_total_exo_import
-            grid_headroom = max(0.0, self._p_gmax - total_exo_import)
+            H = max(0.0, self._p_gmax - total_exo_import)
 
-            total_batt_charge = sum(
-                max(0.0, safe_max[self._building_batt_act[b]]) * self._batt_powers[b]
-                for b in self._building_batt_act
-            )
+            # Type A: structural C4 infeasibility
+            if total_exo_import > self._p_gmax:
+                self._last_structural_c4 = 1
 
-            total_ev_charge = sum(
-                max(0.0, safe_max[self._building_ev_act[b]]) * self._ev_max_charge.get(b, 0.0)
-                for b in self._building_ev_act
-            ) if self._building_ev_act else 0.0
+            # Collect all charging devices with their request and priority
+            devices = []  # list of (act_idx, power_kw, r_kw, priority, device_type)
+            for b in self._building_batt_act:
+                act_idx = self._building_batt_act[b]
+                p_kw = self._batt_powers.get(b, 5.0)
+                r_kw = max(0.0, safe_max[act_idx]) * p_kw
+                if r_kw > 1e-9:
+                    devices.append((act_idx, p_kw, r_kw, 1.0, 'batt'))
 
-            remaining_for_batt = max(0.0, grid_headroom - total_ev_charge)
+            total_ev_min_kw = 0.0
+            for b in self._building_ev_act:
+                act_idx = self._building_ev_act[b]
+                p_kw = self._ev_max_charge.get(b, 0.0)
+                r_kw = max(0.0, safe_max[act_idx]) * p_kw
+                if r_kw > 1e-9:
+                    has_deficit = self._ev_has_deficit(b)
+                    if has_deficit:
+                        urgency = self._ev_urgency(b)
+                        priority = 1.0 + self._urgency_alpha * urgency
+                        ev_min = self._ev_min_charge_kw(b)
+                        total_ev_min_kw += ev_min
+                        # Type C: per-building C0-vs-C3 conflict
+                        # Use same formula as C3: max(0, P_bmax - exo), not max(0, exo)
+                        import_hr_b = max(0.0, self._p_bmax - (exo_nec[b] if b < len(exo_nec) else 0))
+                        if ev_min > import_hr_b:
+                            self._last_c0_c3_conflict += 1
+                    else:
+                        priority = 0.0  # no-deficit EV gets zero allocation
+                    devices.append((act_idx, p_kw, r_kw, priority, 'ev'))
 
-            if total_batt_charge > remaining_for_batt and total_batt_charge > 0:
-                scale = max(0.0, remaining_for_batt / total_batt_charge)
-                for b in self._building_batt_act:
-                    batt_act_idx = self._building_batt_act[b]
-                    safe_max[batt_act_idx] = max(safe_min[batt_act_idx],
-                                                  safe_max[batt_act_idx] * scale)
+            # Type B: Stage-1 C0-vs-C4 conflict indicator
+            if total_exo_import <= self._p_gmax and total_ev_min_kw > H:
+                self._last_c0_c4_conflict = 1
+                # Mobility policy: relax C4 to preserve EV minimum charge
+                if self._infeasibility_policy == "mobility":
+                    self._last_c4_relaxation_kw = total_ev_min_kw - H
+                    H = total_ev_min_kw  # expand headroom
+                    self._mobility_overrides += 1
+
+            # Check if total request exceeds headroom
+            total_requested = sum(d[2] for d in devices)
+
+            if total_requested > H and total_requested > 0 and len(devices) > 0:
+                # Iterative weighted allocation with saturation
+                remaining = list(range(len(devices)))
+                allocations = [0.0] * len(devices)
+                H_remaining = H
+
+                for _iteration in range(len(devices) + 1):
+                    if not remaining or H_remaining <= 0:
+                        break
+
+                    total_weighted = sum(
+                        devices[i][3] * devices[i][2] for i in remaining
+                    )
+                    if total_weighted <= 1e-9:
+                        # All remaining have zero priority — give them nothing
+                        break
+
+                    saturated = []
+                    for i in remaining:
+                        _, _, r_kw, p_i, _ = devices[i]
+                        trial = min(r_kw, (p_i * r_kw / total_weighted) * H_remaining)
+                        if trial >= r_kw - 1e-9:
+                            saturated.append(i)
+
+                    if not saturated:
+                        # No saturations — final proportional distribution
+                        for i in remaining:
+                            _, _, r_kw, p_i, _ = devices[i]
+                            allocations[i] = (p_i * r_kw / total_weighted) * H_remaining
+                        break
+
+                    for i in saturated:
+                        allocations[i] = devices[i][2]  # full request
+                        H_remaining -= devices[i][2]
+                        remaining.remove(i)
+
+                # Apply allocations: C4 can only tighten, never loosen C3 bounds
+                for idx_d, (act_idx, p_kw, r_kw, _, _) in enumerate(devices):
+                    if p_kw > 0:
+                        new_max = allocations[idx_d] / p_kw
+                        safe_max[act_idx] = min(safe_max[act_idx], new_max)
 
         # Ensure no inverted ranges after C4 scaling
         inverted = safe_max < safe_min

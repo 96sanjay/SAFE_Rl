@@ -101,18 +101,35 @@ def main(cfg_path: str) -> None:
     print(f"  Lambda upper bound: {'None (uncapped)' if ub is None else ub}")
     print(f"{'=' * 60}")
 
-    # 5. Verify SE-RL QP projection status
+    # 5. Direct instantiation (bypasses omnisafe.Agent)
+    agent = SACLagMulti(env_id=env_id, cfgs=cfgs)
+
+    # 6. Verify SE-RL QP projection is ACTUALLY in the env stack (not just env var)
     serl_on = os.environ.get("CITYLEARN_SERL_PROJECTION", "0") == "1"
     mask_on = os.environ.get("CITYLEARN_ACTION_MASK", "0") == "1"
-    print(f"  SE-RL QP Projection: {'ENABLED' if serl_on else 'DISABLED'}")
-    print(f"  Action Mask: {'ENABLED' if mask_on else 'DISABLED'}")
     if serl_on:
-        print("  → C2/C3/C4 enforced by QP projection in environment")
-    if not serl_on and not mask_on:
-        print("  → WARNING: No safety projection active. C2/C3/C4 via Lagrangian only.")
-
-    # 6. Direct instantiation (bypasses omnisafe.Agent)
-    agent = SACLagMulti(env_id=env_id, cfgs=cfgs)
+        # Walk the wrapper chain and check for ActionProjectionSERL
+        from citylearn_safe.action_projection_serl import ActionProjectionSERL
+        env_check = agent._env
+        found_serl = False
+        for _ in range(20):
+            if isinstance(env_check, ActionProjectionSERL):
+                found_serl = True
+                break
+            env_check = getattr(env_check, 'env', getattr(env_check, '_env', None))
+            if env_check is None:
+                break
+        if found_serl:
+            print("[VERIFIED] ActionProjectionSERL is in the env wrapper chain")
+        else:
+            raise RuntimeError(
+                "[FATAL] CITYLEARN_SERL_PROJECTION=1 but ActionProjectionSERL "
+                "is NOT in the env wrapper chain. Check omni_env_v2.py env construction."
+            )
+    elif mask_on:
+        print("[INFO] ActionMaskWrapper active (not SE-RL QP)")
+    else:
+        print("[WARNING] No safety projection active. C2/C3/C4 via Lagrangian only.")
 
     ep_ret, ep_cost, ep_len = agent.learn()
 

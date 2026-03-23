@@ -513,9 +513,31 @@ class ActionProjectionSERL(gym.Wrapper):
 
         # Ensure no inverted ranges after C4 scaling
         inverted = safe_max < safe_min
-        n_infeasible = int(inverted.sum())
-        if n_infeasible > 0:
+        n_inverted = int(inverted.sum())
+        if n_inverted > 0:
             safe_max = np.maximum(safe_max, safe_min)
-            interventions += n_infeasible
+            interventions += n_inverted
 
+        # Detect structural infeasibility: buildings where exogenous load
+        # already exceeds P_building_max and no controllable device can fix it.
+        # This happens when base_load > P_bmax AND the device can't discharge
+        # enough (or has no device at all). The wrapper sets [0,0] or tight
+        # bounds, but the constraint is still violated by physics.
+        n_structural = 0
+        for b_idx in range(self._n_buildings):
+            if b_idx >= len(exo_nec):
+                continue
+            if abs(exo_nec[b_idx]) > self._p_bmax:
+                # Check if any device at this building can reduce NEC enough
+                can_fix = False
+                if b_idx in self._building_batt_act:
+                    act_idx = self._building_batt_act[b_idx]
+                    # Max discharge possible = |safe_min| × p_batt
+                    max_discharge_kw = abs(safe_min[act_idx]) * self._batt_powers.get(b_idx, 0)
+                    if max_discharge_kw > abs(exo_nec[b_idx]) - self._p_bmax:
+                        can_fix = True
+                if not can_fix:
+                    n_structural += 1
+
+        n_infeasible = n_inverted + n_structural
         return safe_min, safe_max, interventions, n_infeasible

@@ -1580,6 +1580,10 @@ class CityLearnCMDPv2(CMDP):
 
         reward = self._stems_reward(info, a, a_pre_ev_clamp)
 
+        # Markgraf et al. 2025 Eq. 23: SE-RL augmented reward
+        mask_penalty = float(info.get("mask_penalty", 0.0))
+        reward = reward - mask_penalty
+
         # Sauté MDP reward reshaping (per Sootla et al., ICML 2022):
         # When safety budget is exhausted, penalize the agent.
         # shaped_alpha > 0: smooth gradient (reward - alpha * |deficit|)

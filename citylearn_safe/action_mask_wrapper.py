@@ -85,6 +85,9 @@ class ActionMaskWrapper(gym.Wrapper):
         # SoC margin for C2 enforcement
         self._soc_margin = 0.02
 
+        # Markgraf et al. 2025 Eq. 24: SE-RL penalty weight (cached, not per-step)
+        self._penalty_w = float(os.environ.get("SE_RL_PENALTY_WEIGHT", "0.0"))
+
         # Discover CityLearn env and read device specs
         self._city = _unwrap_citylearn(env)
         if self._city is None:
@@ -202,6 +205,19 @@ class ActionMaskWrapper(gym.Wrapper):
     def step(self, action):
         raw_action = np.asarray(action, dtype=np.float32)
         safe_action = self._apply_mask(raw_action)
+
+        # Markgraf et al. 2025 Eq. 24: penalty for action correction
+        # h = 0 if u ∈ safe set, else w × ||u - clip(u, safe_min, safe_max)||²
+        # We measure the CLIPPING distance (how much the raw action exceeds bounds),
+        # NOT the rescaling distance. Rescaling maps [-1,1] to [safe_min, safe_max]
+        # but doesn't indicate a safety violation. Only exceeding bounds does.
+        if self._penalty_w > 0:
+            clipped = np.clip(raw_action, self._last_safe_min, self._last_safe_max)
+            delta = raw_action - clipped
+            mask_penalty = self._penalty_w * float(np.sum(delta ** 2))
+        else:
+            mask_penalty = 0.0
+
         obs, reward, terminated, truncated, info = self.env.step(safe_action)
 
         info["action_mask_enabled"] = 1.0
@@ -209,6 +225,8 @@ class ActionMaskWrapper(gym.Wrapper):
         info["action_mask_safe_max"] = self._last_safe_max.tolist()
         info["action_mask_raw_action"] = raw_action.tolist()
         info["action_mask_interventions"] = float(self._last_interventions)
+        info["mask_penalty"] = mask_penalty
+        info["mask_delta_l2"] = float(np.sqrt(np.sum((raw_action - safe_action) ** 2)))
 
         batt_ranges = np.array([
             self._last_safe_max[ai] - self._last_safe_min[ai]
@@ -416,13 +434,43 @@ class ActionMaskWrapper(gym.Wrapper):
             safe_min[idx] = -1.0
             safe_max[idx] = 1.0
 
-        # ── C4: Grid-level aggregate import constraint ──
-        # DISABLED: C4 mask over-restricts EV charging headroom, causing C0 (EV departure)
-        # violations to spike from 16% to 86%. The per-building C4 allocation (grid_headroom/5
-        # ≈ 2kW per building) is too small for EV chargers (11-22kW nominal).
-        # C4 is left to the Lagrangian, which handles it at the policy level.
-        # C2 (SoC bounds) and C3 (per-building power) are structurally enforced by the mask.
+        # ── C4: Grid-level aggregate import constraint (BATTERY ONLY) ──
+        # EVs are exempt to preserve C1 (EV departure SoC) priority.
+        # Only tighten battery safe_max (charge side), leave EV bounds unchanged.
+        c4_enabled = os.environ.get("MASK_C4_ENABLED", "0") == "1"
         self._last_total_exo_import = sum(max(0.0, e) for e in exo_nec)
+
+        if c4_enabled:
+            total_exo_import = self._last_total_exo_import
+            grid_headroom = max(0.0, self._p_gmax - total_exo_import)
+
+            # Total battery charge power at current safe_max
+            total_batt_charge = sum(
+                max(0.0, safe_max[self._building_batt_act[b]]) * self._batt_powers[b]
+                for b in self._building_batt_act
+            )
+
+            # Also count EV charge (but don't restrict it)
+            total_ev_charge = sum(
+                max(0.0, safe_max[self._building_ev_act[b]]) * self._ev_max_charge.get(b, 0.0)
+                for b in self._building_ev_act
+            ) if self._building_ev_act else 0.0
+
+            remaining_for_batt = max(0.0, grid_headroom - total_ev_charge)
+
+            if total_batt_charge > remaining_for_batt and total_batt_charge > 0:
+                # Scale down ALL battery charge proportionally
+                scale = max(0.0, remaining_for_batt / total_batt_charge)
+                for b in self._building_batt_act:
+                    batt_act_idx = self._building_batt_act[b]
+                    safe_max[batt_act_idx] = max(safe_min[batt_act_idx],
+                                                  safe_max[batt_act_idx] * scale)
+
+        # Ensure no inverted ranges after C4 scaling
+        inverted = safe_max < safe_min
+        if np.any(inverted):
+            safe_max = np.maximum(safe_max, safe_min)
+            interventions += int(inverted.sum())
 
         return safe_min, safe_max, interventions
 

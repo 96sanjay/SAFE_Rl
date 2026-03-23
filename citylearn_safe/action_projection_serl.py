@@ -88,6 +88,9 @@ class ActionProjectionSERL(gym.Wrapper):
         # Eq. 24: SE-RL penalty weight
         self._penalty_w = float(os.environ.get("SE_RL_PENALTY_WEIGHT", "0.5"))
 
+        # C4 grid mask toggle (cached, not per-step)
+        self._c4_enabled = os.environ.get("MASK_C4_ENABLED", "0") == "1"
+
         # Discover CityLearn env and read device specs
         self._city = _unwrap_citylearn(env)
         if self._city is None:
@@ -208,7 +211,7 @@ class ActionProjectionSERL(gym.Wrapper):
         # Compute state-dependent safe bounds
         exo_nec = self._get_exogenous_nec()
         socs = self._get_battery_socs()
-        safe_min, safe_max, interventions = self._compute_safe_bounds(exo_nec, socs)
+        safe_min, safe_max, interventions, n_infeasible = self._compute_safe_bounds(exo_nec, socs)
 
         # Eq. 12: Closest-point projection (NOT rescaling)
         safe_action = np.clip(raw_action, safe_min, safe_max)
@@ -236,6 +239,7 @@ class ActionProjectionSERL(gym.Wrapper):
         info["serl_safe_min"] = safe_min.tolist()
         info["serl_safe_max"] = safe_max.tolist()
         info["serl_raw_action"] = raw_action.tolist()
+        info["serl_n_infeasible"] = float(n_infeasible)  # dims where C3/C4 bounds conflict
 
         # Store bounds on CityLearn env for other wrappers to access
         if self._city is not None:
@@ -356,16 +360,23 @@ class ActionProjectionSERL(gym.Wrapper):
         interventions = 0
 
         for b_idx in range(self._n_buildings):
-            if b_idx >= len(exo_nec) or b_idx not in self._building_batt_act:
+            if b_idx >= len(exo_nec):
+                continue
+            # Skip buildings with neither battery nor EV
+            has_batt = b_idx in self._building_batt_act
+            has_ev_device = b_idx in self._ev_max_charge
+            if not has_batt and not has_ev_device:
                 continue
 
             exo = exo_nec[b_idx]
-            batt_act_idx = self._building_batt_act[b_idx]
-            p_batt = self._batt_powers[b_idx]
 
             # Total headroom for all controllable devices
             import_headroom = self._p_bmax - exo
             export_headroom = self._p_bmax + exo
+
+            # Get battery info (may not exist for EV-only buildings)
+            batt_act_idx = self._building_batt_act.get(b_idx, None)
+            p_batt = self._batt_powers.get(b_idx, 0.0)
 
             has_ev = b_idx in self._ev_max_charge
             if has_ev:
@@ -418,40 +429,40 @@ class ActionProjectionSERL(gym.Wrapper):
                         interventions += 1
                     safe_min[ev_act_idx] = ev_smin
                     safe_max[ev_act_idx] = ev_smax
-            else:
-                # Battery-only: all headroom goes to battery
+            elif has_batt:
+                # Battery-only (no EV): all headroom goes to battery
                 b_smin = max(-1.0, -export_headroom / p_batt)
                 b_smax = min(1.0, import_headroom / p_batt)
 
-            if b_smax < b_smin:
-                interventions += 1
-            safe_min[batt_act_idx] = b_smin
-            safe_max[batt_act_idx] = b_smax
+            # Apply battery bounds and C2 SoC (only if building has battery)
+            if has_batt and batt_act_idx is not None:
+                if b_smax < b_smin:
+                    interventions += 1
+                safe_min[batt_act_idx] = b_smin
+                safe_max[batt_act_idx] = b_smax
 
-            # C2: SoC bounds
-            # CityLearn formula: charge → SoC += energy × rte / cap
-            #                    discharge → SoC += energy / rte / cap
-            # where rte = round_trip_efficiency (0.9487 = sqrt(0.9) for this schema)
-            soc = socs[b_idx] if b_idx < len(socs) else 0.5
-            try:
-                es = self._city.buildings[b_idx].electrical_storage
-                cap = float(getattr(es, 'capacity', 6.4) or 6.4)
-                rte = float(getattr(es, 'round_trip_efficiency', 0.9487))
-            except Exception:
-                cap = 6.4
-                rte = 0.9487
+                # C2: SoC bounds
+                # CityLearn formula: charge → SoC += energy × rte / cap
+                #                    discharge → SoC += energy / rte / cap
+                soc = socs[b_idx] if b_idx < len(socs) else 0.5
+                try:
+                    es = self._city.buildings[b_idx].electrical_storage
+                    cap = float(getattr(es, 'capacity', 6.4) or 6.4)
+                    rte = float(getattr(es, 'round_trip_efficiency', 0.9487))
+                except Exception:
+                    cap = 6.4
+                    rte = 0.9487
 
-            # SoC change per unit action differs for charge vs discharge
-            soc_per_unit_charge = (p_batt * rte) / max(cap, 1e-6)     # charging
-            soc_per_unit_discharge = (p_batt / rte) / max(cap, 1e-6)  # discharging
+                soc_per_unit_charge = (p_batt * rte) / max(cap, 1e-6)
+                soc_per_unit_discharge = (p_batt / rte) / max(cap, 1e-6)
 
-            remaining_charge = max(0.0, self._soc_high - soc)
-            max_charge_action = remaining_charge / max(soc_per_unit_charge, 1e-9)
-            safe_max[batt_act_idx] = min(safe_max[batt_act_idx], max_charge_action)
+                remaining_charge = max(0.0, self._soc_high - soc)
+                max_charge_action = remaining_charge / max(soc_per_unit_charge, 1e-9)
+                safe_max[batt_act_idx] = min(safe_max[batt_act_idx], max_charge_action)
 
-            remaining_discharge = max(0.0, soc - self._soc_low)
-            max_discharge_action = remaining_discharge / max(soc_per_unit_discharge, 1e-9)
-            safe_min[batt_act_idx] = max(safe_min[batt_act_idx], -max_discharge_action)
+                remaining_discharge = max(0.0, soc - self._soc_low)
+                max_discharge_action = remaining_discharge / max(soc_per_unit_discharge, 1e-9)
+                safe_min[batt_act_idx] = max(safe_min[batt_act_idx], -max_discharge_action)
 
         # Passthrough indices keep [-1, 1]
         for idx in self._passthrough_indices:
@@ -459,7 +470,7 @@ class ActionProjectionSERL(gym.Wrapper):
             safe_max[idx] = 1.0
 
         # C4: Grid-level aggregate import constraint (BATTERY ONLY)
-        c4_enabled = os.environ.get("MASK_C4_ENABLED", "0") == "1"
+        c4_enabled = self._c4_enabled
         self._last_total_exo_import = sum(max(0.0, e) for e in exo_nec)
 
         if c4_enabled:
@@ -487,8 +498,9 @@ class ActionProjectionSERL(gym.Wrapper):
 
         # Ensure no inverted ranges after C4 scaling
         inverted = safe_max < safe_min
-        if np.any(inverted):
+        n_infeasible = int(inverted.sum())
+        if n_infeasible > 0:
             safe_max = np.maximum(safe_max, safe_min)
-            interventions += int(inverted.sum())
+            interventions += n_infeasible
 
-        return safe_min, safe_max, interventions
+        return safe_min, safe_max, interventions, n_infeasible

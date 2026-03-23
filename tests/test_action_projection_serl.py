@@ -156,6 +156,46 @@ def test_penalty_nonzero_outside_bounds():
         f"Some dimensions should be clipped, got {info['serl_n_clipped']}"
 
 
+def test_beta_actor_rejected():
+    """SE-RL projection must reject CITYLEARN_BETA_ACTOR=1."""
+    os.environ["CITYLEARN_BETA_ACTOR"] = "1"
+    try:
+        from citylearn_safe.action_projection_serl import ActionProjectionSERL
+        from scripts.make_env import make_base_env
+        from citylearn_safe.safety_env_v3 import CityLearnSafetyEnvV3
+        from citylearn_safe.forecast_obs_wrapper import ForecastObsWrapper
+
+        base = make_base_env(central_agent=True)
+        safety = CityLearnSafetyEnvV3(base)
+        forecast = ForecastObsWrapper(safety, forecast_horizon=24)
+        raised = False
+        try:
+            ActionProjectionSERL(forecast)
+        except RuntimeError as e:
+            if "CITYLEARN_BETA_ACTOR" in str(e):
+                raised = True
+        assert raised, "Should raise RuntimeError when CITYLEARN_BETA_ACTOR=1"
+    finally:
+        os.environ["CITYLEARN_BETA_ACTOR"] = "0"
+
+
+def test_smoke_rollout():
+    """Short rollout smoke test — 200 steps with projection enabled."""
+    env = _build_env()
+    obs, _ = env.reset()
+    total_reward = 0.0
+    for t in range(200):
+        action = np.random.uniform(-1, 1, size=env.action_space.shape)
+        obs, r, term, trunc, info = env.step(action)
+        total_reward += r
+        assert "serl_penalty" in info, "serl_penalty missing from info"
+        assert "serl_n_infeasible" in info, "serl_n_infeasible missing from info"
+        assert "serl_clip_rate" in info, "serl_clip_rate missing from info"
+        if term or trunc:
+            break
+    assert total_reward != 0.0, "Total reward should be nonzero"
+
+
 if __name__ == "__main__":
     tests = [
         test_ev_only_no_crash,
@@ -163,6 +203,8 @@ if __name__ == "__main__":
         test_structural_infeasibility_reported,
         test_penalty_zero_inside_bounds,
         test_penalty_nonzero_outside_bounds,
+        test_beta_actor_rejected,
+        test_smoke_rollout,
     ]
     for test in tests:
         try:

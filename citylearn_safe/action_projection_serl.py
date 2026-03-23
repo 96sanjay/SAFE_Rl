@@ -91,6 +91,17 @@ class ActionProjectionSERL(gym.Wrapper):
         # C4 grid mask toggle (cached, not per-step)
         self._c4_enabled = os.environ.get("MASK_C4_ENABLED", "0") == "1"
 
+        # Beta actor incompatibility guard: SE-RL projection clips in [-1,1]
+        # action space. Beta actor outputs in (0,1). These are incompatible.
+        # Use ActionMaskWrapper (which has beta_mode affine transform) instead.
+        if os.environ.get("CITYLEARN_BETA_ACTOR", "0") == "1":
+            raise RuntimeError(
+                "[ActionProjectionSERL] Incompatible with CITYLEARN_BETA_ACTOR=1. "
+                "Beta actor outputs x∈(0,1) but SE-RL projection clips in [-1,1] space. "
+                "Use CITYLEARN_ACTION_MASK=1 (ActionMaskWrapper) instead, which has "
+                "beta_mode affine transform support."
+            )
+
         # Discover CityLearn env and read device specs
         self._city = _unwrap_citylearn(env)
         if self._city is None:

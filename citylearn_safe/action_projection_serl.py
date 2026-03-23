@@ -133,13 +133,23 @@ class ActionProjectionSERL(gym.Wrapper):
 
         self._n_actions = len(action_names_flat)
 
+        # Build building-number to list-index mapping
+        # Building names might be "Building_1", "Building_2", "Building_4"
+        # but list indices are 0, 1, 2
+        self._bldg_num_to_idx = {}
+        for list_idx, b in enumerate(self._city.buildings):
+            bname = getattr(b, 'name', f'Building_{list_idx+1}')
+            # Extract number from name (e.g., "Building_4" -> 4)
+            nums = re.findall(r'\d+', str(bname))
+            bnum = int(nums[0]) if nums else list_idx + 1
+            self._bldg_num_to_idx[bnum] = list_idx
+
         # Parse action_names to build mapping
-        self._building_batt_act = {}  # b_idx -> action_idx
-        self._building_ev_act = {}    # b_idx -> action_idx
+        self._building_batt_act = {}  # b_list_idx -> action_idx
+        self._building_ev_act = {}    # b_list_idx -> action_idx
         self._passthrough_indices = []
 
-        b_idx = 0
-        batt_count_for_building = {}
+        batt_list_idx = 0  # sequential assignment for battery actions
         for act_idx, name in enumerate(action_names_flat):
             name_lower = name.lower()
             if _EV_RE.match(name):
@@ -147,16 +157,13 @@ class ActionProjectionSERL(gym.Wrapper):
                 suffix = m.group('suffix')
                 parts = suffix.split('_')
                 bldg_num = int(parts[0])
-                ev_b_idx = bldg_num - 1
-                self._building_ev_act[ev_b_idx] = act_idx
+                ev_list_idx = self._bldg_num_to_idx.get(bldg_num, bldg_num - 1)
+                self._building_ev_act[ev_list_idx] = act_idx
             elif 'washing_machine' in name_lower:
                 self._passthrough_indices.append(act_idx)
             elif name_lower == 'electrical_storage':
-                while b_idx in batt_count_for_building:
-                    b_idx += 1
-                self._building_batt_act[b_idx] = act_idx
-                batt_count_for_building[b_idx] = True
-                b_idx += 1
+                self._building_batt_act[batt_list_idx] = act_idx
+                batt_list_idx += 1
             else:
                 self._passthrough_indices.append(act_idx)
 
@@ -477,68 +484,122 @@ class ActionProjectionSERL(gym.Wrapper):
         safe_max: np.ndarray,
         exo_nec: list,
     ) -> np.ndarray:
-        """Eq. 12: Closest-point QP projection.
+        """Eq. 12: Fully joint closest-point QP projection.
 
-        Solves:  min_{ũ} ½||ũ - u||²
-                 s.t. safe_min ≤ ũ ≤ safe_max          (C2, C3 per-dim)
-                      Σ_buildings(exo_b + Σ_devices(gain_b_d × ũ_d)) ≤ P_grid_max  (C4 coupled)
+        Solves one QP with ALL constraints (C2, C3, C4) simultaneously:
+            min_{ũ}  ½||ũ - u||²
+            s.t.  ũ ∈ [-1, 1]^n                                       (action bounds)
+                  soc_low ≤ soc0 + ũ_batt × scale_ch ≤ soc_high       (C2: SoC bounds)
+                  -P_bmax ≤ exo_b + Σ(gains × ũ_devices) ≤ P_bmax     (C3: building power)
+                  Σ(exo_b + Σ(gains × ũ_devices)) ≤ P_gmax            (C4: grid import)
 
-        Falls back to np.clip if cvxpy is unavailable or QP fails.
+        Same formulation as DiffProjector (SP-RL) but solved non-differentiably.
+        Falls back to np.clip if cvxpy unavailable or QP fails.
         """
-        # Fast path: if all actions are already inside bounds AND C4 not binding,
-        # no QP needed
-        clipped = np.clip(raw_action, safe_min, safe_max)
-        if not self._c4_enabled or not _HAS_CVXPY:
-            return clipped
+        if not _HAS_CVXPY:
+            return np.clip(raw_action, safe_min, safe_max)
 
-        # Check if C4 is binding with the clipped action
-        grid_total = sum(exo_nec)
+        # Fast path: check if raw_action is already feasible for all constraints
+        clipped = np.clip(raw_action, -1.0, 1.0)
+        all_feasible = True
+
+        # Check C2 (SoC bounds)
         for b_idx in self._building_batt_act:
             act_idx = self._building_batt_act[b_idx]
-            grid_total += float(clipped[act_idx]) * self._batt_powers.get(b_idx, 0)
-        for b_idx in self._building_ev_act:
-            act_idx = self._building_ev_act[b_idx]
-            grid_total += float(clipped[act_idx]) * self._ev_max_charge.get(b_idx, 0)
+            if clipped[act_idx] < safe_min[act_idx] or clipped[act_idx] > safe_max[act_idx]:
+                all_feasible = False
+                break
 
-        if grid_total <= self._p_gmax:
-            # C4 not binding — np.clip is the correct projection
+        # Check C3 (building power) and C4 (grid)
+        if all_feasible:
+            grid_total = 0.0
+            for b_idx in range(self._n_buildings):
+                exo = exo_nec[b_idx] if b_idx < len(exo_nec) else 0.0
+                net_b = exo
+                if b_idx in self._building_batt_act:
+                    net_b += clipped[self._building_batt_act[b_idx]] * self._batt_powers.get(b_idx, 0)
+                if b_idx in self._building_ev_act:
+                    net_b += clipped[self._building_ev_act[b_idx]] * self._ev_max_charge.get(b_idx, 0)
+                if abs(net_b) > self._p_bmax:
+                    all_feasible = False
+                    break
+                grid_total += net_b
+            if all_feasible and self._c4_enabled and grid_total > self._p_gmax:
+                all_feasible = False
+
+        if all_feasible:
             return clipped
 
-        # C4 is binding — solve QP
+        # Not feasible — solve full QP
         n = self._n_actions
         z = cp.Variable(n)
         objective = cp.Minimize(0.5 * cp.sum_squares(z - raw_action))
+        constraints = [z >= -1.0, z <= 1.0]
 
-        constraints = [
-            z >= safe_min,
-            z <= safe_max,
-        ]
-
-        # C4: grid aggregate constraint
-        # grid_import = Σ(exo_b + batt_gain_b × z_batt_b + ev_gain_b × z_ev_b) ≤ P_grid_max
-        grid_expr = float(sum(exo_nec))
+        # C2: Battery SoC bounds (asymmetric charge/discharge)
         for b_idx in self._building_batt_act:
             act_idx = self._building_batt_act[b_idx]
-            grid_expr = grid_expr + self._batt_powers.get(b_idx, 0) * z[act_idx]
+            # Read actual SoC and efficiency
+            try:
+                es = self._city.buildings[b_idx].electrical_storage
+                soc = float(es.soc[-1]) if hasattr(es.soc, '__len__') else float(es.soc)
+                cap = float(getattr(es, 'capacity', 6.4) or 6.4)
+                rte = float(getattr(es, 'round_trip_efficiency', 0.9) or 0.9)
+                p_batt = self._batt_powers.get(b_idx, 5.0)
+                import math
+                sqrt_rte = math.sqrt(max(rte, 0.01))
+                scale_ch = (p_batt * sqrt_rte) / max(cap, 0.01)
+                scale_dis = (p_batt / sqrt_rte) / max(cap, 0.01)
+            except Exception:
+                soc = 0.5
+                scale_ch = 0.74
+                scale_dis = 0.83
+
+            # charge: soc + z * scale_ch <= soc_high
+            constraints.append(soc + z[act_idx] * scale_ch <= self._soc_high)
+            # discharge: soc + z * scale_dis >= soc_low
+            constraints.append(soc + z[act_idx] * scale_dis >= self._soc_low)
+
+        # C3: Per-building net power magnitude bounds
+        # net_b = exo_b + Σ(batt_gain * z_batt) + Σ(ev_gain * z_ev) ∈ [-P_bmax, P_bmax]
+        net_exprs = []
+        for b_idx in range(self._n_buildings):
+            exo = float(exo_nec[b_idx]) if b_idx < len(exo_nec) else 0.0
+            net_b = exo
+            if b_idx in self._building_batt_act:
+                act_idx = self._building_batt_act[b_idx]
+                net_b = net_b + self._batt_powers.get(b_idx, 0) * z[act_idx]
+            if b_idx in self._building_ev_act:
+                act_idx = self._building_ev_act[b_idx]
+                net_b = net_b + self._ev_max_charge.get(b_idx, 0) * z[act_idx]
+            constraints.append(net_b <= self._p_bmax)
+            constraints.append(net_b >= -self._p_bmax)
+            net_exprs.append(net_b)
+
+        # C4: Grid aggregate import bound
+        if self._c4_enabled and net_exprs:
+            grid_total = sum(net_exprs)
+            constraints.append(grid_total <= self._p_gmax)
+
+        # EV bounds from safe_min/safe_max (includes connection state, min charge power)
         for b_idx in self._building_ev_act:
             act_idx = self._building_ev_act[b_idx]
-            grid_expr = grid_expr + self._ev_max_charge.get(b_idx, 0) * z[act_idx]
+            constraints.append(z[act_idx] >= safe_min[act_idx])
+            constraints.append(z[act_idx] <= safe_max[act_idx])
 
-        constraints.append(grid_expr <= self._p_gmax)
+        # Passthrough actions unconstrained in [-1, 1] (already in bounds above)
 
         prob = cp.Problem(objective, constraints)
         try:
             prob.solve(solver=cp.SCS, verbose=False, max_iters=5000, eps=1e-4)
             if prob.status in ('optimal', 'optimal_inaccurate') and z.value is not None:
                 result = np.asarray(z.value, dtype=np.float32).flatten()
-                # Safety clamp (numerical precision)
-                result = np.clip(result, safe_min, safe_max)
-                return result
+                return np.clip(result, -1.0, 1.0)  # numerical safety
         except Exception:
             pass
 
-        # Fallback: np.clip (C4 not enforced but C2/C3 still are)
-        return clipped
+        # Fallback: use pre-computed box bounds (C2+C3 enforced, C4 best-effort)
+        return np.clip(raw_action, safe_min, safe_max)
 
     def _compute_safe_bounds(
         self,

@@ -101,7 +101,17 @@ def main(cfg_path: str) -> None:
     print(f"  Lambda upper bound: {'None (uncapped)' if ub is None else ub}")
     print(f"{'=' * 60}")
 
-    # 5. Direct instantiation (bypasses omnisafe.Agent)
+    # 5. Verify SE-RL QP projection status
+    serl_on = os.environ.get("CITYLEARN_SERL_PROJECTION", "0") == "1"
+    mask_on = os.environ.get("CITYLEARN_ACTION_MASK", "0") == "1"
+    print(f"  SE-RL QP Projection: {'ENABLED' if serl_on else 'DISABLED'}")
+    print(f"  Action Mask: {'ENABLED' if mask_on else 'DISABLED'}")
+    if serl_on:
+        print("  → C2/C3/C4 enforced by QP projection in environment")
+    if not serl_on and not mask_on:
+        print("  → WARNING: No safety projection active. C2/C3/C4 via Lagrangian only.")
+
+    # 6. Direct instantiation (bypasses omnisafe.Agent)
     agent = SACLagMulti(env_id=env_id, cfgs=cfgs)
 
     ep_ret, ep_cost, ep_len = agent.learn()

@@ -206,15 +206,26 @@ class ActionMaskWrapper(gym.Wrapper):
         raw_action = np.asarray(action, dtype=np.float32)
         safe_action = self._apply_mask(raw_action)
 
-        # Markgraf et al. 2025 Eq. 24: penalty for action correction
-        # h = 0 if u ∈ safe set, else w × ||u - clip(u, safe_min, safe_max)||²
-        # We measure the CLIPPING distance (how much the raw action exceeds bounds),
-        # NOT the rescaling distance. Rescaling maps [-1,1] to [safe_min, safe_max]
-        # but doesn't indicate a safety violation. Only exceeding bounds does.
+        # SE-RL penalty (inspired by Markgraf et al. 2025 Eq. 24):
+        # Penalizes the agent proportional to how far the raw action exceeds
+        # the safe bounds. Serves as a regularizer pushing the policy toward
+        # actions that need less mask correction.
+        #
+        # Note: our rescaling mask is bijective (not projection), so the
+        # flat-lining critic problem from Lemma 2 does not apply. The penalty
+        # is a heuristic regularizer, not a theoretical fix.
         if self._penalty_w > 0:
-            clipped = np.clip(raw_action, self._last_safe_min, self._last_safe_max)
-            delta = raw_action - clipped
-            mask_penalty = self._penalty_w * float(np.sum(delta ** 2))
+            # In beta mode, raw_action ∈ (0,1) and bounds ∈ [-1,1] — different spaces.
+            # Convert to same space: use the actual executed delta instead.
+            if self._beta_mode:
+                # Penalty = w × ||raw_output - safe_output||² (both in physical space)
+                delta = raw_action - safe_action
+                mask_penalty = self._penalty_w * float(np.sum(delta ** 2))
+            else:
+                # Standard mode: clip-based penalty (raw and bounds in same [-1,1] space)
+                clipped = np.clip(raw_action, self._last_safe_min, self._last_safe_max)
+                delta = raw_action - clipped
+                mask_penalty = self._penalty_w * float(np.sum(delta ** 2))
         else:
             mask_penalty = 0.0
 

@@ -1596,7 +1596,7 @@ class CityLearnCMDPv2(CMDP):
                 ev_deficit = min(abs(float(info.get("ev_saute_budget", 0.0))), 2.0)
                 reward = reward - self._ev_saute_shaped_alpha * ev_deficit
             else:
-                reward = -float(info.get("ev_saute_penalty", 5.0))
+                reward = -float(info.get("ev_saute_penalty", 5.0)) - mask_penalty
 
         cost = self._rebalanced_cost(info)
 

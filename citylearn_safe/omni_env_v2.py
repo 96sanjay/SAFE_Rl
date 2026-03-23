@@ -104,8 +104,13 @@ class CityLearnCMDPv2(CMDP):
             env_final = SauteEVBudgetWrapper(env_final)
 
 
-        # R29: Action mask wrapper (rescales actions to satisfy C3 power constraints)
-        if os.environ.get("CITYLEARN_ACTION_MASK", "0") == "1":
+        # R29: Action mask/projection wrapper (satisfies C2/C3/C4 power constraints)
+        # SE-RL projection (paper-exact clip + penalty) takes priority over rescaling mask
+        if os.environ.get("CITYLEARN_SERL_PROJECTION", "0") == "1":
+            from citylearn_safe.action_projection_serl import ActionProjectionSERL
+            env_final = ActionProjectionSERL(env_final)
+            print("[CMDPv2] ActionProjectionSERL ENABLED (SE-RL clip + penalty)")
+        elif os.environ.get("CITYLEARN_ACTION_MASK", "0") == "1":
             from citylearn_safe.action_mask_wrapper import ActionMaskWrapper
             env_final = ActionMaskWrapper(env_final)
             print("[CMDPv2] ActionMaskWrapper ENABLED")

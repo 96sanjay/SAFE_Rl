@@ -791,6 +791,21 @@ class DiffProjector:
                 for gidx, val, gain in pos_devices:
                     z[gidx] = torch.tensor(val * scale, dtype=z.dtype)
 
+        # --- Verification pass: re-enforce C2 after C3/C4 may have changed actions ---
+        # C3/C4 scaling can push battery actions beyond SoC limits set in C2.
+        # Re-clamp to ensure C2 is never violated.
+        for i in range(n_batt):
+            gidx = int(m["batt_gidx"][i])
+            s0 = float(state["soc0"][i])
+            sch = float(state["soc_scale_ch"][i])
+            sdis = float(state["soc_scale_dis"][i])
+            if sch > 1e-9:
+                a_hi = min((self.soc_high - s0) / sch, 1.0)
+                z[gidx] = torch.clamp(z[gidx], max=a_hi)
+            if sdis > 1e-9:
+                a_lo = max((self.soc_low - s0) / sdis, -1.0)
+                z[gidx] = torch.clamp(z[gidx], min=a_lo)
+
         # Straight-through estimator: gradient flows through unsafe_action
         # but forward value is the clamped z.
         return unsafe_action + (z - unsafe_action.detach())

@@ -157,8 +157,17 @@ class _SPRLOffPolicyAdapter(OffPolicyAdapter):
                 )
                 self._per_ep_costs[i] += float(val)
 
+            # Extract NEXT-step projection state (after env step, at s')
+            if projector is not None:
+                with torch.no_grad():
+                    next_proj_state = projector.extract_state_tensor().unsqueeze(0).to(
+                        self._device
+                    )
+            else:
+                next_proj_state = None
+
             # Store in buffer: standard fields + per-constraint costs
-            # + safe action + penalty + projection state.
+            # + safe action + penalty + projection state + next projection state.
             # The 'act' field stores the UNSAFE action (needed for penalty critic).
             # We store safe action and projection state separately.
             extra_fields = dict(
@@ -168,6 +177,8 @@ class _SPRLOffPolicyAdapter(OffPolicyAdapter):
             )
             if proj_state is not None:
                 extra_fields['proj_state'] = proj_state
+            if next_proj_state is not None:
+                extra_fields['next_proj_state'] = next_proj_state
             buffer.store(
                 obs=self._current_obs,
                 act=act_unsafe,
@@ -227,6 +238,10 @@ class _SPRLOffPolicyBuffer(VectorOffPolicyBuffer):
         # Projection state buffer (per-sample env state for correct batch projection)
         if proj_state_dim > 0:
             self.data['proj_state'] = torch.zeros(
+                (size, num_envs, proj_state_dim), dtype=torch.float32, device=device
+            )
+            # Next-step projection state (for correct target computation: Φ(s', π(s')))
+            self.data['next_proj_state'] = torch.zeros(
                 (size, num_envs, proj_state_dim), dtype=torch.float32, device=device
             )
         # Per-constraint cost buffers
@@ -569,6 +584,7 @@ class TD3LagMulti(TD3):
         done: torch.Tensor,
         next_obs: torch.Tensor,
         proj_state: Optional[torch.Tensor] = None,
+        next_proj_state: Optional[torch.Tensor] = None,
     ) -> None:
         """Update twin reward critics using TD3-style target noise smoothing.
 
@@ -576,9 +592,9 @@ class TD3LagMulti(TD3):
         Target action is the projected target actor output with clipped noise.
 
         Args:
-            proj_state: Per-sample projector state from replay buffer. Used as
-                        approximate state for next-step target projection (state
-                        changes slowly between consecutive steps).
+            proj_state: Per-sample projector state from replay (for current obs).
+            next_proj_state: Per-sample projector state at s' (for correct
+                             target projection Φ(s', π_target(s'))).
         """
         with torch.no_grad():
             # Target action from target actor
@@ -594,10 +610,15 @@ class TD3LagMulti(TD3):
             next_action_noisy = (next_action_raw + noise).clamp(-1.0, 1.0)
 
             # Project target action through DiffProjector
-            # Use stored per-sample state (approximate for next step)
-            if self._projector is not None:
+            # Use next_proj_state for correct Φ(s', π_target(s'))
+            target_state = next_proj_state if next_proj_state is not None else proj_state
+            if self._projector is not None and target_state is not None:
                 next_action_safe, _ = self._projector.project(
-                    next_obs, next_action_noisy, state_tensors=proj_state,
+                    next_obs, next_action_noisy, state_tensors=target_state,
+                )
+            elif self._projector is not None:
+                next_action_safe, _ = self._projector.project(
+                    next_obs, next_action_noisy,
                 )
             else:
                 next_action_safe = next_action_noisy
@@ -773,13 +794,16 @@ class TD3LagMulti(TD3):
             next_obs = data['next_obs']
             penalty_h = data['penalty_h']
             proj_state = data.get('proj_state', None)  # per-sample projector state
+            next_proj_state = data.get('next_proj_state', None)  # next-step state for targets
 
             # Store proj_state for _loss_pi to access during actor update
             self._current_proj_state = proj_state
 
             # 1. Reward critics: trained on (obs, act_safe, reward)
+            #    Target uses next_proj_state for correct Φ(s', π_target(s'))
             self._update_reward_critic(
-                obs, act_safe, reward, done, next_obs, proj_state=proj_state,
+                obs, act_safe, reward, done, next_obs,
+                proj_state=proj_state, next_proj_state=next_proj_state,
             )
 
             # 2. Standard cost critic (OmniSafe compatibility, uses aggregate cost)

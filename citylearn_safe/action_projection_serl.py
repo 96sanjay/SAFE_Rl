@@ -518,26 +518,45 @@ class ActionProjectionSERL(gym.Wrapper):
             safe_max = np.maximum(safe_max, safe_min)
             interventions += n_inverted
 
-        # Detect structural infeasibility: buildings where exogenous load
-        # already exceeds P_building_max and no controllable device can fix it.
-        # This happens when base_load > P_bmax AND the device can't discharge
-        # enough (or has no device at all). The wrapper sets [0,0] or tight
-        # bounds, but the constraint is still violated by physics.
+        # Detect structural infeasibility: buildings where exogenous NEC
+        # exceeds P_building_max and no admissible corrective action can fix it.
+        #
+        # Two cases:
+        #   Import violation (exo > +P_bmax): need devices to DISCHARGE (reduce NEC)
+        #   Export violation (exo < -P_bmax): need devices to CHARGE (increase NEC)
+        #
+        # Check both battery AND EV corrective capacity in the needed direction.
         n_structural = 0
         for b_idx in range(self._n_buildings):
             if b_idx >= len(exo_nec):
                 continue
-            if abs(exo_nec[b_idx]) > self._p_bmax:
-                # Check if any device at this building can reduce NEC enough
-                can_fix = False
+            exo = exo_nec[b_idx]
+            violation = abs(exo) - self._p_bmax
+            if violation <= 0:
+                continue  # no violation
+
+            # How much corrective power can all devices at this building provide?
+            corrective_kw = 0.0
+
+            if exo > 0:
+                # Import violation: need discharge (negative action) to reduce NEC
                 if b_idx in self._building_batt_act:
                     act_idx = self._building_batt_act[b_idx]
-                    # Max discharge possible = |safe_min| × p_batt
-                    max_discharge_kw = abs(safe_min[act_idx]) * self._batt_powers.get(b_idx, 0)
-                    if max_discharge_kw > abs(exo_nec[b_idx]) - self._p_bmax:
-                        can_fix = True
-                if not can_fix:
-                    n_structural += 1
+                    corrective_kw += abs(safe_min[act_idx]) * self._batt_powers.get(b_idx, 0)
+                if b_idx in self._building_ev_act:
+                    act_idx = self._building_ev_act[b_idx]
+                    corrective_kw += abs(safe_min[act_idx]) * self._ev_max_discharge.get(b_idx, 0)
+            else:
+                # Export violation: need charge (positive action) to increase NEC
+                if b_idx in self._building_batt_act:
+                    act_idx = self._building_batt_act[b_idx]
+                    corrective_kw += safe_max[act_idx] * self._batt_powers.get(b_idx, 0)
+                if b_idx in self._building_ev_act:
+                    act_idx = self._building_ev_act[b_idx]
+                    corrective_kw += safe_max[act_idx] * self._ev_max_charge.get(b_idx, 0)
+
+            if corrective_kw < violation:
+                n_structural += 1
 
         n_infeasible = n_inverted + n_structural
         return safe_min, safe_max, interventions, n_infeasible

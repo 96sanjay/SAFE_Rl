@@ -67,6 +67,14 @@ def test_ev_only_bounds():
     """EV-only building: battery bounds untouched, EV bounds restricted."""
     env = _build_env()
 
+    # Read indices BEFORE mutating (dynamic, not hardcoded)
+    batt_act_idx = env._building_batt_act.get(0)  # e.g., 0
+    ev_act_idx = env._building_ev_act.get(0)      # e.g., 1
+
+    assert batt_act_idx is not None, "Building 0 must have battery to test removal"
+    assert ev_act_idx is not None, "Building 0 must have EV"
+
+    # Remove battery to simulate EV-only
     env._building_batt_act.pop(0, None)
     env._batt_powers.pop(0, None)
 
@@ -74,15 +82,15 @@ def test_ev_only_bounds():
     action = np.random.uniform(-1, 1, size=env.action_space.shape)
     obs, r, term, trunc, info = env.step(action)
 
-    # Battery action at index 0: should be untouched [-1, 1]
-    assert abs(info["serl_safe_min"][0] - (-1.0)) < 0.01, \
-        f"Battery safe_min should be -1.0, got {info['serl_safe_min'][0]}"
-    assert abs(info["serl_safe_max"][0] - 1.0) < 0.01, \
-        f"Battery safe_max should be 1.0, got {info['serl_safe_max'][0]}"
+    # Battery action at its dynamic index: should be untouched [-1, 1]
+    assert abs(info["serl_safe_min"][batt_act_idx] - (-1.0)) < 0.01, \
+        f"Battery safe_min should be -1.0, got {info['serl_safe_min'][batt_act_idx]}"
+    assert abs(info["serl_safe_max"][batt_act_idx] - 1.0) < 0.01, \
+        f"Battery safe_max should be 1.0, got {info['serl_safe_max'][batt_act_idx]}"
 
-    # EV action at index 1: should be restricted by C3
-    ev_restricted = (info["serl_safe_max"][1] < 1.0 or
-                     info["serl_safe_min"][1] > -1.0)
+    # EV action at its dynamic index: should be restricted by C3
+    ev_restricted = (info["serl_safe_max"][ev_act_idx] < 1.0 or
+                     info["serl_safe_min"][ev_act_idx] > -1.0)
     assert ev_restricted, "EV bounds should be restricted by C3 headroom"
 
 

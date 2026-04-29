@@ -1,0 +1,80 @@
+# R30: KL-Regularized PPOLag + NEC-Sign Reward + Action Mask + BC Warmstart
+#
+# The combination that addresses ALL identified failure modes:
+#   1. Action mask → prevents C3/C2 violations → lambdas stay low
+#   2. NEC-sign reward → cycling is 2.5x better than static (EVLearn proven)
+#   3. BC warmstart → initializes near cycling behavior
+#   4. KL regularization → prevents drift from cycling back to static
+#   5. Price arbitrage → fine-tunes timing within NEC-gated direction
+#   6. Lagrangian for ALL constraints → agent learns constraint awareness
+algo: PPOLagMulti
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 109500          # 50 epochs × 2190 steps/epoch
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 2190
+  update_iters: 30
+  target_kl: 0.08
+  kl_early_stop: true
+  batch_size: 256
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  standardized_cost_adv: true
+  entropy_coef: 0.005
+  max_grad_norm: 40.0
+
+lagrange_cfgs:
+  cost_limit: 21800
+  lagrangian_multiplier_init: 0.001
+  lambda_lr: 0.035
+  lambda_optimizer: Adam
+  lagrangian_upper_bound: 3.0
+
+multi_cfgs:
+  tau: 1.0
+  # TIGHT limits (computed from R29 actual costs — lambdas WILL activate)
+  cost_limit_0: 800            # C0: EV departure (actual ~1120, lambda grows gradually)
+  cost_limit_1: 1500           # C1: EV dense
+  cost_limit_2: 10000          # C2: Battery SoC (mask handles bounds, generous limit)
+  cost_limit_3: 5000           # C3: Building power (structural floor ~2500-3000)
+  cost_limit_4: 3000           # C4: Grid power (structural floor ~1000-2000)
+
+  # PID gains (tuned: lambda reaches ~1.0 by epoch 30, not instant)
+  pid_kp: 0.1
+  pid_ki: 0.01
+  pid_kd: 0.01
+  pid_d_delay: 10
+  pid_delta_p_ema_alpha: 0.95
+  pid_delta_d_ema_alpha: 0.95
+  pid_kp_0: 0.5               # C0: gentle growth (~1.0 by epoch 15)
+  pid_ki_0: 0.0
+  pid_kd_0: 0.0
+  pid_ema_p_0: 0.0
+  pid_kp_3: 0.2               # C3: down from 0.5 (tight limit means less gain needed)
+  pid_ki_3: 0.02              # C3: down from 0.05
+  pid_kp_4: 0.2               # C4: down from 0.3
+  pid_ki_4: 0.02              # C4: down from 0.03
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0003
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5
+  log_dir: ./runs/test_1bld_v3
+  window_lens: 1

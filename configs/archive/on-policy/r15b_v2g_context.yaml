@@ -1,0 +1,71 @@
+# R15b: R15a + context-aware V2G signal
+# Base: R15a (hard EV clamp + anti-discharge penalty)
+# Changes from R15a:
+#   - Context-aware V2G signal: rewards smart discharge timing
+#   - Isolates smart V2G incentive effect
+algo: PPOLagMulti
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 437950          # 50 epochs × 8759 steps/epoch
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 30
+  target_kl: 0.12
+  kl_early_stop: true
+  batch_size: 128
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  standardized_cost_adv: true
+  entropy_coef: 0.005
+  max_grad_norm: 40.0
+
+lagrange_cfgs:
+  cost_limit: 21800
+  lagrangian_multiplier_init: 0.001
+  lambda_lr: 0.035
+  lambda_optimizer: Adam
+  lagrangian_upper_bound: 3.0
+
+multi_cfgs:
+  tau: 1.0
+  cost_limit_0: 1800
+  cost_limit_1: 1500
+  cost_limit_2: 4000
+  cost_limit_3: 12000
+  cost_limit_4: 2500
+  pid_kp: 0.1
+  pid_ki: 0.01
+  pid_kd: 0.01
+  pid_d_delay: 10
+  pid_delta_p_ema_alpha: 0.95
+  pid_delta_d_ema_alpha: 0.95
+  pid_kp_0: 5.0
+  pid_ki_0: 0.0
+  pid_kd_0: 0.0
+  pid_ema_p_0: 0.0
+  pid_kp_3: 0.3
+  pid_ki_3: 0.03
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0003
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5
+  log_dir: ./runs/r15b_v2g_context/5bld
+  window_lens: 1

@@ -1,0 +1,56 @@
+# PPOLag + GradS: Per-constraint lambdas with Gradient Shaping
+# Matching Yao et al. 2024 (L4DC) architecture: 5 independent lambdas
+# GradS adds 5 per-constraint cost critics + lambda-proportional sampling
+algo: PPOLagGradS
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 437950          # 50 epochs x 8759 steps/epoch
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 40             # reduced from 60 for GradS compute budget
+  target_kl: 0.10              # same as R5-A/R6/R7 for fair comparison
+  kl_early_stop: true
+  batch_size: 256
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.005
+
+lagrange_cfgs:
+  cost_limit: 24400            # kept for parent class compatibility
+  lagrangian_multiplier_init: 0.1    # lower init — per-constraint is gentler
+  lambda_lr: 0.05
+  lambda_optimizer: SGD
+
+# GradS-specific config (per-constraint cost limits from observed ranges)
+grads_cfgs:
+  sim_threshold: 0.8           # kappa: above this, gradients are redundant
+  conflict_threshold: 0.999    # sigma: below -sigma, gradients conflict
+  cost_limit_0: 650            # C1: EV departure (observed: 240-924)
+  cost_limit_1: 36500          # C1d: EV dense (observed: 21K-37K)
+  cost_limit_2: 137000         # C2: Battery SoC (observed: 72K-140K)
+  cost_limit_3: 137000         # C3: Building power (observed: 72K-140K)
+  cost_limit_4: 83000          # C4: Grid power (observed: 37K-85K)
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0005
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5
+  log_dir: ./runs/r6_compare/grads_5bld
+  window_lens: 1

@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+Universal Policy Evaluation with Oracle
+FIXED: Proper env unwrapping + progress indicators
+"""
+
+import os
+import sys
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Callable, Optional, Dict, Any
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from glob import glob
+
+REPO_ROOT = "/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork"
+sys.path.insert(0, REPO_ROOT)
+
+os.environ["PYTHONPATH"] = f"{REPO_ROOT}:" + os.environ.get("PYTHONPATH", "")
+os.environ["CITYLEARN_SCHEMA"] = f"{REPO_ROOT}/data/citylearn_challenge_2022_phase_all_plus_evs/schema.json"
+os.environ["CITYLEARN_EXPORT_FACTOR"] = "0.7"
+os.environ["CITYLEARN_REWARD_SCALE"] = "1.0"
+os.environ["CITYLEARN_EV_COST_SCALE"] = "3.0"
+os.environ["CITYLEARN_KPI_FLUSH_EVERY_STEP"] = "0"  # Disable verbose KPI logging
+
+from scripts.make_env import make_base_env
+from citylearn_safe.safety_env_v3 import CityLearnSafetyEnvV3
+from citylearn_safe.extractors_v3 import (
+    run_policy_and_oracle_rollouts,
+    summarize_oracle_gap,
+    unwrap_to_raw_citylearn_env,
+    current_time_index
+)
+
+
+# ============================================================================
+# MODEL REGISTRY
+# ============================================================================
+
+@dataclass
+class ModelConfig:
+    name: str
+    model_type: str
+    checkpoint_dir: Optional[str] = None
+    description: str = ""
+
+
+MODEL_REGISTRY: List[ModelConfig] = [
+    ModelConfig(
+        name="RBC-Greedy",
+        model_type="rbc",
+        description="Rule-based controller with greedy EV charging"
+    ),
+    
+    ModelConfig(
+        name="PPO-Lag-Lambda35",
+        model_type="ppo",
+        checkpoint_dir="runs/ppo_lag_3constraints_lambda35_evweight3_100ep",
+        description="PPO-Lagrangian lambda=35"
+    ),
+    
+    ModelConfig(
+        name="PPO-Lag-Lambda40",
+        model_type="ppo",
+        checkpoint_dir="runs/ppo_lag_3constraints_lambda40_highexplore_100ep",
+        description="PPO-Lagrangian lambda=40"
+    ),
+]
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+def _unwrap_action_names(names):
+    if isinstance(names, list) and len(names) == 1 and isinstance(names[0], list):
+        return names[0]
+    return names
+
+
+def _norm_id(x) -> str:
+    if isinstance(x, (bytes, np.bytes_)):
+        x = x.decode("utf-8", errors="ignore")
+    s = str(x).strip()
+    if s.startswith("b'") and s.endswith("'"):
+        s = s[2:-1]
+    return s.strip()
+
+
+def _is_valid_ev_id(x) -> bool:
+    s = _norm_id(x)
+    return bool(s and s.lower() not in ("nan", "none"))
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> str:
+    full_path = f"{REPO_ROOT}/{checkpoint_dir}" if not checkpoint_dir.startswith("/") else checkpoint_dir
+    search_pattern = f"{full_path}/**/torch_save/epoch-*.pt"
+    checkpoints = glob(search_pattern, recursive=True)
+    
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoints found in {full_path}")
+    
+    epoch_nums = []
+    for cp in checkpoints:
+        try:
+            basename = os.path.basename(cp)
+            epoch_str = basename.replace("epoch-", "").replace(".pt", "")
+            epoch_nums.append((int(epoch_str), cp))
+        except:
+            continue
+    
+    if not epoch_nums:
+        raise FileNotFoundError(f"No valid checkpoints in {full_path}")
+    
+    latest = max(epoch_nums, key=lambda x: x[0])
+    return latest[1]
+
+
+def get_action_names_from_env(env) -> List[str]:
+    """Robustly get action_names by unwrapping"""
+    # Try direct access
+    if hasattr(env, 'action_names'):
+        return _unwrap_action_names(env.action_names)
+    
+    # Unwrap to raw CityLearn
+    raw = unwrap_to_raw_citylearn_env(env)
+    if hasattr(raw, 'action_names'):
+        return _unwrap_action_names(raw.action_names)
+    
+    raise AttributeError("Could not find action_names in environment")
+
+
+# ============================================================================
+# RBC POLICY - FIXED
+# ============================================================================
+
+class RBCGreedyPolicy:
+    """Rule-based controller - FIXED env access"""
+    
+    def __init__(self, env):
+        """
+        Args:
+            env: Any wrapped/unwrapped environment
+        """
+        self.env = env
+        
+        # Get action names robustly
+        self.action_names = get_action_names_from_env(env)
+        self.action_dim = len(self.action_names)
+        
+        self.battery_indices = [i for i, n in enumerate(self.action_names) if str(n).strip().lower() == "electrical_storage"]
+        self.ev_indices = [i for i, n in enumerate(self.action_names) if "electric_vehicle_storage_charger" in str(n).lower()]
+        self.cooling_indices = [i for i, n in enumerate(self.action_names) if str(n).strip().lower() == "cooling_storage"]
+        self.heating_indices = [i for i, n in enumerate(self.action_names) if str(n).strip().lower() == "heating_storage"]
+        
+        print(f"  RBC initialized: {len(self.battery_indices)} batteries, {len(self.ev_indices)} EVs")
+    
+    def _battery_action(self, hour: int) -> float:
+        return 0.8 if 10 <= hour <= 16 else (-0.6 if 17 <= hour <= 21 else 0.0)
+    
+    def _charger_connected_now(self, raw_env, action_name: str) -> bool:
+        s = str(action_name).strip().lower()
+        if "electric_vehicle_storage_charger_" not in s:
+            return False
+        suffix = s.split("electric_vehicle_storage_charger_", 1)[1]
+        charger_id = f"charger_{suffix}"
+        # OLD (can be wrong vs wrapper action alignment)
+        # t_state = int(getattr(raw_env, "time_step", 0))
+        # if t_state < 0:
+        #     t_state = 0
+
+        # NEW: wrapper stores action at (time_step+1), so check connectivity at (time_step+1)
+        t_state = int(getattr(raw_env, "time_step", 0))
+        t_check = t_state + 1
+        if t_check < 0:
+            t_check = 0
+        
+        for b in getattr(raw_env, "buildings", []) or []:
+            for ch in getattr(b, "electric_vehicle_chargers", []) or []:
+                cid = getattr(ch, "charger_id", getattr(ch, "name", None))
+                if _norm_id(cid) != charger_id:
+                    continue
+                sim = getattr(ch, "charger_simulation", getattr(ch, "_Charger__charger_simulation", None))
+                if sim is None:
+                    return False
+                try:
+                    state = np.asarray(getattr(sim, "_electric_vehicle_charger_state"), dtype=float)
+                    ev_id = np.asarray(getattr(sim, "_electric_vehicle_id"))
+                except:
+                    return False
+                if state.ndim != 1:
+                    return False
+                if t_check >= len(state):
+                    t_check = len(state) - 1
+                if t_check < 0:
+                    return False
+                st = float(state[t_check])
+                eid = ev_id[t_check]
+                return (st == 1.0) and _is_valid_ev_id(eid)
+        return False
+    
+    def _get_indoor_temps(self, raw_env) -> np.ndarray:
+        temps = []
+        for b in getattr(raw_env, "buildings", []) or []:
+            t_idx = int(getattr(raw_env, "time_step", 0))
+            if t_idx < 0:
+                t_idx = 0
+            try:
+                temp_arr = np.asarray(b.indoor_dry_bulb_temperature, dtype=float)
+                if temp_arr.ndim == 1 and 0 <= t_idx < len(temp_arr):
+                    temps.append(float(temp_arr[t_idx]))
+                else:
+                    temps.append(22.0)
+            except:
+                temps.append(22.0)
+        return np.array(temps) if temps else np.array([22.0])
+    
+    def __call__(self, obs, info, env) -> np.ndarray:
+        """Policy function signature for Oracle evaluation"""
+        a = np.zeros(self.action_dim, dtype=np.float32)
+        raw = unwrap_to_raw_citylearn_env(env)
+        hour = int(current_time_index(raw) % 24)
+        
+        # Greedy EV
+        for i in self.ev_indices:
+            a[i] = 1.0 if self._charger_connected_now(raw, self.action_names[i]) else 0.0
+        
+        # Battery
+        batt = float(self._battery_action(hour))
+        for i in self.battery_indices:
+            a[i] = batt
+        
+        # Temperature
+        temps = self._get_indoor_temps(raw)
+        for i in self.cooling_indices:
+            a[i] = 0.5 if temps[i % len(temps)] > 24.0 else 0.0
+        for i in self.heating_indices:
+            a[i] = 0.5 if temps[i % len(temps)] < 20.0 else 0.0
+        
+        return a
+
+
+# ============================================================================
+# PPO POLICY
+# ============================================================================
+
+class GaussianPolicy(nn.Module):
+    def __init__(self, obs_dim=153, act_dim=26):
+        super().__init__()
+        self.mean = nn.Sequential(
+            nn.Linear(obs_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.Linear(64, act_dim),
+            nn.Tanh(),
+        )
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+    
+    def forward(self, obs, deterministic=True):
+        mean = self.mean(obs)
+        if deterministic:
+            return mean
+        else:
+            std = torch.exp(self.log_std)
+            return mean + torch.randn_like(mean) * std
+
+
+def load_ppo_policy(checkpoint_path: str):
+    """Load OmniSafe PPO checkpoint"""
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    policy = GaussianPolicy(obs_dim=153, act_dim=26)
+    policy.load_state_dict(checkpoint['pi'])
+    policy.eval()
+    
+    # Handle OmniSafe normalizer
+    obs_normalizer_raw = checkpoint.get('obs_normalizer', {})
+    
+    if 'mean' in obs_normalizer_raw:
+        obs_mean = obs_normalizer_raw['mean']
+        obs_var = obs_normalizer_raw['var']
+    elif '_mean' in obs_normalizer_raw:
+        obs_mean = obs_normalizer_raw['_mean']
+        obs_var = obs_normalizer_raw['_var']
+    else:
+        print("  ⚠️  WARNING: No normalizer found, using identity")
+        obs_mean = torch.zeros(153)
+        obs_var = torch.ones(153)
+    
+    obs_normalizer = {'mean': obs_mean, 'var': obs_var}
+    return policy, obs_normalizer
+
+
+def make_ppo_policy_fn(policy_net, obs_norm):
+    """Create PPO policy function"""
+    def policy_fn(obs, info, env):
+        obs_torch = torch.FloatTensor(obs).unsqueeze(0)
+        obs_mean = obs_norm['mean']
+        obs_var = obs_norm['var']
+        obs_normalized = (obs_torch - obs_mean) / torch.sqrt(obs_var + 1e-8)
+        
+        with torch.no_grad():
+            action = policy_net(obs_normalized, deterministic=True)
+        
+        return action.squeeze(0).numpy()
+    
+    return policy_fn
+
+
+# ============================================================================
+# POLICY LOADER
+# ============================================================================
+
+def load_policy(config: ModelConfig) -> Callable:
+    
+    if config.model_type == "rbc":
+        base_env = make_base_env(central_agent=True)
+        policy = RBCGreedyPolicy(base_env)
+        return policy
+    
+    elif config.model_type == "ppo":
+        checkpoint_path = find_latest_checkpoint(config.checkpoint_dir)
+        print(f"  Loading: {checkpoint_path}")
+        policy_net, obs_norm = load_ppo_policy(checkpoint_path)
+        return make_ppo_policy_fn(policy_net, obs_norm)
+    
+    else:
+        raise ValueError(f"Unknown model_type: {config.model_type}")
+
+
+# ============================================================================
+# EVALUATION ENGINE
+# ============================================================================
+
+def make_env_factory():
+    def _make():
+        base = make_base_env(central_agent=True)
+        return CityLearnSafetyEnvV3(base)
+    return _make
+
+
+def evaluate_single_policy(config: ModelConfig, seed: int = 42) -> Dict[str, Any]:
+    
+    print(f"\n{'='*90}")
+    print(f"  Evaluating: {config.name}")
+    print(f"  Type: {config.model_type}")
+    if config.description:
+        print(f"  Description: {config.description}")
+    print(f"{'='*90}")
+    
+    print(f"\n[1/3] Loading policy...")
+    try:
+        policy_fn = load_policy(config)
+        print(f"  ✅ Policy loaded")
+    except Exception as e:
+        print(f"  ❌ Failed to load policy: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+    print(f"\n[2/3] Running Oracle evaluation...")
+    print(f"  This takes ~4 minutes (2 rollouts × 8760 steps each)")
+    print(f"  Progress: ", end='', flush=True)
+    
+    try:
+        policy_summary, oracle_summary = run_policy_and_oracle_rollouts(
+            make_env=make_env_factory(),
+            policy_action_fn=policy_fn,
+            seed=seed
+        )
+        gap = summarize_oracle_gap(policy_summary, oracle_summary)
+        print(f"\n  ✅ Evaluation complete")
+    except Exception as e:
+        print(f"\n  ❌ Evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    
+    print(f"\n[3/3] Results:")
+    print(f"  Policy Deficit:       {gap['policy_deficit_kwh']:>10.2f} kWh")
+    print(f"  Oracle Deficit:       {gap['oracle_deficit_kwh']:>10.2f} kWh (physics minimum)")
+    print(f"  Avoidable:            {gap['avoidable_wrt_oracle_kwh']:>10.2f} kWh ({gap['avoidable_wrt_oracle_fraction']*100:>5.1f}%)")
+    print(f"  Total Cost:           {policy_summary.cost_total:>10.2f}")
+    
+    results = {
+        'model_name': config.name,
+        'model_type': config.model_type,
+        'description': config.description,
+        'policy_deficit_kwh': gap['policy_deficit_kwh'],
+        'policy_cost_total': policy_summary.cost_total,
+        'oracle_deficit_kwh': gap['oracle_deficit_kwh'],
+        'oracle_cost_total': oracle_summary.cost_total,
+        'avoidable_kwh': gap['avoidable_wrt_oracle_kwh'],
+        'avoidable_fraction': gap['avoidable_wrt_oracle_fraction'],
+    }
+    
+    return results
+
+
+def evaluate_all_policies(output_dir: Path, seed: int = 42):
+    
+    print(f"\n{'='*90}")
+    print(f"  UNIVERSAL POLICY EVALUATION")
+    print(f"  Total policies: {len(MODEL_REGISTRY)}")
+    print(f"  Estimated time: ~{len(MODEL_REGISTRY) * 4} minutes")
+    print(f"{'='*90}")
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    all_results = []
+    
+    for i, config in enumerate(MODEL_REGISTRY, 1):
+        print(f"\n{'#'*90}")
+        print(f"  POLICY {i}/{len(MODEL_REGISTRY)}")
+        print(f"{'#'*90}")
+        
+        result = evaluate_single_policy(config, seed=seed)
+        
+        if result is not None:
+            all_results.append(result)
+            individual_csv = output_dir / f"eval_{config.name.lower().replace(' ', '_').replace('-', '_')}.csv"
+            pd.DataFrame([result]).to_csv(individual_csv, index=False)
+            print(f"  💾 Saved: {individual_csv}")
+    
+    if all_results:
+        combined_df = pd.DataFrame(all_results)
+        combined_df = combined_df.sort_values('avoidable_fraction')
+        
+        combined_csv = output_dir / "evaluation_summary_all_policies.csv"
+        combined_df.to_csv(combined_csv, index=False)
+        
+        print(f"\n{'='*90}")
+        print(f"  EVALUATION COMPLETE")
+        print(f"{'='*90}")
+        print(f"\n💾 Combined results: {combined_csv}")
+        
+        print(f"\n📊 COMPARISON TABLE:")
+        print(f"{'='*90}")
+        print(f"{'Model':<30} {'Oracle (kWh)':<15} {'Policy (kWh)':<15} {'Avoidable %':<15}")
+        print(f"{'-'*90}")
+        
+        for _, row in combined_df.iterrows():
+            print(f"{row['model_name']:<30} {row['oracle_deficit_kwh']:>10.2f}     "
+                  f"{row['policy_deficit_kwh']:>10.2f}     {row['avoidable_fraction']*100:>10.1f}%")
+        
+        print(f"{'='*90}")
+        
+        best = combined_df.iloc[0]
+        oracle_baseline = combined_df['oracle_deficit_kwh'].mean()
+        oracle_std = combined_df['oracle_deficit_kwh'].std()
+        
+        print(f"\n🎯 KEY INSIGHTS:")
+        print(f"  Physics minimum (Oracle):  ~{oracle_baseline:.1f} kWh (should be constant)")
+        print(f"  Best policy:               {best['model_name']} ({best['avoidable_fraction']*100:.1f}% avoidable)")
+        
+        if oracle_std > 1.0:
+            print(f"  ⚠️  WARNING: Oracle varies by {oracle_std:.2f} kWh (should be constant!)")
+        else:
+            print(f"  ✅ Oracle baseline consistent across policies")
+    
+    else:
+        print(f"\n❌ No successful evaluations")
+
+
+def main():
+    output_dir = Path("runs/evaluation_all_policies")
+    evaluate_all_policies(output_dir, seed=42)
+
+
+if __name__ == "__main__":
+    main()

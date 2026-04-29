@@ -1,0 +1,48 @@
+algo: PPOSaute
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+train_cfgs:
+  device: cuda:0
+  total_steps: 87590
+  vector_env_nums: 1
+  parallel: 1
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 40
+  batch_size: 256
+  target_kl: 0.02
+  kl_early_stop: true
+  entropy_coef: 0.005
+  obs_normalize: true
+  reward_normalize: false
+  cost_normalize: false
+  standardized_rew_adv: true
+  standardized_cost_adv: true
+  use_max_grad_norm: true
+  max_grad_norm: 0.5
+  use_cost: false
+  safety_budget: 400000.0
+  saute_gamma: 0.9999
+  unsafe_reward: -1.0
+  max_ep_len: 8759
+model_cfgs:
+  actor_type: gaussian_learning
+  actor:
+    hidden_sizes:
+    - 256
+    - 256
+    activation: tanh
+    lr: 0.0003
+  critic:
+    hidden_sizes:
+    - 256
+    - 256
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 10
+  log_dir: ./runs/benchmark_pposaute_smoke/5bld
+  window_lens: 1

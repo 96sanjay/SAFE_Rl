@@ -1,0 +1,41 @@
+
+# PPO-Lagrangian training config for Safe RL
+algo: PPOLag
+env_id: CityLearnSafety-SoC-v0
+
+train_cfgs:
+  total_steps: 875900
+  vector_env_nums: 1
+  parallel: 1
+  device: "cpu"
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 20
+  batch_size: 256
+  target_kl: 0.02
+  entropy_coef: 0.005
+  reward_normalize: true
+  cost_normalize: true
+  obs_normalize: true
+  gamma: 0.99
+  # Removed cg_damping and cg_iters as they caused KeyErrors
+
+model_cfgs:
+  actor:
+    lr: 0.00005
+    hidden_sizes: [256, 256]
+  critic:
+    lr: 0.0001
+    hidden_sizes: [256, 256]
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  log_dir: ./runs/ppo_lag_greedy_baseline
+
+lagrange_cfgs:
+  cost_limit: 102.43
+  lagrangian_multiplier_init: 10.0
+  lambda_lr: 0.035
+  lambda_optimizer: "Adam"

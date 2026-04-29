@@ -1,0 +1,88 @@
+# PPOLag + GradS v3: Balanced gradients + proper sampling
+#
+# Root cause analysis of v2 failure (50 epochs, StopIter=1 throughout):
+#   1. Cost advantages only mean-centered (reward was z-scored) → 9x gradient imbalance
+#   2. Lambda amplification (C3 hit cap at 50) → cost grad 350x larger than reward
+#   3. softmax(lambda/limit) sampling skewed by 700x limit variation (50 vs 35000)
+#
+# v3 fixes:
+#   1. zscore_cost_adv: true → full z-score for cost advantages (matches reward)
+#   2. normalize_cost_grad: true → cost grad rescaled to reward grad magnitude
+#   3. sampling: lambda → softmax(lambda_i) not softmax(lambda_i/limit_i)
+#   4. actor LR: 0.0005 → 0.0002 (more conservative with balanced gradients)
+#   5. max_grad_norm: 40 → 5.0 (tighter clipping now that grads are balanced)
+#   6. lagrangian_upper_bound: 50 → 10.0 (don't need extreme lambda with balanced grads)
+#   7. target_kl: 0.10 → 0.15 (slightly higher to allow >1 update per epoch)
+algo: PPOLagGradS
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 437950          # 50 epochs x 8759 steps/epoch
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 40
+  target_kl: 0.15              # CHANGED: was 0.10 (allow more updates per epoch)
+  kl_early_stop: true
+  batch_size: 256
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  standardized_cost_adv: true   # enables cost advantage standardization
+  entropy_coef: 0.005
+  max_grad_norm: 5.0            # CHANGED: was 40.0 (tighter clipping with balanced grads)
+
+lagrange_cfgs:
+  cost_limit: 999999                   # disabled (GradS uses per-constraint only)
+  lagrangian_multiplier_init: 1.0
+  lambda_lr: 0.0001
+  lambda_optimizer: SGD
+  lagrangian_upper_bound: 10.0         # CHANGED: was 50.0 (balanced grads need less lambda)
+
+# GradS-specific config
+grads_cfgs:
+  sim_threshold: 0.8
+  conflict_threshold: 0.5
+
+  # v3 NEW: z-score cost advantages (matches reward advantage normalization)
+  zscore_cost_adv: true
+
+  # v3 NEW: normalize cost gradient to reward gradient magnitude before combining
+  # DISABLED: z-scoring alone should fix the 9x imbalance. Enabling both
+  # may over-correct and collapse the cost signal (critic review finding).
+  # Enable only if z-scoring alone leaves gradient ratio >3x.
+  normalize_cost_grad: false
+
+  # v3 NEW: sampling strategy
+  # 'lambda' = softmax(lambda_i) — most-violated constraint dominates
+  # 'lambda_normalized' = softmax(lambda_i/limit_i) — v2 behavior (skewed by limit scale)
+  # 'uniform' = equal probability (paper's original approach)
+  sampling: lambda
+
+  # Per-constraint limits (same as v2 — achievable mins with 30-50% slack)
+  cost_limit_0: 50                    # C1:  EV departure (217% of min 23)
+  cost_limit_1: 300                   # C1d: EV dense (236% of min 127)
+  cost_limit_2: 35000                 # C2:  Battery SoC (172% of min 20353)
+  cost_limit_3: 35000                 # C3:  Building power (114% of min 30616, tightest)
+  cost_limit_4: 35000                 # C4:  Grid power (143% of min 24517)
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0002                         # CHANGED: was 0.0005 (more conservative)
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5
+  log_dir: ./runs/grads_v3/grads_5bld
+  window_lens: 1

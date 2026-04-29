@@ -1,0 +1,75 @@
+# PPOLag-Multi v2: Per-constraint Lagrange + softmax advantage selection
+#
+# v2 fixes: ALL cost limits set ABOVE R5a's achieved values (feasible targets).
+# v1 failed because C0 limit (500) was below R5a's achievable (2075), forcing
+# degenerate "always charge EVs" strategy. Actor LR lowered to fix StopIter=1.
+#
+# Per-constraint cost limits calibrated from R5a EVAL results:
+#   C0 (EV departure):    R5a=2075,  limit=2500  (+20% slack, maintain)
+#   C1 (EV dense):        R5a=1700,  limit=2000  (+18% slack, maintain)
+#   C2 (Battery SoC):     R5a=4459,  limit=6000  (+35% slack, maintain)
+#   C3 (Building power):  R5a=16782, limit=20000 (+19% slack, gentle improve)
+#   C4 (Grid power):      R5a=1589,  limit=3000  (+89% slack, generous)
+algo: PPOLagMulti
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 437950          # 50 epochs x 8759 steps/epoch
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 60             # Same as R5a (proven value)
+  target_kl: 0.10              # Same as R5a (proven value)
+  kl_early_stop: true
+  batch_size: 256              # Same as R5a
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  standardized_cost_adv: true  # Enables z-score for per-constraint advantages
+  entropy_coef: 0.005          # Same as R5a
+  max_grad_norm: 40.0          # Same as R5a default
+
+lagrange_cfgs:
+  cost_limit: 24400                       # Parent lambda (for logging, same as R5a)
+  lagrangian_multiplier_init: 1.0         # Conservative start (not 10.0)
+  lambda_lr: 0.035                        # With Adam: effective step ~0.035/epoch
+  lambda_optimizer: Adam                  # MUST be Adam (SGD causes lambda explosion
+                                          # because lr multiplies raw gradient of ~32000)
+  lagrangian_upper_bound: null            # NO CAP (let lambdas grow freely like R5a)
+
+# Multi-Lagrangian specific config
+multi_cfgs:
+  # Softmax temperature for per-timestep constraint selection
+  # tau=1.0: moderate focus on most-violated (good default)
+  # tau=0.1: near-hard-max (sharp focus, one constraint per timestep)
+  # tau=5.0: near-uniform (approaches raw sum, cancellation returns)
+  tau: 1.0
+
+  # Per-constraint cost limits — ALL above R5a's achieved values (feasible)
+  # Rule: limit >= R5a_value * 1.2 (no infeasible targets)
+  cost_limit_0: 2500           # C0: EV departure (R5a=2075, +20% slack)
+  cost_limit_1: 2000           # C1: EV dense (R5a=1700, +18% slack)
+  cost_limit_2: 6000           # C2: Battery SoC (R5a=4459, +35% slack)
+  cost_limit_3: 20000          # C3: Building power (R5a=16782, +19% slack)
+  cost_limit_4: 3000           # C4: Grid power (R5a=1589, +89% slack)
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0002                 # Lower than R5a (0.0005) to fix StopIter=1
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001                  # Same as R5a
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5
+  log_dir: ./runs/multi_lag_v2/5bld
+  window_lens: 1

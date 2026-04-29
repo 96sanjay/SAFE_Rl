@@ -1,0 +1,42 @@
+algo: STEMSSPRLAll4
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+schema_path: /home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork/data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json
+
+train_cfgs:
+  epochs: 10
+  steps_per_epoch: 1024
+  gamma: 0.99
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  penalty_weight: 1.0
+  bc_coef: 0.5
+  tau: 0.01
+  batch_size: 64
+  buffer_size: 200000
+  warmup_steps: 1024
+  update_iters: 8
+  policy_noise: 0.1
+  policy_noise_clip: 0.2
+  device: cuda
+  save_every: 1
+
+lagrange_cfgs:
+  cost_limit: 5.0
+  pid_kp: 0.1
+  pid_ki: 0.01
+  pid_kd: 0.0
+  penalty_max: 3.0
+  lagrangian_multiplier_init: 0.001
+
+encoder_cfgs:
+  temporal_window: 12
+  hidden_dim: 64
+  global_hidden: 32
+  temporal_hidden: 32
+  temporal_heads: 4
+  num_gcn_layers: 3
+  output_dim: 256
+  dropout: 0.1
+  actor_hidden_sizes: [128, 128]
+  critic_hidden_sizes: [128, 128]

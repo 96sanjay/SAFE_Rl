@@ -1,0 +1,47 @@
+# R28_CPO: CPO benchmark with same 9-term reward as R28b
+# =========================================================
+# CPO (Achiam et al. 2017) — second-order trust region,
+# single aggregate constraint via _rebalanced_cost().
+# Same env, rewards, and cost weights as R28b PPO-Lag.
+# =========================================================
+algo: CPO
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  device: cuda:0
+  total_steps: 875900                    # 100 epochs
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 1                        # CPO: single second-order update per epoch
+  target_kl: 0.01                        # CPO needs tighter KL (second-order)
+  kl_early_stop: true
+  batch_size: 256
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.005
+  max_grad_norm: 0.5
+  cost_limit: 100000                     # aggregate: ~10*C0 + 5*C3 + 5*C4
+
+model_cfgs:
+  actor_type: gaussian_learning
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0003
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 10
+  log_dir: ./runs/benchmark_cpo/5bld
+  window_lens: 1

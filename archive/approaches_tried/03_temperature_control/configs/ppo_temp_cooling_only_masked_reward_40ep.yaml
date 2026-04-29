@@ -1,0 +1,41 @@
+# Temperature case study: clean cooling-only shielded reward PPO, 40 epochs.
+
+algo: PPOTempMasked
+env_id: CityLearnTemp-CoolingOnly-Masked-Reward-v0
+seed: 42
+
+train_cfgs:
+  total_steps: 88280
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 2207
+  update_iters: 10
+  target_kl: 0.15
+  kl_early_stop: true
+  batch_size: 512
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.01
+  max_grad_norm: 40.0
+
+model_cfgs:
+  actor_type: gaussian_learning
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0001
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0003
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 1
+  log_dir: ./runs/ppo_temp_cooling_only_masked_reward_40ep
+  window_lens: 1

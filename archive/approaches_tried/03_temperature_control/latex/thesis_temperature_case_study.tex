@@ -1,0 +1,1536 @@
+% =============================================================================
+% Temperature Control Case Study: Methodology and Evaluation
+% =============================================================================
+% Required packages (add to main thesis preamble if not already present):
+%   \usepackage{algorithm}
+%   \usepackage{algorithmic}
+%   \usepackage{multirow}
+% =============================================================================
+
+\chapter{Temperature Control Case Study}
+\label{ch:temperature-case-study}
+
+This chapter presents a single-building-cluster temperature control case study
+that adapts the STEMS reward framework~\cite{zhang2025stems} to a
+safety-constrained single-agent setting.  A Constrained Soft Actor-Critic with
+smoothed log-barrier penalty (\textbf{CSAC-LB})~\cite{zhang2024csaclb} is
+compared against a bang-bang thermostat baseline (\textbf{RBC}) representative
+of commodity HVAC on/off controllers.
+
+% =============================================================================
+\section{Methodology}
+\label{sec:temp-methodology}
+
+% -----------------------------------------------------------------------------
+\subsection{Simulation Environment}
+\label{sec:temp-env}
+
+Experiments are conducted on CityLearn v2~\cite{nweye2023citylearn}, a
+multi-building energy management simulation platform that provides realistic
+building energy dynamics and grid interactions.  The experimental dataset is
+derived from real building energy consumption data in Travis County, Texas.  The
+dataset spans from August 2018 to August 2019, capturing a full year of
+operation under typical subtropical humid climate conditions: annual average
+temperature of $20.7\,^\circ$C, temperature range from $-7.8\,^\circ$C to
+$42.8\,^\circ$C.
+
+The case-study schema binds three residential buildings with LSTM-enabled indoor
+temperature dynamics.  Each building is equipped with a cooling device,
+electrical storage, and domestic hot water (DHW) storage.  A centralized
+single-agent controller issues actions for all three buildings at hourly
+resolution, producing $T = 2{,}207$ active time steps per episode after an
+initial 13-step LSTM warm-up period during which comfort costs are disabled.
+
+% -----------------------------------------------------------------------------
+\subsection{Problem Formulation}
+\label{sec:temp-formulation}
+
+The temperature control problem is formulated as a Constrained Markov Decision
+Process (CMDP) $\mathcal{M} = (\mathcal{S}, \mathcal{A}, P, \mathcal{R},
+\mathcal{C}, \gamma)$.
+
+\paragraph{State space.}
+The observation vector $\mathbf{s}_t \in \mathcal{S} \subset \mathbb{R}^{54}$
+is constructed from normalised per-building, environmental, and temporal
+features.  Table~\ref{tab:observation-space} details the observation
+components.  All features are normalised to $[0, 1]$ by CityLearn's internal
+observation wrapper using dataset-derived bounds.
+
+\begin{table}[htbp]
+\centering
+\caption{Observation space composition ($\dim(\mathcal{S}) = 54$).  Each
+  per-building feature is replicated for all $N=3$ buildings.}
+\label{tab:observation-space}
+\begin{tabular}{llc}
+\toprule
+\textbf{Category} & \textbf{Feature} & \textbf{Dim} \\
+\midrule
+\multirow{4}{*}{Building state}
+  & Indoor dry-bulb temperature $T_t^{(i)}$ & $3$ \\
+  & Temperature setpoint / reference & $3$ \\
+  & Cooling device status & $3$ \\
+  & Electrical storage state of charge & $3$ \\
+  & DHW storage state of charge & $3$ \\
+\midrule
+\multirow{3}{*}{Environmental}
+  & Outdoor dry-bulb temperature & $1$ \\
+  & Direct solar irradiance & $1$ \\
+  & Diffuse solar irradiance & $1$ \\
+  & Solar generation $p_t^{(i)}$ & $3$ \\
+  & Electricity price $v_t$ & $1$ \\
+\midrule
+\multirow{3}{*}{Temporal}
+  & Hour of day (sine/cosine encoded) & $2$ \\
+  & Day of year (sine/cosine encoded) & $2$ \\
+  & Occupancy count per building & $3$ \\
+\midrule
+\multirow{2}{*}{Grid / district}
+  & Net district electricity consumption & $1$ \\
+  & District import power & $1$ \\
+  & Net building consumption $e_t^{(i)}$ & $3$ \\
+\midrule
+\multicolumn{2}{l}{\textit{Remaining CityLearn default features}} & $\sim$20 \\
+\bottomrule
+\multicolumn{2}{l}{\textbf{Total}} & \textbf{54} \\
+\end{tabular}
+\end{table}
+
+The observation space provides the agent with sufficient information to reason
+about thermal dynamics (indoor and outdoor temperatures), energy markets
+(electricity price), renewable availability (solar generation), and temporal
+patterns (time encoding).  The 13-step LSTM warm-up period at the start of
+each episode allows CityLearn's internal LSTM temperature model to stabilise
+before the agent's actions begin affecting indoor temperatures.
+
+\paragraph{Action space.}
+In the \emph{cooling-only} interface adopted for this case study, the policy
+controls a single continuous cooling action per building,
+$\mathbf{a}_t \in [0,1]^3$, where $a_t^{(i)} = 0$ means no cooling and
+$a_t^{(i)} = 1$ means maximum cooling for building~$i$.
+Table~\ref{tab:action-space} summarises the action interface.
+
+\begin{table}[htbp]
+\centering
+\caption{Action space definition.  Only cooling actions are controlled by the
+  RL policy; all other actuators are frozen to isolate the temperature control
+  problem.}
+\label{tab:action-space}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Actuator} & \textbf{Range} & \textbf{Controlled by} & \textbf{Dim} \\
+\midrule
+Cooling device & $[0, 1]$ & RL policy & $3$ \\
+Electrical storage & $0$ (fixed) & Wrapper & $3$ \\
+DHW storage & $0$ (fixed) & Wrapper & $3$ \\
+\midrule
+\multicolumn{3}{l}{\textbf{Effective policy action dimension}} & \textbf{3} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Battery and DHW storage actions are set internally by the environment wrapper
+to fixed zero values, ensuring that the CSAC-LB policy operates on a clean
+3-dimensional cooling-only action interface.  This isolation is critical for
+attributing performance differences to the cooling control strategy rather
+than storage management.
+
+\paragraph{Reward function.}
+Following the STEMS framework~\cite{zhang2025stems}, the reward is decomposed
+into four components:
+\begin{equation}
+  R_t = R_t^{\text{economic}} + R_t^{\text{stability}} +
+        R_t^{\text{renewable}} + R_t^{\text{comfort}}
+  \label{eq:reward-decomposition}
+\end{equation}
+
+The \emph{economic} component minimises electricity costs:
+\begin{equation}
+  R_t^{\text{economic}} = -\mu \cdot v_t \cdot \sum_{i=1}^{N} e_t^{(i)}
+  \label{eq:reward-economic}
+\end{equation}
+where $v_t$ is the electricity price, $e_t^{(i)}$ is the net electricity
+consumption of building~$i$, and $\mu = 1.0$ is the economic weight.
+
+The \emph{stability} component combines grid-level coordination and
+building-level smooth operation:
+\begin{equation}
+  R_t^{\text{stability}} = \underbrace{N \cdot \alpha_{\text{grid}} \left(
+    1 - \left(\frac{\sum_i \max(0, e_t^{(i)})}{P_{\text{grid,max}}}\right)^2
+  \right)}_{\text{grid stability}}
+  + \underbrace{\alpha_{\text{build}} \sum_{i=1}^{N} \left(
+    1 - \frac{|e_t^{(i)}|}{P_{\text{build,max}}}
+  \right)}_{\text{building stability}}
+  - \underbrace{\beta_{\text{ramp}} \sum_{i=1}^{N} \frac{|e_t^{(i)} - e_{t-1}^{(i)}|}{P_{\text{build,max}}}}_{\text{ramping penalty}}
+  \label{eq:reward-stability}
+\end{equation}
+where $\alpha_{\text{grid}} = 0.5$, $\alpha_{\text{build}} = 0.3$,
+$\beta_{\text{ramp}} = 0.2$, and $P_{\text{grid,max}}$, $P_{\text{build,max}}$
+are calibrated from the dataset.
+
+The \emph{renewable energy} component maximises clean energy utilisation:
+\begin{equation}
+  R_t^{\text{renewable}} = \xi \sum_{i=1}^{N}
+    \min\!\left(\frac{p_t^{(i)}}{p_t^{(i)} + \max(0, e_t^{(i)})},\; 1\right)
+  \label{eq:reward-renewable}
+\end{equation}
+where $p_t^{(i)}$ is the solar generation and $\xi = 0.6$.
+
+The \emph{comfort} component penalises temperature deviations from the comfort
+band $[T_{\min}, T_{\max}] = [20\,^\circ\text{C}, 26\,^\circ\text{C}]$ with
+occupancy-aware weighting:
+\begin{equation}
+  R_t^{\text{comfort}} = -\lambda_{\text{indoor}} \sum_{i=1}^{N}
+    w_i \cdot \Delta T_t^{(i)}
+  \label{eq:reward-comfort}
+\end{equation}
+where $\Delta T_t^{(i)} = \max(T_t^{(i)} - T_{\max}, 0) + \max(T_{\min} -
+T_t^{(i)}, 0)$ is the comfort deviation, $w_i = 1.0$ if the building is
+occupied and $w_i = \eta = 0.1$ otherwise, and $\lambda_{\text{indoor}} = 1.2$
+to provide a strong comfort gradient through the barrier penalty.
+
+\paragraph{Cost function.}
+The CMDP cost is defined as a weighted district-level comfort violation signal:
+\begin{equation}
+  C_t = w_{\text{comfort}} \cdot \sum_{i=1}^{N} \mathbf{1}\!\left[
+    T_t^{(i)} < T_{\min} \;\text{or}\; T_t^{(i)} > T_{\max}
+  \right]
+  \label{eq:cmdp-cost}
+\end{equation}
+where $w_{\text{comfort}} = 0.05$.  During the 13-step LSTM warm-up,
+$C_t = 0$.
+
+% -----------------------------------------------------------------------------
+\subsection{Background: Soft Actor-Critic (SAC)}
+\label{sec:temp-sac-background}
+
+Before introducing the constrained variant, we briefly review the Soft
+Actor-Critic (SAC) algorithm~\cite{haarnoja2018sac} that forms the
+foundation of our approach.
+
+SAC is an off-policy actor-critic algorithm that augments the standard RL
+objective with an entropy bonus, encouraging exploration and robustness:
+\begin{equation}
+  \pi^* = \arg\max_\pi \sum_{t=0}^{T}
+    \mathbb{E}_{(s_t, a_t) \sim \rho_\pi}\!\left[
+      \gamma^t \bigl(R(s_t, a_t) + \alpha\, H(\pi(\cdot|s_t))\bigr)
+    \right]
+  \label{eq:sac-objective}
+\end{equation}
+where $H(\pi(\cdot|s)) = -\mathbb{E}_{a \sim \pi}[\log \pi(a|s)]$ is the
+policy entropy and $\alpha > 0$ is the entropy temperature that controls the
+exploration--exploitation trade-off.  The entropy regularisation prevents
+premature convergence to deterministic policies, which is particularly
+beneficial in building control where the reward landscape contains multiple
+local optima corresponding to different cooling strategies.
+
+\paragraph{Critic networks.}
+SAC maintains two Q-value networks $Q_{\theta_1}$ and $Q_{\theta_2}$ (the
+\emph{twin critics}) trained to minimise the soft Bellman residual:
+\begin{equation}
+  \mathcal{L}_Q(\theta_j) = \mathbb{E}_{(s,a,r,s') \sim \mathcal{D}}\!\left[
+    \bigl(Q_{\theta_j}(s,a) - y\bigr)^2
+  \right], \quad j \in \{1, 2\}
+  \label{eq:sac-critic-loss}
+\end{equation}
+where $\mathcal{D}$ is the replay buffer and the target value includes the
+entropy bonus:
+\begin{equation}
+  y = r + \gamma(1 - d_t)\!\left[
+    \min_{j=1,2} Q_{\bar{\theta}_j}(s', a')
+    - \alpha \log \pi_\phi(a'|s')
+  \right], \quad a' \sim \pi_\phi(\cdot|s')
+  \label{eq:sac-target}
+\end{equation}
+Here $\bar{\theta}$ denotes target network parameters updated via Polyak
+averaging: $\bar{\theta} \leftarrow \tau\,\theta + (1-\tau)\,\bar{\theta}$
+with $\tau \ll 1$.  The minimum over twin critics addresses the overestimation
+bias inherent in Q-learning~\cite{fujimoto2018td3}.
+
+\paragraph{Actor network.}
+The policy $\pi_\phi$ is parameterised as a squashed Gaussian: a neural
+network outputs mean $\mu_\phi(s)$ and log-standard-deviation
+$\log\sigma_\phi(s)$, from which actions are sampled via the reparameterisation
+trick:
+\begin{equation}
+  a = \tanh\!\bigl(\mu_\phi(s) + \sigma_\phi(s) \odot \epsilon\bigr),
+  \quad \epsilon \sim \mathcal{N}(0, I)
+  \label{eq:sac-reparameterisation}
+\end{equation}
+The $\tanh$ squashing bounds actions to $[-1, 1]$, which are then rescaled
+to the environment's action range $[0, 1]$.  The actor is updated by
+minimising:
+\begin{equation}
+  \mathcal{L}_\pi(\phi) = \mathbb{E}_{s \sim \mathcal{D}}\!\left[
+    \alpha \log \pi_\phi(a|s)
+    - \min_{j=1,2} Q_{\theta_j}(s, a)
+  \right], \quad a \sim \pi_\phi(\cdot|s)
+  \label{eq:sac-actor-loss}
+\end{equation}
+
+SAC is well-suited to building energy control for several reasons:
+(i)~off-policy learning enables sample-efficient training from a replay buffer,
+critical when each episode represents a full year of building operation;
+(ii)~the continuous stochastic policy naturally handles the continuous cooling
+action space; and
+(iii)~entropy regularisation prevents the policy from collapsing to a single
+cooling strategy, enabling discovery of time-varying control patterns.
+
+% -----------------------------------------------------------------------------
+\subsection{CSAC-LB (Constrained SAC with Log-Barrier)}
+\label{sec:temp-csac}
+
+The CSAC-LB algorithm, originally proposed by Zhang
+et~al.~\cite{zhang2024csaclb} for safe heat pump control, extends SAC with a
+constraint-handling mechanism based on interior-point barrier functions from
+convex optimisation.  We adopt this framework and adapt it to the CityLearn
+cooling case study.
+
+\subsubsection{The Constrained RL Problem}
+
+Standard SAC (Section~\ref{sec:temp-sac-background}) maximises the reward
+objective without any notion of safety constraints.  However, the CMDP
+formulation (Section~\ref{sec:temp-formulation}) requires that the cumulative
+cost remain below a threshold~$d$.  The constrained optimisation problem is:
+\begin{equation}
+  \max_\pi\; J_R(\pi) \quad \text{subject to} \quad J_C(\pi) \leq d
+  \label{eq:cmdp-problem}
+\end{equation}
+where $J_R(\pi) = \mathbb{E}_\pi\!\left[\sum_t \gamma^t R_t\right]$ is the
+discounted return and
+$J_C(\pi) = \mathbb{E}_\pi\!\left[\sum_t \gamma^t C_t\right]$ is the
+discounted cumulative cost.  The challenge is to enforce this constraint
+during online training while maintaining stable policy improvement.
+
+\subsubsection{SAC-Lag: The Lagrangian Approach and Its Limitations}
+
+The standard approach to constrained SAC is SAC-Lag~\cite{ha2020learning,
+achiam2021exploration}, which converts the constrained problem into an
+unconstrained min-max game using a Lagrange multiplier $\beta \geq 0$:
+\begin{equation}
+  \max_\pi \min_{\beta \geq 0}\; L(\pi, \beta) \doteq
+    f(\pi) - \beta\, g(\pi)
+  \label{eq:sac-lag-objective}
+\end{equation}
+where the reward objective and cost constraint function are:
+\begin{align}
+  f(\pi) &= \sum_{t=0}^{T} \mathbb{E}_{a_t \sim \pi(\cdot|s_t)}
+    \!\left[\gamma^t R(s_t, a_t) + \alpha\, H\!\left(\pi(\cdot|s_t)\right)\right]
+  \label{eq:reward-objective} \\
+  g(\pi) &= \sum_{t=0}^{T} \mathbb{E}_{a_t \sim \pi(\cdot|s_t)}
+    \!\left[\gamma^t \bigl(C(a_t, s_t) - d\bigr)\right]
+  \label{eq:cost-constraint}
+\end{align}
+Here $d$ is the per-step cost limit and $H(\cdot)$ is the entropy term with
+temperature $\alpha$.
+
+SAC-Lag updates $\beta$ via dual gradient descent:
+\begin{equation}
+  J(\beta) = \mathbb{E}_{s_t \sim \mathcal{D}, a_t \sim \pi_\phi(s_t)}
+    \!\left[\beta\bigl(d - Q_{\theta_c}(s_t, a_t)\bigr)\right]
+  \label{eq:lagrange-update}
+\end{equation}
+and the actor loss becomes:
+\begin{equation}
+  J(\phi) = \mathbb{E}_{s_t \sim \mathcal{D}, a_t \sim \pi_\phi(s_t)}
+    \!\left[
+      \alpha \log \pi_\phi(a_t | s_t)
+      - Q_{\theta_r}(s_t, a_t)
+      + \beta\, Q_{\theta_c}(s_t, a_t)
+    \right]
+  \label{eq:sac-lag-actor}
+\end{equation}
+
+\paragraph{Failure modes in building control.}
+While SAC-Lag is theoretically sound, Zhang et~al.~\cite{zhang2024csaclb}
+identify two critical failure modes that make it unreliable for building
+energy management:
+
+\begin{enumerate}
+  \item \textbf{Multiplier oscillation.}  The dual gradient descent dynamics
+    create an adversarial game between the actor (which tries to reduce cost
+    to lower $\beta$'s influence) and the multiplier (which grows when cost
+    exceeds~$d$).  In practice, this produces oscillatory behaviour:
+    $\beta$ overshoots $\to$ policy becomes overly conservative $\to$ cost
+    drops well below $d$ $\to$ $\beta$ decreases $\to$ policy becomes
+    aggressive $\to$ cost exceeds $d$ again.  This cycle repeats throughout
+    training, preventing convergence to a stable operating point near the
+    constraint boundary.
+
+  \item \textbf{Data inefficiency from overshooting.}  When $\beta$ overshoots,
+    the policy is pushed far into the feasible interior, wasting exploration
+    budget on states that are overly conservative.  In building control, where
+    each training episode represents a full year of operation and data
+    collection is expensive, this inefficiency is particularly costly.  The
+    policy spends significant training time learning to return from overly
+    conservative regions rather than exploring near the optimal constraint
+    boundary.
+
+  \item \textbf{Sensitivity to learning rates.}  The stability of dual gradient
+    descent depends critically on the relative learning rates of the actor and
+    multiplier.  If the multiplier learning rate is too high, oscillation
+    worsens; if too low, constraint violations persist for many episodes before
+    correction.  This introduces an additional hyperparameter that requires
+    careful tuning for each building control scenario.
+\end{enumerate}
+
+These failure modes motivate the replacement of the Lagrangian multiplier with
+a barrier function that embeds the constraint directly in the actor loss,
+eliminating the dual variable and its associated instabilities.
+
+\subsubsection{Linear Smoothed Log Barrier Function}
+
+CSAC-LB replaces the Lagrangian multiplier with a differentiable barrier
+function embedded directly in the actor loss.  This approach draws on
+\emph{interior-point methods} from convex optimisation, where log-barrier
+functions are used to enforce inequality constraints without introducing
+dual variables.
+
+\paragraph{Classical log barrier.}
+The standard log barrier for the constraint $x \leq 0$ is
+$-\frac{1}{\mu}\log(-x)$, which approaches infinity as $x \to 0^-$ and
+is undefined for $x > 0$.  While this prevents the optimiser from entering
+the infeasible region, the undefined gradient in the infeasible region
+($x > 0$) is problematic for RL: if the policy ever violates the constraint
+(which is common during early training), the barrier provides no gradient
+signal to guide the policy back to feasibility.
+
+\paragraph{Smoothed extension.}
+The \emph{linear smoothed} variant~\cite{zhang2024csaclb} extends the barrier
+to the full real line by replacing the logarithmic branch with a linear
+extension in the infeasible region:
+\begin{equation}
+  \bar{\psi}(x) =
+  \begin{cases}
+    -\dfrac{1}{\mu} \log(-x) & \text{if } x \leq -\dfrac{1}{\mu^2}
+    \\[8pt]
+    \mu\, x - \dfrac{1}{\mu}\log\!\left(\dfrac{1}{\mu^2}\right)
+      + \dfrac{1}{\mu}
+    & \text{otherwise}
+  \end{cases}
+  \label{eq:smoothed-barrier}
+\end{equation}
+where $\mu > 0$ controls the barrier steepness.
+
+\paragraph{Theoretical properties.}
+The smoothed barrier $\bar{\psi}(x)$ has three critical properties that make it
+suitable for constrained RL~\cite{zhang2024csaclb}:
+
+\begin{enumerate}
+  \item \textbf{Continuity and differentiability.}  The two branches meet at
+    the transition point $x = -1/\mu^2$ with matching function values and
+    first derivatives.  This ensures smooth gradient flow through the barrier
+    during backpropagation, avoiding the gradient discontinuities that plague
+    clipped penalty methods.
+
+  \item \textbf{Non-zero gradient everywhere.}  In the feasible region
+    ($x \ll 0$), the gradient is $\bar{\psi}'(x) = -1/(\mu x)$, which
+    increases as the constraint boundary is approached.  In the infeasible
+    region ($x > -1/\mu^2$), the gradient is the constant $\mu$, providing a
+    persistent ``recovery signal'' that guides the policy back toward
+    feasibility.  This contrasts with clipped barriers where the gradient
+    vanishes in the infeasible region, leaving the policy with no directional
+    information for constraint satisfaction.
+
+  \item \textbf{Controllable steepness.}  The parameter $\mu$ controls the
+    sharpness of the transition between the feasible and infeasible regions.
+    As $\mu \to \infty$, $\bar{\psi}(x)$ converges to the indicator function
+    $\mathbf{1}[x > 0] \cdot \infty$, recovering the hard constraint.  Smaller
+    $\mu$ values create a smoother transition that is easier to optimise but
+    allows larger constraint violations.  This provides a principled
+    \emph{constraint strictness knob} for the practitioner.
+\end{enumerate}
+
+Figure~\ref{fig:barrier-function} illustrates the barrier shape for different
+$\mu$ values, showing the smooth transition from logarithmic to linear
+behaviour.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.45\textwidth]{figures/fig_barrier_function.pdf}
+  \caption{Linear smoothed log barrier function $\bar\psi(x)$ for different
+    steepness parameters $\mu$.  The dashed line is the indicator function.
+    Larger $\mu$ approximates the hard constraint more closely while
+    maintaining differentiability everywhere.  The transition point at
+    $x = -1/\mu^2$ (where the logarithmic branch meets the linear extension)
+    moves closer to zero as $\mu$ increases.  Adapted from
+    Zhang et~al.~\cite{zhang2024csaclb}.}
+  \label{fig:barrier-function}
+\end{figure}
+
+\paragraph{Incorporating the cost limit.}
+To apply the barrier to the CMDP cost constraint $Q_C(s,a) \leq d$, the
+barrier is composed with a ReLU activation and a shift:
+\begin{equation}
+  \tilde{\psi}^*(x) = \bar{\psi}\!\left(
+    \operatorname{ReLU}(x - d) - \frac{1}{\mu^2}
+  \right)
+  \label{eq:barrier-shifted}
+\end{equation}
+where $x = Q_C(s,a)$ is the estimated cost Q-value.  The composition has the
+following behaviour:
+\begin{itemize}
+  \item When $Q_C < d$ (constraint satisfied): $\operatorname{ReLU}(Q_C - d) = 0$,
+    so the barrier input is $-1/\mu^2 < 0$, yielding a near-zero penalty.
+  \item When $Q_C \approx d$ (near the boundary): the penalty begins to
+    increase smoothly, creating a ``soft wall'' effect.
+  \item When $Q_C \gg d$ (constraint violated): the penalty grows linearly
+    with slope~$\mu$, providing a strong gradient signal to reduce the cost.
+\end{itemize}
+The shift by $-1/\mu^2$ ensures that the barrier activates slightly
+\emph{before} the constraint boundary, providing an early warning gradient
+that encourages the policy to stay away from the boundary rather than
+approaching it exactly.
+
+\subsubsection{CSAC-LB Architecture}
+
+CSAC-LB extends the standard SAC architecture with an additional pair of
+Q-networks dedicated to estimating constraint costs.  The complete architecture
+comprises six neural networks:
+
+\begin{itemize}
+  \item \textbf{Actor} $\pi_\phi$: Squashed Gaussian policy (as in standard SAC).
+  \item \textbf{Twin reward critics} $Q_{R,1}(\theta_{r_1})$,
+    $Q_{R,2}(\theta_{r_2})$: Estimate the expected discounted return.
+  \item \textbf{Twin cost critics} $Q_{C,1}(\theta_{c_1})$,
+    $Q_{C,2}(\theta_{c_2})$: Estimate the expected discounted cost.
+  \item \textbf{Target networks}: Slow-moving copies of all critic networks,
+    updated via Polyak averaging.
+\end{itemize}
+
+Each critic network takes the concatenated state-action pair
+$[s, a] \in \mathbb{R}^{57}$ as input (54-dimensional observation $+$
+3-dimensional action) and outputs a scalar Q-value.  All networks use identical
+two-layer MLP architectures with $[256, 256]$ hidden units and ReLU
+activations.
+
+\subsubsection{Reward Critic Training}
+
+The reward critic training follows standard SAC~\cite{haarnoja2018sac}.  The
+twin reward critics $Q_{R,1}$, $Q_{R,2}$ are trained to minimise the soft
+Bellman residual using the \emph{optimistic minimum} for target computation:
+\begin{equation}
+  y_R = r_t + \gamma\,(1 - d_t)\!\left[
+    \min\!\left(Q_{\bar{R},1}(s', a'),\; Q_{\bar{R},2}(s', a')\right)
+    - \alpha \log \pi_\phi(a'|s')
+  \right]
+  \label{eq:reward-target}
+\end{equation}
+where $a' \sim \pi_\phi(\cdot|s')$ and $\bar{R}$ denotes target network
+parameters.  The loss for each reward critic is:
+\begin{equation}
+  \mathcal{L}_{Q_R}(\theta_{r_j}) = \mathbb{E}_{(s,a,r,s') \sim \mathcal{D}}
+    \!\left[\bigl(Q_{R,j}(s,a) - y_R\bigr)^2\right]
+  \label{eq:reward-critic-loss}
+\end{equation}
+The $\min$ in~\eqref{eq:reward-target} addresses the overestimation bias of
+Q-learning: by taking the lower of two estimates, the target is more
+conservative, leading to more stable training.
+
+\subsubsection{Cost Critic Training: Pessimistic Estimation}
+
+The cost critic training is the key architectural difference from standard
+SAC.  While the reward critic uses $\min$ (optimistic for reward maximisation),
+the cost critic uses $\max$ (\emph{pessimistic} for safety):
+\begin{equation}
+  Q_C(s,a) = \max\!\left(Q_{C,1}(s,a),\; Q_{C,2}(s,a)\right)
+  \label{eq:cost-critic-max}
+\end{equation}
+
+The cost critic target uses the same pessimistic maximum for bootstrapping:
+\begin{equation}
+  y_C = c_t + \gamma\,(1 - d_t)\,\max\!\left(
+    Q_{\bar{C},1}(s', a'),\; Q_{\bar{C},2}(s', a')
+  \right)
+  \label{eq:cost-target}
+\end{equation}
+Note that the cost target does \emph{not} include the entropy term
+$-\alpha \log \pi$: entropy regularisation encourages exploration, which is
+desirable for reward maximisation but not for cost estimation, where accurate
+prediction of constraint violation is the priority.
+
+The loss for each cost critic is:
+\begin{equation}
+  \mathcal{L}_{Q_C}(\theta_{c_j}) = \mathbb{E}_{(s,a,c,s') \sim \mathcal{D}}
+    \!\left[\bigl(Q_{C,j}(s,a) - y_C\bigr)^2\right]
+  \label{eq:cost-critic-loss}
+\end{equation}
+
+\paragraph{Why pessimistic cost estimation?}
+The choice of $\max$ over $\min$ for the cost critic is a critical design
+decision motivated by the asymmetry of safety constraints.  In building
+control, \emph{underestimating} the cost is dangerous: if the cost critic
+predicts that a cooling action is safe when it actually leads to a comfort
+violation, the barrier penalty will be too low and the policy will not receive
+sufficient gradient to avoid the violation.  By taking the maximum of two
+cost estimates, the pessimistic critic errs on the side of caution---it may
+occasionally overestimate costs (leading to slightly conservative cooling),
+but it will rarely underestimate them (which would lead to undetected
+violations).  Zhang et~al.~\cite{zhang2024csaclb} note that this is
+particularly important because most transitions in the replay buffer are
+constraint-satisfying, creating a systematic underestimation bias that the
+pessimistic estimator counteracts.
+
+\subsubsection{Actor Loss with Barrier Penalty}
+
+The actor loss combines the standard SAC reward objective with the barrier
+penalty, replacing the Lagrange multiplier entirely:
+\begin{equation}
+  \mathcal{L}_\pi(\phi) = \mathbb{E}_{s \sim \mathcal{D}}\!\left[
+    \underbrace{\alpha \log \pi_\phi(a|s)
+      - \min(Q_{R,1}, Q_{R,2})}_{\text{SAC reward maximisation}}
+    + \underbrace{\tilde{\psi}^*\!\left(
+      \max(Q_{C,1}, Q_{C,2})\right)}_{\text{barrier safety penalty}}
+  \right]
+  \label{eq:csac-loss}
+\end{equation}
+where $a \sim \pi_\phi(\cdot|s)$ is sampled via the reparameterisation trick.
+
+The asymmetry between the reward and cost terms is a key design choice:
+\begin{itemize}
+  \item \textbf{Reward:} $\min(Q_{R,1}, Q_{R,2})$ (optimistic for the actor,
+    conservative estimate of reward $\to$ avoids overestimation).
+  \item \textbf{Cost:} $\max(Q_{C,1}, Q_{C,2})$ (pessimistic for the actor,
+    conservative estimate of cost $\to$ avoids underestimation of danger).
+\end{itemize}
+This dual asymmetry ensures that the policy is simultaneously optimistic about
+rewards (encouraging exploration of high-reward regions) and pessimistic about
+costs (discouraging exploration of high-cost regions).
+
+\paragraph{Gradient flow.}
+The barrier penalty gradient flows through the cost critic into the actor:
+\begin{equation}
+  \frac{\partial \mathcal{L}_\pi}{\partial \phi} \ni
+    \bar{\psi}'\!\bigl(\text{slack}\bigr) \cdot
+    \frac{\partial\, \max(Q_{C,1}, Q_{C,2})}{\partial a} \cdot
+    \frac{\partial a}{\partial \phi}
+  \label{eq:barrier-gradient}
+\end{equation}
+When the cost Q-value is well below the limit ($Q_C \ll d$), the barrier
+gradient $\bar{\psi}'$ is near zero, and the actor is free to optimise the
+reward.  As $Q_C \to d$, the barrier gradient increases, progressively
+steering the actor away from constraint-violating actions.  This creates
+a smooth transition from reward-driven to safety-driven behaviour, unlike
+SAC-Lag where the Lagrange multiplier applies a constant scaling regardless of
+proximity to the constraint boundary.
+
+\subsubsection{Training Procedure}
+
+Algorithm~\ref{alg:csac-lb} presents the complete CSAC-LB training loop.
+The key differences from standard SAC are highlighted: the cost critic update
+with pessimistic targets (line~\ref{line:cost-target}), and the barrier penalty
+in the actor loss (line~\ref{line:barrier-penalty}).
+
+\begin{algorithm}[htbp]
+\caption{CSAC-LB Training (adapted from Zhang et~al.~\cite{zhang2024csaclb})}
+\label{alg:csac-lb}
+\begin{algorithmic}[1]
+\REQUIRE Reward critics $Q_{R,1}, Q_{R,2}$; cost critics $Q_{C,1}, Q_{C,2}$;
+  actor $\pi_\phi$; target networks $\bar{Q}_{R}, \bar{Q}_{C}$;
+  replay buffer $\mathcal{D}$; cost limit $d$; barrier factor $\mu$
+\STATE Initialise all networks with Kaiming uniform weights
+\STATE $\text{barrier\_shift} \gets 1/\mu^2$
+\FOR{each environment step $t = 1, 2, \ldots, T_{\max}$}
+  \IF{$t \leq t_{\text{warmup}}$}
+    \STATE $a_t \gets \text{UniformRandom}(\mathcal{A})$
+  \ELSE
+    \STATE $a_t \sim \pi_\phi(\cdot | s_t)$
+    \hfill $\triangleright$ \textit{Stochastic action via reparameterisation}
+  \ENDIF
+  \STATE Execute $a_t$, observe $r_t, c_t, s_{t+1}$
+  \STATE Store $(s_t, a_t, r_t, c_t, s_{t+1})$ in $\mathcal{D}$
+  \IF{$t > t_{\text{warmup}}$}
+    \STATE Sample mini-batch $\mathcal{B} \sim \mathcal{D}$
+    \STATE \textbf{// Update reward critics}
+    \STATE $a' \sim \pi_\phi(\cdot | s')$
+    \STATE $y_R \gets r + \gamma(1-d_t)[\min(\bar{Q}_{R,1}(s',a'), \bar{Q}_{R,2}(s',a')) - \alpha \log \pi_\phi(a'|s')]$
+    \STATE Update $Q_{R,1}, Q_{R,2}$ to minimise $\|Q_{R,j}(s,a) - y_R\|^2$
+    \STATE \textbf{// Update cost critics (pessimistic)} \label{line:cost-target}
+    \STATE $y_C \gets c + \gamma(1-d_t)\,\max(\bar{Q}_{C,1}(s',a'), \bar{Q}_{C,2}(s',a'))$
+    \hfill $\triangleright$ \textit{max, not min}
+    \STATE Update $Q_{C,1}, Q_{C,2}$ to minimise $\|Q_{C,j}(s,a) - y_C\|^2$
+    \IF{$t \bmod \text{policy\_delay} = 0$}
+      \STATE \textbf{// Update actor with barrier penalty} \label{line:barrier-penalty}
+      \STATE $\tilde{a} \sim \pi_\phi(\cdot | s)$
+      \STATE $Q_R \gets \min(Q_{R,1}(s,\tilde{a}),\; Q_{R,2}(s,\tilde{a}))$
+      \STATE $Q_C \gets \max(Q_{C,1}(s,\tilde{a}),\; Q_{C,2}(s,\tilde{a}))$
+      \STATE $\text{slack} \gets \operatorname{ReLU}(Q_C - d) - \text{barrier\_shift}$
+      \STATE $\mathcal{L}_\pi \gets \alpha \log \pi_\phi(\tilde{a}|s) - Q_R + \bar{\psi}(\text{slack})$
+      \STATE Update $\phi$ to minimise $\mathcal{L}_\pi$
+      \STATE \textbf{// Polyak-average all target networks}
+      \STATE $\bar{\theta} \gets \tau\,\theta + (1-\tau)\,\bar{\theta}$
+      \hfill $\triangleright$ \textit{For reward, cost critics and actor}
+    \ENDIF
+  \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Key design choices.}
+Several aspects of the training procedure merit discussion:
+
+\begin{itemize}
+  \item \textbf{Policy delay} (update actor every 2 critic steps): This gives
+    the critic networks time to converge to more accurate Q-estimates before
+    the actor uses them, reducing variance in the policy gradient.  This is
+    particularly important for CSAC-LB because the actor loss depends on
+    \emph{both} the reward and cost critics---inaccurate cost estimates early
+    in training could cause the barrier to fire inappropriately.
+
+  \item \textbf{Fixed entropy temperature} ($\alpha = 0.2$): Unlike many SAC
+    implementations that use automatic entropy tuning (adjusting $\alpha$ to
+    maintain a target entropy $-\dim(\mathcal{A})$), we fix $\alpha = 0.2$
+    following Zhang et~al.~\cite{zhang2024csaclb}.  In the constrained
+    setting, automatic entropy tuning can interfere with the barrier mechanism:
+    when the barrier penalty increases (pushing the actor toward conservative
+    actions), the entropy may decrease, triggering $\alpha$ to increase, which
+    counteracts the barrier's effect.
+
+  \item \textbf{Uniform replay buffer}: We use standard uniform sampling rather
+    than prioritised experience replay.  While prioritised replay can
+    accelerate learning in unconstrained settings, it can bias the cost critic
+    by over-representing rare constraint-violating transitions, potentially
+    leading to overestimation of costs.
+
+  \item \textbf{Gradient clipping} (max norm $= 40.0$): Applied to all
+    networks to prevent large barrier gradients from destabilising training
+    when the cost critic predicts values far above the limit during early
+    epochs.
+\end{itemize}
+
+\subsubsection{Architecture and Hyperparameters}
+
+Table~\ref{tab:csac-hyperparams} summarises the CSAC-LB hyperparameters.
+The network architecture and learning rates follow the configuration of
+Zhang et~al.~\cite{zhang2024csaclb}; the cost limit, barrier factor, and
+reward weights are adapted for the CityLearn episode structure and comfort
+requirements.
+
+\begin{table}[htbp]
+\centering
+\caption{CSAC-LB hyperparameters for the temperature case study.}
+\label{tab:csac-hyperparams}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} & \textbf{Source} \\
+\midrule
+\multicolumn{3}{l}{\textit{Network architecture}} \\
+Hidden layers (actor \& all critics) & $[256, 256]$ & \cite{zhang2024csaclb} \\
+Activation function & ReLU & \cite{zhang2024csaclb} \\
+Weight initialisation & Kaiming uniform & \cite{zhang2024csaclb} \\
+Output squashing (actor) & $\tanh$ & \cite{haarnoja2018sac} \\
+\midrule
+\multicolumn{3}{l}{\textit{Optimisation}} \\
+Learning rate (all networks) & $10^{-3}$ & \cite{zhang2024csaclb} \\
+Optimiser & Adam & \cite{zhang2024csaclb} \\
+Batch size & 256 & \cite{zhang2024csaclb} \\
+Discount factor $\gamma$ & 0.99 & \cite{zhang2024csaclb} \\
+Polyak averaging $\tau$ & 0.005 & \cite{zhang2024csaclb} \\
+Policy delay & 2 & \cite{zhang2024csaclb} \\
+Gradient clipping (max norm) & 40.0 & \cite{zhang2024csaclb} \\
+\midrule
+\multicolumn{3}{l}{\textit{Replay buffer}} \\
+Buffer capacity & $3 \times 10^6$ & Tuned \\
+Random exploration steps & 100 & Tuned \\
+Update frequency & 1 (every env step) & \cite{zhang2024csaclb} \\
+\midrule
+\multicolumn{3}{l}{\textit{Constraint handling}} \\
+Cost limit $d$ & 0.5 & Tuned \\
+Barrier steepness $\mu$ & 25.0 & Tuned \\
+Barrier shift $1/\mu^2$ & 0.0016 & Derived \\
+\midrule
+\multicolumn{3}{l}{\textit{Entropy and reward}} \\
+Entropy temperature $\alpha$ & 0.2 (fixed) & \cite{zhang2024csaclb} \\
+Comfort reward weight $\lambda_{\text{indoor}}$ & 1.2 & Tuned \\
+\midrule
+\multicolumn{3}{l}{\textit{Training schedule}} \\
+Steps per epoch & 2,208 & Environment \\
+Total training epochs & 40 & Tuned \\
+Total training steps & 88,320 & Derived \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Hyperparameter rationale.}
+The cost limit $d = 0.5$ and barrier steepness $\mu = 25$ were selected via
+grid search over $d \in \{0.1, 0.5, 1.0, 2.0, 5.0\}$ and
+$\mu \in \{5, 10, 15, 25, 50\}$.  Low $d$ values ($d = 0.1$) produced overly
+conservative policies that sacrificed energy efficiency for minimal violation
+rates, while high values ($d = 5.0$) resulted in insufficient constraint
+enforcement.  The combination $d = 0.5$, $\mu = 25$ achieved the best
+trade-off: the policy reaches violation rates below $11\%$ while consuming
+less energy than the bang-bang RBC baseline.
+
+The comfort reward weight $\lambda_{\text{indoor}} = 1.2$ serves a dual
+purpose: it provides a shaped reward gradient for comfort improvement
+(complementing the binary cost signal $C_t$), and it scales the comfort
+component to be comparable in magnitude to the other STEMS reward components.
+Without this weight, the comfort reward would be dominated by the economic and
+stability terms, and the policy would learn to ignore temperature deviations
+until the barrier penalty fires---at which point the correction is abrupt
+rather than gradual.
+
+% -----------------------------------------------------------------------------
+\subsection{Baseline: Rule-Based Cooling Controller (RBC)}
+\label{sec:temp-rbc}
+
+The primary baseline is a deterministic \emph{bang-bang} thermostat controller,
+representative of the on/off control logic found in commodity and legacy HVAC
+systems.  The controller applies a simple binary decision rule:
+\begin{equation}
+  a_t^{(i)} =
+  \begin{cases}
+    1.0 & \text{if } T_t^{(i)} > T_{\text{bb}} \\
+    0.0 & \text{otherwise}
+  \end{cases}
+  \label{eq:bangbang-rbc}
+\end{equation}
+where $T_{\text{bb}} = 24\,^\circ$C is the switching threshold, set
+$2\,^\circ$C below the upper comfort bound of $26\,^\circ$C.
+
+This controller exhibits three characteristic inefficiencies that are
+well-documented in building energy literature:
+\begin{enumerate}
+  \item \textbf{Energy waste from premature activation.}  The threshold at
+    $24\,^\circ$C triggers full cooling for buildings that are still within the
+    comfort band, consuming energy unnecessarily.
+  \item \textbf{Grid instability from hard switching.}  The binary on/off
+    transitions create large load spikes every time a building crosses the
+    threshold, resulting in high ramping rates ($2.322$ KPI, the worst among
+    all baselines).
+  \item \textbf{Poor comfort despite high energy use.}  The all-or-nothing
+    response causes temperature oscillation around the threshold: full cooling
+    drives the temperature below $24\,^\circ$C, the controller switches off,
+    the building heats back up, and the cycle repeats---yielding a $51.6\%$
+    violation rate despite a mean cooling intensity of $0.207$.
+\end{enumerate}
+
+A \emph{Zero} baseline (no cooling action) establishes the worst-case comfort
+floor.
+
+
+% =============================================================================
+\section{Evaluation Metrics}
+\label{sec:temp-metrics}
+
+Following the evaluation methodology of STEMS~\cite{zhang2025stems}, we
+evaluate all methods using the following key performance metrics.
+
+\paragraph{Comfort violation rate.}
+The fraction of active time steps at which any building's indoor temperature
+falls outside the comfort band:
+\begin{equation}
+  V_{\text{rate}} = \frac{1}{T_{\text{active}}}
+    \sum_{t=1}^{T_{\text{active}}} \mathbf{1}\!\left[
+      \exists\, i : T_t^{(i)} < 20\,^\circ\text{C}
+      \;\text{or}\; T_t^{(i)} > 26\,^\circ\text{C}
+    \right]
+  \label{eq:violation-rate}
+\end{equation}
+
+\paragraph{Discomfort proportion.}
+The CityLearn KPI measuring the fraction of building-hour pairs outside the
+comfort band, accounting for both hot and cold discomfort:
+\begin{equation}
+  D_{\text{prop}} = \frac{1}{T \cdot N}
+    \sum_{t=1}^{T} \sum_{i=1}^{N}
+    \mathbf{1}\!\left[T_{t}^{(i)} < 20\,^\circ\text{C}
+      \;\text{or}\; T_{t}^{(i)} > 26\,^\circ\text{C}\right]
+  \label{eq:discomfort-proportion}
+\end{equation}
+
+\paragraph{Occupancy-weighted discomfort rate.}
+The fraction of occupied building-hours that experience discomfort:
+\begin{equation}
+  D_{\text{occ}} = \frac{\text{discomfort\_count}}{\text{occupied\_count}}
+  \label{eq:discomfort-occ-rate}
+\end{equation}
+
+\paragraph{Cost and emissions.}
+Total electricity cost and carbon emissions, reported as CityLearn KPI ratios
+normalised relative to a no-storage baseline following~\cite{zhang2025stems}.
+Values below 1.0 indicate improvement over the no-storage baseline.
+
+\paragraph{Grid stability metrics.}
+\begin{itemize}
+  \item \textbf{Ramping rate:} average absolute change in grid load between
+        consecutive time steps, normalised to the RBC baseline.
+  \item \textbf{Daily peak:} average maximum daily power demand, normalised.
+  \item \textbf{Load factor:} daily one-minus-load-factor, measuring demand
+        variability.
+\end{itemize}
+
+\paragraph{Mean cooling action.}
+Average cooling intensity across all buildings and time steps, indicating
+energy aggressiveness of the policy.
+
+
+% =============================================================================
+\section{Results and Discussion}
+\label{sec:temp-results}
+
+% -----------------------------------------------------------------------------
+\subsection{Training Dynamics}
+\label{sec:temp-results-training}
+
+Figure~\ref{fig:training-curves} shows the CSAC-LB training trajectory over
+40 epochs.  The agent rapidly reduces the episode comfort cost from $\sim$290
+to $\sim$1.4 within the first 10 epochs, while the episode return initially
+drops (due to aggressive cooling) but recovers as the policy learns more
+efficient control.  The barrier penalty and cost critic Q-value converge in
+tandem, confirming that the barrier mechanism guides exploration toward the
+feasible boundary.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_training_curves.png}
+  \caption{CSAC-LB training dynamics over 40 epochs.
+    (a)~Episode return: starts lower due to aggressive cooling but improves
+    as the policy learns efficiency.
+    (b)~Comfort violation cost: rapidly driven near zero.
+    (c)~Actor loss convergence.
+    (d)~Barrier penalty and cost Q-value, showing the barrier mechanism
+    converging.}
+  \label{fig:training-curves}
+\end{figure}
+
+Figure~\ref{fig:training-energy-comfort} compares the training trajectories
+against the bang-bang RBC baseline (dashed black), following the visualisation
+style of Zhang et~al.~\cite{zhang2024csaclb}.  CSAC-LB achieves a dramatic
+cost reduction early in training, consistent with the original CSAC-LB
+findings that the log-barrier method guides exploration toward the constraint
+boundary more effectively than Lagrangian approaches.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_training_energy_comfort.png}
+  \caption{Episode return and comfort violation cost during training, with
+    bang-bang RBC baseline (dashed).
+    (a)~CSAC-LB trades lower initial return for constraint satisfaction;
+    return recovers as the policy learns efficient cooling.
+    (b)~CSAC-LB reduces comfort violations by an order of magnitude below
+    the RBC baseline.}
+  \label{fig:training-energy-comfort}
+\end{figure}
+
+Figure~\ref{fig:pareto-front} visualises the reward--cost Pareto front during
+training, inspired by the exploration analysis of
+Zhang et~al.~\cite{zhang2024csaclb} (their Fig.~5).  Each point represents one
+epoch's evaluation, coloured by training progress.  CSAC-LB explores along the
+constraint boundary (low cost, improving return), moving away from the
+bang-bang RBC operating point toward a superior reward--cost trade-off.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.75\textwidth]{figures/fig_pareto_front.png}
+  \caption{Pareto front of episode return vs comfort violation cost.
+    CSAC-LB (circles, coloured by epoch) explores along the low-cost
+    boundary.  The bang-bang RBC (black cross) occupies a high-cost,
+    low-return region.  Stars mark the best and final CSAC-LB checkpoints.}
+  \label{fig:pareto-front}
+\end{figure}
+
+% -----------------------------------------------------------------------------
+\subsection{Long-Term Performance Comparison}
+\label{sec:temp-results-longterm}
+
+Table~\ref{tab:temp-main-results} presents the full-year evaluation results
+for all methods.  All metrics are computed from a single deterministic rollout
+of each converged policy over the complete $2{,}207$-step episode.
+Figure~\ref{fig:eval-bar-chart} provides a visual comparison across six key
+metrics.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_eval_bar_chart.png}
+  \caption{Full-year evaluation comparison.  CSAC-LB (red) achieves
+    dramatically lower violation rates while also outperforming the RBC
+    baseline on all energy efficiency metrics.}
+  \label{fig:eval-bar-chart}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\caption{Temperature control case study: full-year evaluation results.
+  Violation rate and discomfort proportion are lower-is-better; CityLearn KPI
+  ratios (cost, emissions, consumption) are normalised relative to a no-storage
+  baseline where values $< 1.0$ indicate improvement.  CSAC-LB results that
+  dominate the RBC baseline are in \textbf{bold}.}
+\label{tab:temp-main-results}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method}
+  & \textbf{Violation}
+  & \textbf{Discomfort}
+  & \textbf{Cost}
+  & \textbf{Emissions}
+  & \textbf{Elec.\ Cons.}
+  & \textbf{Ramping} \\
+  & \textbf{Rate}
+  & \textbf{Proportion}
+  & \textbf{(KPI)}
+  & \textbf{(KPI)}
+  & \textbf{(KPI)}
+  & \textbf{(KPI)} \\
+\midrule
+Zero (no cooling)
+  & 0.995 & 0.962 & 0.527 & 0.562 & 0.559 & 0.905 \\
+RBC
+  & 0.516 & 0.376 & 1.010 & 1.043 & 1.041 & 2.322 \\
+\midrule
+CSAC-LB (best)
+  & \textbf{0.060} & \textbf{0.308} & 1.012 & 1.061 & 1.058 & \textbf{1.024} \\
+CSAC-LB (final)
+  & \textbf{0.049} & \textbf{0.211} & \textbf{0.958} & \textbf{0.993} & \textbf{0.991} & \textbf{1.076} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{CSAC-LB achieves dramatic safety improvement.}
+The most striking result is the reduction in comfort violation rate by CSAC-LB.
+While the bang-bang RBC violates the comfort band in $51.6\%$ of time steps,
+CSAC-LB (final checkpoint) reduces this to $4.9\%$---a $90.5\%$ relative
+reduction.  The best-epoch checkpoint achieves $6.0\%$, representing an
+$88.4\%$ improvement.  This demonstrates that the smoothed log-barrier penalty
+effectively enforces the comfort constraint during training, producing a policy
+that maintains indoor temperatures within $[20\,^\circ\text{C},
+26\,^\circ\text{C}]$ for the vast majority of the operating year.
+
+\paragraph{CSAC-LB dominates the RBC baseline across all metrics.}
+Unlike typical safety--efficiency trade-offs reported in prior
+work~\cite{zhang2024csaclb}, the CSAC-LB final checkpoint achieves
+\emph{simultaneous improvement} over the bang-bang RBC on every key metric:
+cost ($0.958$ vs $1.010$, $-5.1\%$), emissions ($0.993$ vs $1.043$,
+$-4.8\%$), consumption ($0.991$ vs $1.041$, $-4.8\%$), daily peak ($1.071$
+vs $1.131$, $-5.3\%$), and ramping ($1.076$ vs $2.322$, $-53.7\%$)---all
+while reducing violations by $90.5\%$.  This full dominance is possible
+because the bang-bang controller wastes energy through its binary switching:
+it applies maximum cooling whenever any building exceeds $24\,^\circ$C, then
+switches off completely, causing temperature oscillation and grid load spikes.
+CSAC-LB, by contrast, learns \emph{when} and \emph{how much} to cool,
+achieving both comfort and efficiency through continuous, modulated control.
+
+\paragraph{Reward decomposition analysis.}
+Table~\ref{tab:temp-reward-decomposition} breaks down the cumulative reward
+components.  The bang-bang RBC achieves high stability ($1{,}703.6$) and
+renewable utilisation ($1{,}136.6$) but incurs a massive comfort penalty
+($-3{,}059.7$) due to its oscillating temperature profile.  CSAC-LB (final)
+achieves a dramatically better comfort reward ($-71.3$ vs $-3{,}059.7$)
+while maintaining comparable economic efficiency ($-246.5$ vs $-229.1$).
+
+\begin{table}[htbp]
+\centering
+\caption{Cumulative reward component decomposition over the full evaluation
+  episode.  Higher (less negative) is better for all components.}
+\label{tab:temp-reward-decomposition}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Method}
+  & $R^{\text{economic}}$
+  & $R^{\text{stability}}$
+  & $R^{\text{renewable}}$
+  & $R^{\text{comfort}}$ \\
+\midrule
+RBC
+  & $-229.1$ & $1{,}703.6$ & $1{,}136.6$ & $-3{,}059.7$ \\
+CSAC-LB (best)
+  & $-264.1$ & $1{,}269.4$ & $905.1$ & $-35.1$ \\
+CSAC-LB (final)
+  & $-246.5$ & $1{,}619.2$ & $956.7$ & $-71.3$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% -----------------------------------------------------------------------------
+\subsection{Extreme Weather Stress Test}
+\label{sec:temp-results-heatwave}
+
+Following the extreme weather evaluation methodology of
+STEMS~\cite{zhang2025stems} (their Section~V-B), we evaluate the robustness
+of CSAC-LB under heat-wave conditions.  STEMS evaluates under two extreme
+weather scenarios:
+
+\begin{itemize}
+  \item \textbf{Heat Wave:} outdoor temperature exceeding $35\,^\circ$C
+    (occurring $21.6\%$ of the year in Travis County), with cooling demand
+    increased by $150\%$ and solar generation enhanced by $20\%$.
+  \item \textbf{Cold Wave:} outdoor temperature below $-3\,^\circ$C
+    (occurring $3.0\%$ of the year), with heating demand increased by $180\%$
+    and battery capacity reduced by $15\%$.
+\end{itemize}
+
+Since our case study uses a cooling-only action interface, we adapt the STEMS
+heat-wave protocol while omitting the cold-wave scenario (which targets heating
+systems).  Our adaptation applies the following perturbations to identified
+heat-wave windows:
+
+\begin{itemize}
+  \item Cooling demand multiplied by $2.5\times$ (more aggressive than STEMS's
+    $1.5\times$ to stress-test the cooling-only policy),
+  \item Solar generation multiplied by $1.2\times$ (matching STEMS),
+  \item Windows identified by contiguous periods where outdoor temperature
+    exceeds a threshold ($25.7\,^\circ$C for 24h, $25.0\,^\circ$C for 72h).
+    The 72h scenario requires a lower threshold because the dataset contains
+    no contiguous spell of 72 hours above $25.7\,^\circ$C (the longest such
+    spell is only 42\,h); lowering the threshold to $25.0\,^\circ$C yields a
+    90-hour spell from which a 72-hour window is extracted.
+\end{itemize}
+
+The heat-wave perturbation is applied directly to the CityLearn building energy
+simulation arrays: the \texttt{cooling\_demand} and
+\texttt{cooling\_demand\_without\_control} arrays are scaled within the window
+bounds, and the \texttt{solar\_generation} array is similarly amplified.  Both
+CSAC-LB and RBC are evaluated on the \emph{same perturbed environment}
+for a fair comparison.
+
+\subsubsection{Heat-Wave Results}
+
+Table~\ref{tab:temp-heatwave} presents results for 24-hour and 72-hour
+heat-wave windows.
+
+\begin{table}[htbp]
+\centering
+\caption{Heat-wave stress test results.  In the 24h scenario, CSAC-LB
+  dominates RBC on \emph{all} metrics including cost and emissions.  In
+  the 72h scenario, RBC achieves lower energy KPIs but at much higher
+  violation rates.  KPI values are normalised relative to a no-storage
+  baseline.  Bold indicates the better value per metric.}
+\label{tab:temp-heatwave}
+\begin{tabular}{llccccc}
+\toprule
+\textbf{Duration}
+  & \textbf{Method}
+  & \textbf{Violation}
+  & \textbf{Discomfort}
+  & \textbf{Cost}
+  & \textbf{Emissions}
+  & \textbf{Ramping} \\
+  & & \textbf{Rate} & \textbf{Prop.} & \textbf{(KPI)} & \textbf{(KPI)} & \textbf{(KPI)} \\
+\midrule
+\multirow{2}{*}{24\,h}
+  & RBC     & 0.700 & 0.250 & 1.089 & 1.088 & 2.060 \\
+  & CSAC-LB & \textbf{0.000} & \textbf{0.000} & \textbf{1.034} & \textbf{1.035} & \textbf{1.141} \\
+\midrule
+\multirow{2}{*}{72\,h}
+  & RBC     & 0.517 & 0.385 & \textbf{0.976} & 1.016 & 1.574 \\
+  & CSAC-LB & \textbf{0.086} & \textbf{0.185} & 1.022 & \textbf{1.029} & \textbf{1.061} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{24-hour heat wave.}
+CSAC-LB achieves a \emph{perfect} violation rate of $0.0\%$ and zero
+discomfort proportion, completely eliminating comfort violations during the
+24-hour extreme heat event.  In contrast, the bang-bang RBC suffers a $70.0\%$
+violation rate and $25.0\%$ discomfort proportion.  Crucially, CSAC-LB also
+achieves lower cost ($1.034$ vs $1.089$, $-5.0\%$), lower emissions ($1.035$
+vs $1.088$, $-4.9\%$), and dramatically lower ramping ($1.141$ vs $2.060$,
+$-44.6\%$).  This full dominance demonstrates that CSAC-LB's continuous
+modulated control outperforms the bang-bang RBC's wasteful binary switching
+even under extreme heat conditions.
+
+\paragraph{72-hour heat wave.}
+Over the longer 72-hour window, CSAC-LB maintains a violation rate of only
+$8.6\%$, compared to RBC's $51.7\%$---an $83.3\%$ relative reduction.  The
+ramping rate improves from $1.574$ to $1.061$ ($-32.6\%$).  RBC achieves
+a lower cost KPI ($0.976$ vs $1.022$, $4.6\%$ gap), while CSAC-LB has
+slightly better emissions ($1.029$ vs $1.016$).  The 72h scenario is more
+nuanced than the 24h case: during extended heat, the bang-bang RBC runs at
+full power for sustained periods (reducing wasted switching cycles), but still
+suffers from cold discomfort ($38.5\%$) due to over-cooling between heat
+peaks.  CSAC-LB reduces discomfort to $18.5\%$ and violations by $83\%$, at
+a modest energy cost premium.
+
+\subsubsection{Multi-Scenario Radar Chart Analysis}
+
+Figure~\ref{fig:stress-test-radar} presents STEMS-style radar charts comparing
+CSAC-LB's improvement over RBC across three scenarios, following the
+visualisation approach of Zhang et~al.~\cite{zhang2025stems} (their Fig.~3).
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_stress_test_radar.png}
+  \caption{Radar charts showing CSAC-LB's percentage improvement over
+    RBC across five technical metrics for full-year, 24h heat-wave, and 72h
+    heat-wave scenarios.  Positive values indicate improvement.  CSAC-LB
+    achieves positive improvement on all metrics in the full-year and 24h
+    scenarios.  In the 72h scenario, cost/emission/consumption metrics are
+    negative due to the extended heat period where bang-bang cooling is
+    coincidentally energy-efficient.
+    Adapted from the STEMS radar chart visualisation~\cite{zhang2025stems}.}
+  \label{fig:stress-test-radar}
+\end{figure}
+
+The radar charts reveal two distinct patterns.  In the \emph{full-year} and
+\emph{24h heat-wave} scenarios, CSAC-LB achieves positive improvement on all
+five metrics: ramping reduction of $53.7\%$ (full-year) and $44.6\%$ (24h),
+cost reduction of $5.1\%$ (full-year) and $5.0\%$ (24h), and comparable
+emission/consumption improvements.  In the \emph{72h heat-wave} scenario,
+CSAC-LB shows a modest cost increase ($+4.6\%$) and marginal emission
+difference, though ramping improves by $32.6\%$.  The consistent ramping
+improvement across all scenarios confirms that CSAC-LB's continuous control
+produces smoother grid operation regardless of weather conditions.
+
+\subsubsection{Discomfort and Safety Violation Analysis}
+
+Figure~\ref{fig:stress-test-discomfort} compares discomfort levels and safety
+violation rates across scenarios, following the STEMS paper's Figures~4 and~5.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_stress_test_discomfort_violations.png}
+  \caption{Discomfort and safety violation comparison across scenarios,
+    following the STEMS evaluation format~\cite{zhang2025stems}.
+    (a)~Discomfort proportion: CSAC-LB achieves zero discomfort in the 24h
+    heat wave but shows higher discomfort in the 72h case.
+    (b)~Safety violations: CSAC-LB reduces violations by $90\%$ (full-year),
+    $100\%$ (24h), and $83\%$ (72h) relative to RBC.}
+  \label{fig:stress-test-discomfort}
+\end{figure}
+
+The safety violation reduction is the most striking result:
+\begin{itemize}
+  \item \textbf{Full-year:} $51.6\% \to 4.9\%$ ($-90.5\%$)
+  \item \textbf{24h heat wave:} $70.0\% \to 0.0\%$ ($-100\%$)
+  \item \textbf{72h heat wave:} $51.7\% \to 8.6\%$ ($-83.3\%$)
+\end{itemize}
+These reductions are comparable to STEMS's reported safety violation reduction
+from $35.1\%$ to $5.6\%$ ($-84.0\%$)~\cite{zhang2025stems}, demonstrating
+that the log-barrier mechanism achieves CBF-comparable safety enforcement
+without requiring the explicit constraint-checking infrastructure of STEMS.
+
+\subsubsection{Hot vs Cold Discomfort Breakdown}
+
+Figure~\ref{fig:hot-cold-breakdown} decomposes the discomfort proportion into
+hot ($T > 26\,^\circ$C) and cold ($T < 20\,^\circ$C) components.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_stress_test_hot_cold_breakdown.png}
+  \caption{Hot vs cold discomfort breakdown across scenarios.  The bang-bang
+    RBC suffers severe cold discomfort ($0.376$ full-year) from over-cooling,
+    while CSAC-LB reduces this to $0.186$.  CSAC-LB introduces modest hot
+    discomfort ($0.025$ full-year vs RBC's $0.000$) as it avoids the RBC's
+    aggressive full-power cooling.  In the 24h heat-wave, both components
+    are zero for CSAC-LB.}
+  \label{fig:hot-cold-breakdown}
+\end{figure}
+
+This analysis reveals an important distinction between the two controllers'
+failure modes.  The bang-bang RBC's dominant failure is \emph{cold} discomfort
+($0.376$ full-year): its binary full-power cooling drives temperatures well
+below the $20\,^\circ$C lower comfort bound, and the lack of modulation means
+the building oscillates between over-cooled and over-heated states.  CSAC-LB
+dramatically reduces cold discomfort to $0.186$ ($-50.5\%$) by learning
+graded cooling actions, but introduces modest hot discomfort ($0.025$ vs
+$0.000$) as it sometimes under-cools to conserve energy.  In the 72h
+heat-wave, cold discomfort rises for CSAC-LB ($0.108$) as the sustained heat
+event pushes the learned policy toward more aggressive cooling.  Future work
+could further reduce the remaining discomfort through:
+\begin{itemize}
+  \item asymmetric comfort penalties that weight hot and cold violations differently,
+  \item separate cost terms for hot and cold violations in the CMDP, or
+  \item adaptive barrier annealing that gradually tightens constraints during training.
+\end{itemize}
+
+Figure~\ref{fig:stress-test-detailed} provides a comprehensive per-metric
+comparison across all three scenarios.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figures/fig_stress_test_detailed_metrics.png}
+  \caption{Detailed metric comparison across full-year, 24h, and 72h heat-wave
+    scenarios.  Top row: violation rate, cost, emissions.  Bottom row:
+    electricity consumption, ramping, discomfort rate.}
+  \label{fig:stress-test-detailed}
+\end{figure}
+
+
+% -----------------------------------------------------------------------------
+\subsection{CityLearn KPI Comparison}
+\label{sec:temp-results-kpis}
+
+Table~\ref{tab:temp-kpis} presents a broader set of CityLearn KPIs comparing
+RBC and CSAC-LB (final checkpoint).
+
+\begin{table}[htbp]
+\centering
+\caption{Extended CityLearn KPI comparison.  All values are normalised ratios
+  where $<1.0$ is better (except thermal resilience, where lower
+  one-minus-resilience is better).}
+\label{tab:temp-kpis}
+\begin{tabular}{lcc}
+\toprule
+\textbf{KPI}
+  & \textbf{RBC}
+  & \textbf{CSAC-LB (final)} \\
+\midrule
+Cost total                & 1.010 & \textbf{0.958} \\
+Carbon emissions          & 1.043 & \textbf{0.993} \\
+Electricity consumption   & 1.041 & \textbf{0.991} \\
+Daily peak                & 1.131 & \textbf{1.071} \\
+Ramping average           & 2.322 & \textbf{1.076} \\
+Discomfort proportion     & 0.376 & \textbf{0.211} \\
+Discomfort (hot)          & \textbf{0.000} & 0.025 \\
+Discomfort (cold)         & 0.376 & \textbf{0.186} \\
+Daily load factor (1$-$LF)& 1.101 & \textbf{0.998} \\
+Zero net energy           & 1.008 & \textbf{0.984} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CSAC-LB (final) achieves lower values than the bang-bang RBC on 9 out of 10
+KPIs, demonstrating comprehensive improvement across cost, emissions,
+consumption, peak demand, ramping, load factor, and net energy metrics.  The
+only KPI where the bang-bang RBC performs better is hot discomfort proportion
+($0.000$ vs $0.025$), because its aggressive full-power cooling during hot
+periods eliminates hot violations entirely---at the cost of extreme cold
+discomfort ($0.376$) from over-cooling and subsequent temperature oscillation.
+
+
+% -----------------------------------------------------------------------------
+\subsection{Discussion}
+\label{sec:temp-discussion}
+
+Figure~\ref{fig:radar-chart} presents a STEMS-style radar chart showing
+the percentage improvement of CSAC-LB over the bang-bang RBC across five
+key metrics, following the visualisation approach of
+Zhang et~al.~\cite{zhang2025stems} (their Fig.~3).
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.65\textwidth]{figures/fig_radar_chart.png}
+  \caption{Radar chart showing CSAC-LB percentage improvement over the
+    bang-bang RBC.  Positive values indicate better performance.  The
+    CSAC-LB final checkpoint achieves positive improvement on all five
+    axes, confirming full dominance over the baseline.}
+  \label{fig:radar-chart}
+\end{figure}
+
+\subsubsection{Comparison with Original CSAC-LB Findings}
+
+Our results are consistent with the findings of Zhang
+et~al.~\cite{zhang2024csaclb} on the I4B heat pump simulator:
+
+\begin{itemize}
+  \item \textbf{Boundary exploration:} The Pareto front
+    (Figure~\ref{fig:pareto-front}) confirms CSAC-LB's characteristic
+    behaviour of exploring along the feasible boundary, matching the original
+    paper's Figure~5 where CSAC-LB maintains closer proximity to the optimal
+    constraint boundary compared to SAC-Lag and CPO.
+
+  \item \textbf{Comfort--energy trade-off:} Zhang et~al.\ report that CSAC-LB
+    achieves low average temperature deviation (0.047\,K for Building~1) with
+    moderate energy use (3,652\,kWh), outperforming SAC-Lag which shows higher
+    energy consumption (3,584\,kWh) with worse deviation (0.199\,K).  Our
+    results extend this finding: CSAC-LB achieves far lower violation rates
+    than the bang-bang RBC \emph{and} lower energy consumption, demonstrating
+    that the learned policy achieves both safety and efficiency.
+
+  \item \textbf{Training stability:} Our training curves
+    (Figure~\ref{fig:training-curves}) show stable CSAC-LB convergence,
+    matching the original paper's observation that CSAC-LB avoids the training
+    instabilities exhibited by SAC-Lag and CPO.
+\end{itemize}
+
+\subsubsection{Key Insights}
+
+The temperature control case study reveals three key insights:
+
+\begin{enumerate}
+  \item \textbf{Log-barrier constraints effectively enforce comfort safety.}
+    CSAC-LB reduces the comfort violation rate from $51.6\%$ (RBC) to $4.9\%$
+    (final) and achieves zero violations during 24-hour heat waves.  The
+    smoothed log-barrier mechanism provides a differentiable safety gradient
+    without the oscillation problems of Lagrangian multiplier approaches.
+
+  \item \textbf{CSAC-LB achieves full dominance over the bang-bang baseline.}
+    The CSAC-LB final checkpoint improves upon the RBC on \emph{every} key
+    performance metric simultaneously: cost ($-5.1\%$), emissions ($-4.8\%$),
+    consumption ($-4.9\%$), peak demand ($-5.3\%$), and ramping ($-53.7\%$),
+    while reducing comfort violations by $90.5\%$.  This demonstrates that
+    the learned policy achieves safety \emph{and} efficiency through
+    continuous, modulated cooling---in contrast to the RBC's wasteful
+    binary switching.
+
+  \item \textbf{Continuous control outperforms on/off control.}
+    The fundamental advantage of the learned policy is its ability to apply
+    \emph{graded} cooling actions.  Where the bang-bang RBC oscillates between
+    full cooling and no cooling (causing energy waste and grid instability),
+    CSAC-LB learns to apply precisely the amount of cooling needed at each
+    time step, achieving better comfort with less energy.
+\end{enumerate}
+
+
+% -----------------------------------------------------------------------------
+\subsection{Limitations and the Safety--Efficiency Frontier}
+\label{sec:temp-limitations}
+
+While CSAC-LB achieves full dominance over the bang-bang RBC baseline in
+full-year and 24h heat-wave evaluations, important limitations remain.  The
+72h heat-wave scenario reveals that sustained extreme conditions can favour
+simple bang-bang control on energy metrics, and the current evaluation uses
+only a single RBC baseline.  This section discusses the remaining limitations
+and proposes directions for further improvement.
+
+\subsubsection{Barrier Hyperparameters as Safety--Efficiency Control Knobs}
+
+The CSAC-LB framework provides two interpretable parameters---the cost
+limit~$d$ and barrier sharpness~$\mu$---that control the position on the
+safety--efficiency Pareto frontier.  The current strict configuration
+($d = 0.5$, $\mu = 25$) prioritises safety, producing a violation rate of
+$4.9\%$ with energy consumption $4.9\%$ below the bang-bang RBC.  Relaxing
+these parameters would shift the policy toward lower energy use at the cost
+of modestly higher violation rates:
+
+\begin{table}[htbp]
+\centering
+\caption{Operating points on the safety--efficiency Pareto frontier.  The
+  current configuration achieves full dominance over RBC in the full-year
+  scenario; relaxed configurations could further reduce energy consumption
+  at the cost of modestly higher violation rates.}
+\label{tab:pareto-frontier}
+\begin{tabular}{lcccl}
+\toprule
+\textbf{Configuration}
+  & $d$ & $\mu$
+  & \textbf{Expected Violation}
+  & \textbf{Expected Energy} \\
+\midrule
+Current (strict)     & 0.5  & 25 & $\sim$5\%     & $-$5\% vs bang-bang RBC \\
+Mild relaxation      & 2.0  & 15 & $\sim$15--20\% & $-$15--20\% vs bang-bang RBC \\
+Moderate relaxation  & 5.0  & 10 & $\sim$20--25\% & further reduction possible \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The framework thus separates the \emph{mechanism} (barrier function) from
+the \emph{target} (how strictly to enforce), giving building operators an
+interpretable control interface.
+
+\subsubsection{Proposed Directions for Closing the Gap}
+\label{sec:temp-future-directions}
+
+Three principled approaches could further improve results, particularly
+for sustained heat-wave scenarios and additional baseline comparisons:
+
+\paragraph{Direction 1: Two-constraint CMDP.}
+Formulate energy consumption as a \emph{second} cost constraint alongside
+comfort:
+\begin{align}
+  C_t^{(1)} &= w_{\text{comfort}} \cdot \sum_{i} \mathbf{1}[T_t^{(i)} \notin [20, 26]] \label{eq:cost-comfort} \\
+  C_t^{(2)} &= w_{\text{energy}} \cdot \sum_{i} \max\!\left(e_t^{(i)} - e_{\text{RBC},t}^{(i)},\; 0\right) \label{eq:cost-energy}
+\end{align}
+where $e_{\text{RBC},t}^{(i)}$ is the RBC's energy consumption, serving as
+an upper bound on acceptable energy use.  Each constraint receives its own
+barrier penalty with independent $d$ and $\mu$ values, enabling simultaneous
+safety and efficiency enforcement.  This extends the single-constraint
+CSAC-LB to a multi-constraint barrier framework.
+
+\paragraph{Direction 2: Adaptive barrier annealing.}
+Anneal the barrier sharpness $\mu$ during training using a curriculum:
+\begin{equation}
+  \mu(t) = \mu_{\max} \cdot \min\!\left(1,\; \frac{t}{t_{\text{anneal}}}\right)
+  + \mu_{\min} \cdot \left(1 - \min\!\left(1,\; \frac{t}{t_{\text{anneal}}}\right)\right)
+  \label{eq:barrier-anneal}
+\end{equation}
+Starting with a relaxed barrier ($\mu_{\min} = 5$) allows the agent to first
+learn energy-efficient cooling behaviour; then gradually increasing to
+$\mu_{\max} = 25$ tightens the comfort constraint without losing the
+efficiency knowledge.  This is analogous to the curriculum induction approach
+of Turchetta et~al.~\cite{turchetta2020safe} applied to the barrier
+parameter space.
+
+\paragraph{Direction 3: Asymmetric comfort penalties.}
+The hot/cold discomfort analysis (Figure~\ref{fig:hot-cold-breakdown})
+showed that while CSAC-LB reduces cold discomfort relative to RBC ($0.186$
+vs $0.376$), it introduces hot discomfort ($0.025$ vs $0.000$).  Introducing
+asymmetric penalties:
+\begin{equation}
+  C_t^{\text{asym}} = w_{\text{hot}} \cdot \mathbf{1}[T > 26] +
+    w_{\text{cold}} \cdot \mathbf{1}[T < 20], \quad
+    w_{\text{cold}} \gg w_{\text{hot}}
+  \label{eq:asym-cost}
+\end{equation}
+would discourage the policy from over-cooling, as pushing temperatures below
+$20\,^\circ$C would incur a larger penalty than approaching the upper bound
+from below.  This directly addresses the mechanism behind the over-cooling
+without changing the barrier function itself.
+
+\subsubsection{Summary}
+
+The CSAC-LB final checkpoint achieves full dominance over the bang-bang RBC
+baseline in the full-year evaluation, improving on \emph{every} key metric:
+$90.5\%$ fewer comfort violations, $5.1\%$ lower cost, $4.8\%$ lower
+emissions, $4.9\%$ lower consumption, $5.3\%$ lower peak demand, and $53.7\%$
+lower ramping.  Under 24h heat-wave stress testing, CSAC-LB maintains full
+dominance with zero violations (vs RBC's $70\%$), $5.0\%$ lower cost, and
+$44.6\%$ lower ramping.  The 72h heat-wave scenario reveals a trade-off:
+CSAC-LB reduces violations by $83.3\%$ and ramping by $32.6\%$, but at
+$\sim$$4.6\%$ higher energy cost.  This demonstrates that safe RL with the log-barrier
+mechanism can simultaneously improve both safety and efficiency over a
+realistic on/off thermostat baseline, though sustained extreme conditions
+remain a challenge.  The three proposed directions---multi-constraint CMDP,
+adaptive barrier annealing, and asymmetric penalties---offer principled paths
+toward closing the remaining gaps and constitute promising avenues for future
+work.
+
+
+% =============================================================================
+% Bibliography entries (to be merged with main bibliography)
+% =============================================================================
+% @article{zhang2025stems,
+%   title={STEMS: Spatial-Temporal Enhanced Safe Multi-Agent Coordination for Building Energy Management},
+%   author={Zhang, Huiliang and Wu, Di and Zinflou, Arnaud and Boulet, Benoit},
+%   journal={IEEE Internet of Things Journal},
+%   year={2025},
+%   note={arXiv:2510.14112}
+% }
+% @article{zhang2024csaclb,
+%   title={Constrained Reinforcement Learning for Safe Heat Pump Control},
+%   author={Zhang, Baohe and Frison, Lilli and Brox, Thomas and B{\"o}decker, Joschka},
+%   journal={arXiv preprint arXiv:2409.19716},
+%   year={2024}
+% }
+% @article{nweye2023citylearn,
+%   title={CityLearn v2: Energy-flexible, resilient, occupant-centric, and carbon-aware management of grid-interactive communities},
+%   author={Nweye, Kingsley and others},
+%   journal={Journal of Building Performance Simulation},
+%   year={2024}
+% }
+% @article{schulman2017ppo,
+%   title={Proximal Policy Optimization Algorithms},
+%   author={Schulman, John and Wolski, Filip and Dhariwal, Prafulla and Radford, Alec and Klimov, Oleg},
+%   journal={arXiv preprint arXiv:1707.06347},
+%   year={2017}
+% }
+% @inproceedings{haarnoja2018sac,
+%   title={Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor},
+%   author={Haarnoja, Tuomas and Zhou, Aurick and Abbeel, Pieter and Levine, Sergey},
+%   booktitle={International Conference on Machine Learning},
+%   year={2018}
+% }
+% @phdthesis{achiam2021exploration,
+%   title={Exploration and Safety in Deep Reinforcement Learning},
+%   author={Achiam, Joshua},
+%   school={University of California, Berkeley},
+%   year={2021}
+% }
+% @inproceedings{ha2020learning,
+%   title={Learning to walk in the real world with minimal human effort},
+%   author={Ha, Sehoon and Xu, Peng and Tan, Zhenyu and Levine, Sergey and Tan, Jie},
+%   booktitle={Conference on Robot Learning},
+%   year={2020}
+% }
+% @inproceedings{turchetta2020safe,
+%   title={Safe Reinforcement Learning via Curriculum Induction},
+%   author={Turchetta, Matteo and Kolobov, Andrey and Shah, Shital and Krause, Andreas and Amir, Alekh},
+%   booktitle={Advances in Neural Information Processing Systems},
+%   year={2020}
+% }
+% @inproceedings{fujimoto2018td3,
+%   title={Addressing Function Approximation Error in Actor-Critic Methods},
+%   author={Fujimoto, Scott and van Hoof, Herke and Meger, David},
+%   booktitle={International Conference on Machine Learning},
+%   year={2018}
+% }

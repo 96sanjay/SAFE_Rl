@@ -1,0 +1,60 @@
+# CPO — Constrained Policy Optimization (Achiam et al., 2017)
+# Second-order trust region constrained optimization
+# Temperature cooling-only case study benchmark
+
+algo: CPO
+env_id: CityLearnTemp-CoolingOnly-Masked-Reward-v0
+seed: 42
+
+train_cfgs:
+  device: cpu
+  vector_env_nums: 1
+  parallel: 1
+  total_steps: 132420        # 60 epochs * 2207 steps
+  eval_episodes: 0
+
+algo_cfgs:
+  steps_per_epoch: 2207
+  update_iters: 10
+  batch_size: 128
+  target_kl: 0.01
+  entropy_coef: 0.0
+  reward_normalize: false
+  cost_normalize: false
+  obs_normalize: false
+  use_max_grad_norm: true
+  max_grad_norm: 40.0
+  use_critic_norm: false
+  gamma: 0.99
+  cost_gamma: 0.99
+  lam: 0.95
+  lam_c: 0.95
+  adv_estimation_method: gae
+  standardized_rew_adv: true
+  standardized_cost_adv: true
+  use_cost: true
+  cg_damping: 0.1
+  cg_iters: 15
+  fvp_sample_freq: 1
+  cost_limit: 40.0
+
+model_cfgs:
+  weight_initialization_mode: kaiming_uniform
+  actor_type: gaussian_learning
+  linear_lr_decay: true
+  std_range: [0.5, 0.1]
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: ~
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 1
+  log_dir: ./runs/cpo_temp_cooling_only
+  window_lens: 1

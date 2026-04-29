@@ -1,0 +1,37 @@
+defaults:
+  seed: 42
+  train_cfgs:
+    total_steps: 875900
+    vector_env_nums: 1
+    parallel: 1
+    device: cpu
+  algo_cfgs:
+    steps_per_epoch: 8759
+    target_kl: 0.02
+    update_iters: 1
+    batch_size: 512
+    use_cost: true
+    entropy_coef: 0.0
+    gamma: 0.99
+    lam: 0.95
+    obs_normalize: true
+    reward_normalize: true
+    cost_normalize: false
+  model_cfgs:
+    actor:
+      hidden_sizes: [512, 512, 256]
+      activation: relu
+    critic:
+      hidden_sizes: [512, 512, 256]
+      activation: relu
+      lr: 0.001
+  lagrange_cfgs:
+    cost_limit: 15000.0
+    lagrangian_multiplier_init: 0.1
+    lambda_lr: 0.01
+    lambda_optimizer: Adam
+  logger_cfgs:
+    log_dir: ./runs/trpolag_v2g_psf
+    use_tensorboard: true
+    use_wandb: false
+    save_model_freq: 5

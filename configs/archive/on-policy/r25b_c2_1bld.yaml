@@ -1,0 +1,74 @@
+# Test: 1-building, 3-month cycling test
+# Purpose: Verify NEC-sign reward + action mask produces cycling (not static)
+# Uses R30c reward weights exactly, scaled cost limits for 1 building / 3 months
+algo: PPOLagMulti
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 109500          # 50 epochs x 2190 steps/epoch (3 months)
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 2190
+  update_iters: 30
+  target_kl: 0.08
+  kl_early_stop: true
+  batch_size: 256
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  standardized_cost_adv: true
+  entropy_coef: 0.005
+  max_grad_norm: 40.0
+
+lagrange_cfgs:
+  cost_limit: 4360
+  lagrangian_multiplier_init: 0.001
+  lambda_lr: 0.035
+  lambda_optimizer: Adam
+  lagrangian_upper_bound: 3.0
+
+multi_cfgs:
+  tau: 1.0
+  # Scaled for 1 building, 3 months (~1/4 year, 1/5 buildings => ~1/20 of 5bld full year)
+  cost_limit_0: 200             # C0: EV departure
+  cost_limit_1: 375             # C1: EV dense
+  cost_limit_2: 2500            # C2: Battery SoC (generous, mask handles bounds)
+  cost_limit_3: 1000            # C3: Building power (1 building)
+  cost_limit_4: 1000            # C4: Grid power (grid = 1 building)
+
+  # PID gains (same as R30c)
+  pid_kp: 0.1
+  pid_ki: 0.01
+  pid_kd: 0.01
+  pid_d_delay: 10
+  pid_delta_p_ema_alpha: 0.95
+  pid_delta_d_ema_alpha: 0.95
+  pid_kp_0: 0.5
+  pid_ki_0: 0.0
+  pid_kd_0: 0.0
+  pid_ema_p_0: 0.0
+  pid_kp_3: 0.2
+  pid_ki_3: 0.02
+  pid_kp_4: 0.2
+  pid_ki_4: 0.02
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0003
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 10
+  log_dir: ./runs/r25b_c2_1bld
+  window_lens: 1

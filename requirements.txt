@@ -1,0 +1,20 @@
+# Safe RL for V2G Control — Dependencies
+# ========================================
+
+# Core
+gymnasium>=0.28,<1.0
+numpy>=1.26,<2.0
+pandas>=2.2
+matplotlib>=3.9
+tyro>=0.8.4
+pyyaml>=6.0
+rich>=13.0
+
+# PyTorch — install separately with correct CUDA version
+# See: https://pytorch.org/get-started/locally/
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0
+
+# Note: OmniSafe and CityLearn are vendored with patches in vendor_deps/
+# Install them via: pip install -e vendor_deps/omnisafe
+#                    pip install -e vendor_deps/citylearn

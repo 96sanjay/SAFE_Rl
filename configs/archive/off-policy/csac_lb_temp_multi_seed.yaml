@@ -1,0 +1,66 @@
+# CSAC-LB multi-seed replication study
+# Base: csac_lb_temp_cooling_only_strict_40ep.yaml extended to 60 epochs
+# Seed is overridden by run script via env var
+
+algo: CSACLBTemp
+env_id: CityLearnTemp-CoolingOnly-Masked-Reward-v0
+seed: 0
+
+train_cfgs:
+  device: cpu
+  torch_threads: 8
+  vector_env_nums: 1
+  parallel: 1
+  total_steps: 132480        # 60 epochs * 2208 steps
+  eval_episodes: 1
+
+algo_cfgs:
+  steps_per_epoch: 2208
+  update_cycle: 1
+  update_iters: 1
+  size: 3000000
+  batch_size: 256
+  reward_normalize: false
+  cost_normalize: false
+  obs_normalize: false
+  max_grad_norm: 40.0
+  use_critic_norm: false
+  critic_norm_coeff: 0.001
+  polyak: 0.005
+  gamma: 0.99
+  start_learning_steps: 100
+  policy_delay: 2
+  use_exploration_noise: false
+  alpha: 0.2
+  auto_alpha: false
+  use_cost: true
+  cost_limit: 0.5
+  barrier_factor: 25.0
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 1
+  log_dir: ./runs/csac_lb_multi_seed/seed_0
+  window_lens: 10
+
+model_cfgs:
+  weight_initialization_mode: kaiming_uniform
+  actor_type: gaussian_sac
+  linear_lr_decay: false
+  actor:
+    hidden_sizes: [256, 256]
+    activation: relu
+    lr: 0.001
+  critic:
+    num_critics: 2
+    hidden_sizes: [256, 256]
+    activation: relu
+    lr: 0.001
+
+env_cfgs: {}
+
+eval_env_cfgs: {}
+
+env_overrides:
+  CITYLEARN_STEMS_LAMBDA_INDOOR: "1.2"

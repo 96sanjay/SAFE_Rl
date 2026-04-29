@@ -1,0 +1,84 @@
+# Temperature case study: PPO-Lag + PID Lagrangian + BC warm-start
+# Cooling-only 3D action space, 40 epochs to match CSAC-LB comparison.
+#
+# Fixes 5 root causes of PPOLagTempMasked failure:
+# 1. 3D cooling-only env (was 9D full action space)
+# 2. RBC behavioral cloning warm-start (was random init)
+# 3. PID Lagrangian (was Adam-based, adv_c collapse)
+# 4. Aggressive PID gains (was lambda=0.7 after 20ep)
+# 5. 40 epochs training (matching CSAC-LB strict)
+
+algo: PPOLagTempCoolingOnly
+env_id: CityLearnTemp-CoolingOnly-Masked-Reward-v0
+seed: 42
+
+train_cfgs:
+  total_steps: 88280        # 40 epochs * 2207 steps
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 2207     # 1 CityLearn year
+  update_iters: 10
+  target_kl: 0.15
+  kl_early_stop: true
+  batch_size: 512
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.01
+  max_grad_norm: 40.0
+  use_cost: true
+  gamma: 0.99
+  cost_gamma: 0.99
+  lam: 0.95
+  lam_c: 0.95
+  clip: 0.2
+  standardized_rew_adv: true
+  standardized_cost_adv: true
+
+# OmniSafe's native Lagrange config (needed for PPOLag._init() compatibility)
+lagrange_cfgs:
+  cost_limit: 55.0
+  lagrangian_multiplier_init: 0.001
+  lambda_lr: 0.035
+  lambda_optimizer: Adam
+
+# PID Lagrangian config (used by PPOLagTempCoolingOnly)
+pid_lagrange_cfgs:
+  cost_limit: 55.0              # matches RBC baseline ~50
+  pid_kp: 0.5                   # aggressive P-term for 12.4x initial overshoot
+  pid_ki: 0.05                  # moderate I-term for persistent violations
+  pid_kd: 0.01                  # small D-term for dampening
+  pid_d_delay: 10
+  pid_delta_p_ema_alpha: 0.95
+  pid_delta_d_ema_alpha: 0.95
+  penalty_max: 5.0              # allow large lambda for massive overshoot
+  lagrangian_multiplier_init: 0.001
+  normalize_by_limit: true      # delta = (cost - limit) / limit
+
+# Behavioral cloning warm-start config
+bc_cfgs:
+  epochs: 10                    # same as PPO+BC baseline
+  rollout_steps: 2207           # 1 full year of RBC demonstrations
+  batch_size: 512
+  seed: 42
+
+model_cfgs:
+  actor_type: gaussian_learning
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0001
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0003
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 1
+  log_dir: ./runs/ppolag_temp_cooling_only_pid_bc_40ep
+  window_lens: 1

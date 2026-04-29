@@ -1,0 +1,73 @@
+# PPOLag-Multi v3b: 4-constraint ABLATION run (C1 disabled)
+#
+# v3b changes from v3a:
+#   - C1 (EV dense) DISABLED via high limit (999999) → lambda_1 → 0
+#   - Dense EV charging handled by r_ev in reward (lambda_ev=5.0)
+#   - 4 effective constraints: C0, C2, C3, C4
+#
+# Ablation hypothesis:
+#   If v3b matches v3a on EV metrics → C1 is redundant with r_ev
+#   If v3b is worse on EV metrics → C1 constraint is necessary
+#
+# Per-constraint cost limits (same as v3a except C1):
+#   C0 (EV departure):    R5a=2075,  limit=1800  (-13%, beat R5a)
+#   C1 (EV dense):        DISABLED,  limit=999999 (lambda → 0)
+#   C2 (Battery SoC):     R5a=4459,  limit=4000  (-10%, beat R5a)
+#   C3 (Building power):  R5a=16782, limit=12000 (-29%, aggressive push)
+#   C4 (Grid power):      R5a=1589,  limit=1400  (-12%, beat R5a)
+algo: PPOLagMulti
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 875900          # 100 epochs x 8759 steps/epoch
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 60
+  target_kl: 0.10
+  kl_early_stop: true
+  batch_size: 256
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  standardized_cost_adv: true  # Z-score per-constraint advantages
+  entropy_coef: 0.005
+  max_grad_norm: 40.0
+
+lagrange_cfgs:
+  cost_limit: 19200                      # Sum of active limits (logging only)
+  lagrangian_multiplier_init: 1.0
+  lambda_lr: 0.035                       # Adam: effective step ~0.035/epoch
+  lambda_optimizer: Adam
+  lagrangian_upper_bound: null           # No cap
+
+multi_cfgs:
+  tau: 1.0
+
+  # TIGHT limits — C1 DISABLED for ablation
+  cost_limit_0: 1800           # C0: EV departure (R5a=2075, -13%)
+  cost_limit_1: 999999         # C1: DISABLED (handled by r_ev in reward)
+  cost_limit_2: 4000           # C2: Battery SoC (R5a=4459, -10%)
+  cost_limit_3: 12000          # C3: Building power (R5a=16782, -29%)
+  cost_limit_4: 1400           # C4: Grid power (R5a=1589, -12%)
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0002
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5
+  log_dir: ./runs/multi_lag_v3b/5bld
+  window_lens: 1

@@ -1,0 +1,58 @@
+# R28 SACLag benchmark: stock OmniSafe off-policy SAC + Lagrangian
+# Companion to r28_ppolag (on-policy single-Lagrangian) — same env, same costs.
+algo: SACLag
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  device: cuda:0
+  total_steps: 875900    # 100 epochs x 8759 (matches other R28 baselines)
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_cycle: 1
+  update_iters: 1
+  batch_size: 256
+  size: 1000000          # replay buffer
+  polyak: 0.005
+  gamma: 0.99
+  start_learning_steps: 10000
+  policy_delay: 1
+  use_exploration_noise: false
+  alpha: 0.2
+  auto_alpha: true
+  obs_normalize: true     # required for off-policy device coercion (no shim needed)
+  reward_normalize: false # off-policy: avoid stale-stats bias on replay
+  cost_normalize: false
+  use_cost: true
+  warmup_epochs: 0
+  max_grad_norm: 40.0
+
+lagrange_cfgs:
+  cost_limit: 100000
+  lagrangian_multiplier_init: 0.001
+  lambda_lr: 0.00001
+  lambda_optimizer: Adam
+
+model_cfgs:
+  weight_initialization_mode: kaiming_uniform
+  actor_type: gaussian_sac
+  linear_lr_decay: false
+  actor:
+    hidden_sizes: [256, 256]
+    activation: relu
+    lr: 0.0003
+  critic:
+    num_critics: 2
+    hidden_sizes: [256, 256]
+    activation: relu
+    lr: 0.0003
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 10
+  log_dir: ./runs/benchmark_saclag/5bld
+  window_lens: 1

@@ -1,0 +1,37 @@
+algo: PPOLag
+env_id: CityLearnSafety-SoC-v0
+seed: 42
+train_cfgs:
+  total_steps: 875900
+  vector_env_nums: 1
+  parallel: 1
+algo_cfgs:
+  steps_per_epoch: 8759
+  target_kl: 0.10
+  kl_early_stop: true
+  batch_size: 512
+  update_iters: 40
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.01
+lagrange_cfgs:
+  cost_limit: 20000
+  lagrangian_multiplier_init: 0.1
+  lambda_lr: 0.003
+  lambda_optimizer: SGD
+model_cfgs:
+  actor:
+    hidden_sizes: [512, 512, 256]
+    activation: relu
+    lr: 0.0002
+  critic:
+    hidden_sizes: [512, 512, 256]
+    activation: relu
+    lr: 0.001
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 10
+  log_dir: ./runs/ppolag_v2g_stems
+  window_lens: 1

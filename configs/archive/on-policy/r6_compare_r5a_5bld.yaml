@@ -1,0 +1,45 @@
+# R5-A baseline on 5 buildings: StopIter fix only, no P0/P1
+# Compare against R6 to isolate P0+P1 contribution
+algo: PPOLag
+env_id: CityLearnSafety-V2G-v2
+seed: 42
+
+train_cfgs:
+  total_steps: 437950          # 50 epochs × 8759 steps/epoch
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 8759
+  update_iters: 60             # R5-A fix: working value function
+  target_kl: 0.10
+  kl_early_stop: true
+  batch_size: 256
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.005
+
+lagrange_cfgs:
+  cost_limit: 24400            # scaled from 83000 × (5/17)
+  lagrangian_multiplier_init: 10.0
+  lambda_lr: 0.05
+  lambda_optimizer: SGD
+
+model_cfgs:
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0005
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.001
+  linear_lr_decay: false
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 5
+  log_dir: ./runs/r6_compare/r5a_5bld
+  window_lens: 1

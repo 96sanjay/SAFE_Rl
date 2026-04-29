@@ -1,0 +1,39 @@
+\documentclass[12pt,a4paper]{report}
+
+% --- Encoding & fonts ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+
+% --- Math ---
+\usepackage{amsmath,amssymb}
+
+% --- Tables ---
+\usepackage{booktabs}
+\usepackage{multirow}
+
+% --- Figures ---
+\usepackage{graphicx}
+\usepackage[font=small,labelfont=bf]{caption}
+
+% --- Algorithm ---
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% --- Hyperlinks ---
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+% --- Bibliography ---
+\usepackage[numbers,sort&compress]{natbib}
+
+% --- Misc ---
+\usepackage{xspace}
+
+\begin{document}
+
+\input{thesis_temperature_case_study_v2}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

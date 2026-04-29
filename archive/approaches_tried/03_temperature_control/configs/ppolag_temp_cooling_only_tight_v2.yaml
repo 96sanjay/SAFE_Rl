@@ -1,0 +1,93 @@
+# Temperature case study: PPO-Lag + PID Lagrangian + BC warm-start (TIGHTENED v2)
+# Changes from v1:
+# - force_trigger: 28 -> 25 (start forcing cooling 1°C BELOW comfort bound)
+# - force_range: 4 -> 2 (ramp up forced cooling faster)
+# - min_cap: 0.6 -> 0.8 (force at least 80% cooling when hot)
+# - PID Kp: 0.5 -> 1.0 (2x faster lambda response)
+# - PID Ki: 0.05 -> 0.1 (2x stronger integral for persistent violations)
+# - penalty_max: 5.0 -> 10.0 (allow stronger cost penalty)
+# - cost_limit: 55 -> 40 (tighten — eval was 51, force more conservative policy)
+# - epochs: 40 -> 60 (more training budget for tighter constraint)
+
+algo: PPOLagTempCoolingOnly
+env_id: CityLearnTemp-CoolingOnly-Masked-Reward-v0
+seed: 42
+
+train_cfgs:
+  total_steps: 132420        # 60 epochs * 2207 steps
+  vector_env_nums: 1
+  parallel: 1
+
+algo_cfgs:
+  steps_per_epoch: 2207     # 1 CityLearn year
+  update_iters: 10
+  target_kl: 0.15
+  kl_early_stop: true
+  batch_size: 512
+  obs_normalize: true
+  reward_normalize: true
+  cost_normalize: false
+  entropy_coef: 0.01
+  max_grad_norm: 40.0
+  use_cost: true
+  gamma: 0.99
+  cost_gamma: 0.99
+  lam: 0.95
+  lam_c: 0.95
+  clip: 0.2
+  standardized_rew_adv: true
+  standardized_cost_adv: true
+
+# OmniSafe's native Lagrange config (needed for PPOLag._init() compatibility)
+lagrange_cfgs:
+  cost_limit: 40.0
+  lagrangian_multiplier_init: 0.001
+  lambda_lr: 0.035
+  lambda_optimizer: Adam
+
+# PID Lagrangian config — TIGHTENED
+pid_lagrange_cfgs:
+  cost_limit: 40.0               # was 55, tightened since eval was 51
+  pid_kp: 1.0                    # was 0.5, 2x more aggressive P-term
+  pid_ki: 0.1                    # was 0.05, 2x stronger integral
+  pid_kd: 0.01                   # keep same D-term
+  pid_d_delay: 10
+  pid_delta_p_ema_alpha: 0.95
+  pid_delta_d_ema_alpha: 0.95
+  penalty_max: 10.0              # was 5.0, allow stronger penalty
+  lagrangian_multiplier_init: 0.001
+  normalize_by_limit: true
+
+# Behavioral cloning warm-start config
+bc_cfgs:
+  epochs: 10
+  rollout_steps: 2207
+  batch_size: 512
+  seed: 42
+
+model_cfgs:
+  actor_type: gaussian_learning
+  actor:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0001
+  critic:
+    hidden_sizes: [256, 256]
+    activation: tanh
+    lr: 0.0003
+  linear_lr_decay: false
+
+# Tighter mask parameters passed to env
+env_cfgs:
+  policy_mask_cooling_force_trigger: 25.0    # was 28.0, start forcing 1°C below comfort bound
+  policy_mask_cooling_force_range: 2.0       # was 4.0, ramp up faster
+  policy_mask_cooling_min_cap: 0.8           # was 0.6, force at least 80% cooling
+  policy_mask_cooling_full_range: 4.0        # was 6.0, allow more cooling range
+  policy_mask_cooling_setpoint_deadband: 0.3 # was 0.5, less deadband
+
+logger_cfgs:
+  use_wandb: false
+  use_tensorboard: true
+  save_model_freq: 1
+  log_dir: ./runs/ppolag_temp_cooling_only_tight_v2
+  window_lens: 1

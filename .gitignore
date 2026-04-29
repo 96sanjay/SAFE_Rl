@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+conda-env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Training outputs (large files)
+runs/
+checkpoints/
+logs/
+*.pt
+*.pth
+*.ckpt
+wandb/
+mlruns/
+
+# Evaluation outputs
+eval_results/
+eval_outputs/
+
+# Backup files
+*.bak
+*.bak.*
+*.backup
+*.save
+*.orig
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Large data files (keep schemas, skip CSVs > 1MB)
+*.csv
+!data/**/*.csv
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

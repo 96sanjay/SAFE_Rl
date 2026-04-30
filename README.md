@@ -24,7 +24,7 @@ This repository implements the system described in the thesis *"Development of C
 ## Contributions
 
 1. A **four-channel CMDP** for district energy management that retains the operational meaning of each safety requirement throughout training and evaluation.
-2. A **Multi-Lagrangian PPO formulation** whose per-channel decoupling is the only mechanism in the thirteen-controller roster that drives EV departure readiness into the safe band while remaining constraint-aware on the per-step channels.
+2. A **Multi-Lagrangian PPO formulation** whose per-channel decoupling is the only mechanism in the eleven-controller roster that drives EV departure readiness into the safe band while remaining constraint-aware on the per-step channels.
 3. Positioning of the **latent log-barrier off-policy controller (CSAC-LB)** as a distinct corner of the Pareto surface -- strong reward performance at the cost of higher constraint violations.
 4. An auxiliary **temperature-comfort case study** confirming that the pipeline generalises beyond V2G to additional constraint channels.
 
@@ -149,11 +149,11 @@ python scripts/evaluation/eval_r26hi.py --run-dir runs/headroom_gated_cmdp/
 
 ## Algorithm Roster
 
-Thirteen controllers benchmarked in the thesis:
+Eleven controllers benchmarked in the thesis:
 
 | Category | Algorithms |
 |----------|-----------|
-| Rule-based | Zero-Action, RBC (greedy), RBC (planned) |
+| Rule-based | Zero-Action, RBC (greedy) |
 | Unconstrained RL | PPO |
 | Single-Lagrangian | PPO-Lag, TRPO-Lag, SAC-Lag |
 | Projection-based | CPO |

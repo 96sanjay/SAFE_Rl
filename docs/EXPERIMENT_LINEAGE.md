@@ -629,8 +629,8 @@ shaping and is not a separate constraint.
 | `shell/archive/run_r25b_report_stable.sh`       | Stable baseline configuration        |
 | `shell/archive/run_r26h.sh`                     | Forecast-lean arbitrage (failed)     |
 | `shell/archive/run_r26j.sh`                     | Lagrangian fix attempt (failed)      |
-| `scripts/train_multi_lag_stems.py`              | Training script (STEMS encoder)      |
-| `scripts/train_multi_lag.py`                    | Training script (MLP, legacy)        |
-| `scripts/eval_r26hi.py`                         | Evaluation: per-departure C1, per-building C3 |
-| `stems_encoder.py`                           | STEMSv3 encoder implementation       |
-| `stems_encoder_5bld.py`                         | 5-building STEMS configuration       |
+| `scripts/training/train_multi_lag_stems.py`     | Training script (STEMS encoder)      |
+| `scripts/training/train_multi_lag.py`           | Training script (MLP, legacy)        |
+| `scripts/evaluation/eval_r26hi.py`              | Evaluation: per-departure C1, per-building C3 |
+| `citylearn_safe/stems_encoder.py`               | STEMSv3 encoder implementation       |
+| `citylearn_safe/stems_encoder_5bld.py`          | 5-building STEMS configuration       |

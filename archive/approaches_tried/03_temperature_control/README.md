@@ -70,7 +70,7 @@ constraint violations after 40 epochs.
 │
 ├── # ── Thesis Figures (PDFs) ──
 ├── figures/
-│   ├── latex_ready/                   # Final figures used in thesis (53 PDFs)
+│   ├── latex_ready/                   # Final figures used in thesis (48 PDFs)
 │   │   ├── fig_benchmark_training_curves.pdf
 │   │   ├── fig_benchmark_violation_rates.pdf
 │   │   ├── fig_benchmark_pareto_front.pdf

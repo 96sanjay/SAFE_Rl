@@ -175,7 +175,7 @@ Set to `0.0` to disable a component.
 | `CITYLEARN_TEMPORAL_RICH` | `0` | Rich temporal features (solar, EV SoC, hour encoding) |
 | `CITYLEARN_SPATIAL_OBS` | `0` | Spatial graph features (per-building headroom, SoC spread) |
 | `CITYLEARN_NUM_BUILDINGS` | `0` | Override building count (0 = auto-detect) |
-| `STEMS_ENCODER_VERSION` | `default` | STEMS encoder variant (GCN + Temporal Transformer) |
+| `STEMS_ENCODER_VERSION` | `v3` | STEMS encoder variant (GCN + Temporal Transformer) |
 | `STEMS_AUX_TARGETS` | `0` | Auxiliary temporal prediction targets |
 
 ### 3.4 Safety and Constraint Control
@@ -184,7 +184,7 @@ Set to `0.0` to disable a component.
 |----------|---------|-------------|
 | `CITYLEARN_EV_SAUTE` | `0` | Saute MDP for C1 (dense per-step EV budget augmentation) |
 | `CITYLEARN_EV_SAUTE_SHAPED_ALPHA` | `0.0` | Smooth shaping for Saute penalty (0 = binary) |
-| `CITYLEARN_PENALTY_MAX` | -- | Maximum penalty for constraint violations |
+| ~~`CITYLEARN_PENALTY_MAX`~~ | -- | **Not an env var.** The penalty cap is set via YAML key `lagrangian_upper_bound` in `lagrange_cfgs` (see Section 2). |
 | `CITYLEARN_PID_LAGRANGE` | `0` | Enable PID Lagrangian (1 = on) |
 | `CITYLEARN_EXECUTION_SHIELD` | `1` | Execution-time safety projection |
 | `SAUTE_C4_ENABLED` | `0` | Saute MDP for C4 (grid power budget) |
@@ -228,18 +228,16 @@ algorithms bypass them.
 | `CITYLEARN_SCHEMA` | -- | Path to CityLearn schema JSON |
 | `CITYLEARN_STEMS_P_BUILDING_MAX` | auto | Max building power (auto-calibrated from env) |
 | `CITYLEARN_STEMS_P_GRID_MAX` | auto | Max grid power (auto-calibrated from env) |
-| `CITYLEARN_STEMS_SOC_LOW` | `0.0` | Lower SoC bound for C2 |
+| `CITYLEARN_STEMS_SOC_LOW` | `0.05` | Lower SoC bound for C2 |
 | `CITYLEARN_STEMS_SOC_HIGH` | `0.95` | Upper SoC bound for C2 |
-| `CITYLEARN_C3_COST` | -- | C3 cost coefficient |
-| `CITYLEARN_C4_COST` | -- | C4 cost coefficient |
-| `CITYLEARN_C3_CONTROLLABLE` | `0` | Use controllable load only for C3 |
+| `CITYLEARN_C3_CONTROLLABLE` | `0` | Use controllable load only for C3 (read by `safety_env.py`) |
 | `CITYLEARN_C0_DENSE_MERGE` | `0` | Merge dense C1 variant (code index 1) into sparse C1 channel (code index 0) |
 
 ---
 
 ## 4. CLI Arguments
 
-The training script `scripts/train_multi_lag_stems.py` accepts:
+The training script `scripts/training/train_multi_lag_stems.py` accepts:
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -335,7 +333,7 @@ export CITYLEARN_SCHEMA="$PWD/data/citylearn_challenge_2022_phase_all_plus_evs/s
 # ── STEMS encoder settings ──
 export CITYLEARN_TEMPORAL_RICH=1        # Rich temporal features
 export CITYLEARN_TEMPORAL_WINDOW=12     # 12-step history
-export STEMS_ENCODER_VERSION=default     # GCN + Temporal Transformer
+export STEMS_ENCODER_VERSION=v3          # GCN + Temporal Transformer
 
 # ── Reward terms ──
 export STEMS_MU_ECONOMIC=0.0            # r_eco OFF
@@ -352,20 +350,18 @@ export STEMS_ALPHA_TRAJECTORY=0.0       # OFF (conflicts with C1)
 # ── Safety flags ──
 export CITYLEARN_EV_SAUTE=0             # Saute OFF (sparse C1 only)
 export CITYLEARN_BATT_CLAMP=0           # No action clamps
-export CITYLEARN_EV_CLAMP=0
+export CITYLEARN_EV_ACTION_CLAMP=0
 export CITYLEARN_PID_LAGRANGE=1         # PID Lagrangian ON
 
 # ── SoC bounds ──
-export CITYLEARN_STEMS_SOC_LOW=0.0
+export CITYLEARN_STEMS_SOC_LOW=0.05
 export CITYLEARN_STEMS_SOC_HIGH=0.95
 
-# ── Cost coefficients ──
-export CITYLEARN_C3_COST=0.1
-export CITYLEARN_C4_COST=5.0
-export CITYLEARN_C3_CONTROLLABLE=1
+# ── Cost control ──
+export CITYLEARN_C3_CONTROLLABLE=1      # Use controllable load only for C3
 
 # ── Launch ──
-nohup python scripts/train_multi_lag_stems.py \
+nohup python scripts/training/train_multi_lag_stems.py \
     --cfg configs/active/headroom_gated_cmdp.yaml \
     --hidden_dim 64 \
     --output_dim 256 \

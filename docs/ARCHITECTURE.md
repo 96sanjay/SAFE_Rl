@@ -74,7 +74,7 @@ PID Lagrangian controllers manage per-constraint multipliers.
  |      |                                                            |
  |  +---v------------------------------------------------------+    |
  |  |  [Optional] SauteEVBudgetWrapper (C1 dense budget)        |    |
- |  |  [Optional] ActionProjectionSERL / ActionMaskWrapper      |    |
+ |  |  [Optional] ActionProjectionWrapper / ActionMaskWrapper    |    |
  |  +---+------------------------------------------------------+    |
  |      |                                                            |
  |  +---v------------------------------------------------------+    |
@@ -164,14 +164,15 @@ readiness). Augments the observation with a per-EV budget variable that tracks
 remaining safety budget. Converts the sparse departure-time constraint into a
 dense per-step penalty when the budget is depleted.
 
-### 2.6 ActionProjectionSERL / ActionMaskWrapper (Optional)
+### 2.6 ActionProjectionWrapper / ActionMaskWrapper (Optional)
 
-**Files:** `citylearn_safe/action_projection_serl.py`,
+**Files:** `citylearn_safe/action_projection.py`,
 `citylearn_safe/action_mask_wrapper.py`
 
-Hard constraint enforcement at the action level. The SE-RL projector clips
-actions to satisfy C2/C3/C4 power constraints by construction, reducing the
-constraint satisfaction burden on the learned policy.
+Hard constraint enforcement at the action level. The `ActionProjectionWrapper`
+uses a lexicographic QP safety shield to clip actions and satisfy C1--C4
+constraints by construction, reducing the constraint satisfaction burden on the
+learned policy.
 
 ### 2.7 CityLearnCMDP
 
@@ -196,10 +197,14 @@ The outermost wrapper, registered with OmniSafe via `@env_register`. This class:
 The observation is a flat vector whose structure depends on which wrappers are
 active. With all wrappers enabled (STEMS encoder, temporal history T=12, basic mode):
 
+> **Note:** The dimension counts below are for the **5-building schema**
+> (`schema_5buildings.json`) used throughout the thesis. Other schemas with
+> different building/EV counts will produce different base observation sizes.
+
 ```
 obs [obs_dim]
  |
- +-- Base obs (70 dims)
+ +-- Base obs (70 dims, for 5-building schema)
  |    +-- Per-building (4 features x 5 buildings = 20)
  |    |    - non_shiftable_load
  |    |    - solar_generation
@@ -262,7 +267,7 @@ the CityLearn environment at init time.
 
 1. The actor outputs raw actions in [-1, 1] (or [0, 1] in beta actor mode).
 2. Optional `ActionMaskWrapper` rescales actions to state-dependent safe bounds.
-3. Optional `ActionProjectionSERL` clips actions to satisfy power constraints.
+3. Optional `ActionProjectionWrapper` clips actions to satisfy power constraints.
 4. Battery SoC clamping prevents actions that would violate physical SoC bounds.
 5. EV disconnect masking zeroes out actions for disconnected EVs (no-op).
 
@@ -817,6 +822,7 @@ its feasibility corridor, ensuring C1 compliance takes priority over economics.
 | `citylearn_safe/pid_lagrange.py` | PID Lagrangian controller |
 | `citylearn_safe/grads/ppo_lag_multi.py` | PPOLagMulti: multi-constraint PPO |
 | `citylearn_safe/grads/ppo_lag_grads.py` | PPOLagGradS: gradient surgery variant |
+| `citylearn_safe/action_projection.py` | ActionProjectionWrapper: lexicographic QP safety shield |
 | `citylearn_safe/extractors.py` | EV deficit computation, SoC utilities |
 | `citylearn_safe/forecast_obs_wrapper.py` | 24h forecast observation wrapper |
 | `citylearn_safe/temporal_obs_wrapper.py` | T-step history observation wrapper |

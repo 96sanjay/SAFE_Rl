@@ -3,7 +3,7 @@
 # ==========================================================
 # Key changes from R26j:
 #   1. r_ev_smart=1.5 (NEW) — headroom-gated price signal, departure-aware
-#   2. r_ev=2.0 + r_ev_guard=0.5 — baseline EV charging
+#   2. r_ev=0 + r_ev_guard=0 — OFF (r_ev_smart + Lagrangian handle EV)
 #   3. Dense C0 via Sauté (C1 channel) — per-step corridor cost
 #   4. penalty_max=35 (R26j saturated at 20)
 #   5. C0 curriculum [200→20] over 0-20 epochs (faster)

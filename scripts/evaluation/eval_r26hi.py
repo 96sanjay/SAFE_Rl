@@ -7,17 +7,11 @@ mean pooling), runs a deterministic 1-episode (8759 steps) evaluation, and
 reports per-constraint violation percentages, totals, reward component
 breakdown, price-aware action analysis, and CityLearn KPIs.
 
-Usage (on remote server):
-    cd /home/sanjay/Safe-CityLearn-Fork/Safe-CityLearn-Fork
+Usage:
+    cd <PROJECT_ROOT>
     conda activate citylearn
-    python scripts/eval_r26hi.py --run r26h [--checkpoint PATH] [--device cpu]
-    python scripts/eval_r26hi.py --run r26i [--checkpoint PATH] [--device cpu]
-
-Usage (local):
-    cd /home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork
-    conda activate citylearn
-    python scripts/eval_r26hi.py --run r26h [--checkpoint PATH] [--device cpu]
-    python scripts/eval_r26hi.py --run r26i [--checkpoint PATH] [--device cpu]
+    python scripts/evaluation/eval_r26hi.py --run r26h [--checkpoint PATH] [--device cpu]
+    python scripts/evaluation/eval_r26hi.py --run r26i [--checkpoint PATH] [--device cpu]
 """
 from __future__ import annotations
 
@@ -32,17 +26,10 @@ import torch
 import torch.nn as nn
 
 # ---------------------------------------------------------------------------
-# Path setup: detect which machine we are on
+# Path setup: derive PROJECT_ROOT from this file's location
+# (this file lives at <PROJECT_ROOT>/scripts/evaluation/eval_r26hi.py)
 # ---------------------------------------------------------------------------
-REMOTE_ROOT = "/home/sanjay/Safe-CityLearn-Fork"
-LOCAL_ROOT = "/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork"
-
-if os.path.isdir(REMOTE_ROOT):
-    PROJECT_ROOT = REMOTE_ROOT
-elif os.path.isdir(LOCAL_ROOT):
-    PROJECT_ROOT = LOCAL_ROOT
-else:
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)

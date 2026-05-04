@@ -1,19 +1,26 @@
 #!/bin/bash
-# R27a: Headroom-Gated CMDP (departure-aware EV + dense C0)
+# R27a: Headroom-Gated CMDP (departure-aware EV + sparse C0)
 # ==========================================================
 # Key changes from R26j:
 #   1. r_ev_smart=1.5 (NEW) — headroom-gated price signal, departure-aware
 #   2. r_ev=0 + r_ev_guard=0 — OFF (r_ev_smart + Lagrangian handle EV)
-#   3. Dense C0 via Sauté (C1 channel) — per-step corridor cost
+#   3. Sparse C0 only — fixed limit=200, no Saute, no curriculum
+#      PID (Kp=2.0, Ki=0.05) finds Lambda_0 naturally
 #   4. penalty_max=35 (R26j saturated at 20)
-#   5. C0 curriculum [200→20] over 0-20 epochs (faster)
-#   6. r_trajectory=0 (REMOVED — conflicts with C0)
-#   7. 40-epoch test run (check at epoch 30 if working)
+#   5. r_trajectory=0 (REMOVED — conflicts with C0)
+#   6. 40-epoch test run (check at epoch 20 if working)
 # ==========================================================
 set -euo pipefail
 
-# Activate conda environment
-eval "$(/home/sanjay/miniconda3/bin/conda shell.bash hook)"
+# Activate conda environment (adjust conda path if needed)
+if [ -n "${CONDA_EXE:-}" ]; then
+    eval "$(${CONDA_EXE} shell.bash hook)"
+elif command -v conda &>/dev/null; then
+    eval "$(conda shell.bash hook)"
+else
+    echo "ERROR: conda not found. Install conda or set CONDA_EXE." >&2
+    exit 1
+fi
 conda activate citylearn
 
 export CITYLEARN_SCHEMA="$PWD/data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json"
@@ -72,14 +79,14 @@ export CITYLEARN_PID_LAGRANGE=1
 echo "=== R27a: Headroom-Gated CMDP (40-epoch test) ==="
 echo "  Reward: r_sg=1.5 r_sb=1.5 r_ramp=0.3 r_ren=0.3 r_barrier=0.3"
 echo "  EV:     r_ev=0 r_ev_guard=0 r_ev_smart=1.5 (pure CMDP — Lagrangian handles C0)"
-echo "  C0: fixed limit=200, Kp=0.5, Ki=0.01 (sparse max ~700)"
+echo "  C0: fixed limit=200, Kp=2.0, Ki=0.05 (sparse max ~700)"
 echo "  C1: unused"
 echo "  C3: limit=5000, Kp=0.5, Ki=0.05"
 echo "  C4: limit=8000, Kp=0.3, Ki=0.03"
 echo "  penalty_max=35"
 echo ""
 
-nohup python scripts/train_multi_lag_stems.py \
+nohup python scripts/training/train_multi_lag_stems.py \
     --cfg configs/active/headroom_gated_cmdp.yaml \
     --hidden_dim 64 \
     --output_dim 256 \

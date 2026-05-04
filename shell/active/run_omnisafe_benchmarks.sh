@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# OmniSafe Benchmark Suite — 5 algorithms on srv07 GPU
+# OmniSafe Benchmark Suite — 5 algorithms
 # =============================================================================
-# Runs PPOLag, TRPOLag, FOCOPS, CPPOPID, PCPO in parallel on A100 GPU.
+# Runs PPOLag, TRPOLag, FOCOPS, CPPOPID, PCPO in parallel on GPU.
 # All share the same 9-term reward (env vars) and aggregate cost signal.
 # =============================================================================
 set -euo pipefail
@@ -10,22 +10,23 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Environment setup
 # ---------------------------------------------------------------------------
-if [ -f "/home/sanjay/miniconda3/bin/conda" ]; then
-    eval "$(/home/sanjay/miniconda3/bin/conda shell.bash hook)"
-elif [ -f "/home/christmas/miniconda3/bin/conda" ]; then
-    eval "$(/home/christmas/miniconda3/bin/conda shell.bash hook)"
+# Activate conda environment (adjust conda path if needed)
+if [ -n "${CONDA_EXE:-}" ]; then
+    eval "$(${CONDA_EXE} shell.bash hook)"
+elif command -v conda &>/dev/null; then
+    eval "$(conda shell.bash hook)"
 else
-    echo "ERROR: conda not found"
+    echo "ERROR: conda not found. Install conda or set CONDA_EXE." >&2
     exit 1
 fi
 conda activate citylearn
 
-PROJECT="$(cd "$(dirname "$0")" && pwd)"
+PROJECT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${PROJECT}"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
-# Limit CPU threads — Optuna is using 88/96 cores, leave headroom
+# Limit CPU threads to avoid contention with GPU training
 export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
@@ -150,7 +151,7 @@ for algo in "${ALGOS[@]}"; do
     LOG="${LOG_DIR}/${algo}.log"
 
     echo "  Launching ${algo} ..."
-    nohup python scripts/train_omnisafe.py \
+    nohup python scripts/training/train_omnisafe.py \
         --cfg "${CFG}" \
         > "${LOG}" 2>&1 &
     PIDS+=($!)

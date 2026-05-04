@@ -37,7 +37,11 @@ This repository implements the system described in the thesis *"Development of C
 | C3 | Building power envelope | Bounded power, per-step per-building |
 | C4 | Grid import ceiling | District cap, per-step |
 
-Each channel has its own cost signal, cost critic (MLP), and PID-controlled Lagrangian multiplier. This per-channel architecture is the central design decision: it prevents inter-constraint interference and makes every violation attributable to a specific operational requirement.
+Each channel has its own cost signal, cost critic (MLP), and PID-controlled Lagrangian multiplier.
+
+> **Note:** The codebase uses 0-indexed channels internally (`cost_limit_0` = C1, etc.). Documentation and thesis use 1-indexed (C1-C4).
+
+This per-channel architecture is the central design decision: it prevents inter-constraint interference and makes every violation attributable to a specific operational requirement.
 
 ## Pipeline
 
@@ -115,11 +119,14 @@ conda create -n citylearn python=3.10 -y
 conda activate citylearn
 
 # Install dependencies
-pip install torch>=2.0 omnisafe>=0.4 citylearn>=2.1
+pip install torch>=2.0
 pip install gymnasium numpy pandas matplotlib tyro pyyaml rich
 
-# Install vendored dependencies
-pip install -e vendor_deps/omnisafe
+# OmniSafe and CityLearn are vendored with required patches (do NOT install from PyPI).
+# Launch scripts set PYTHONPATH automatically.
+# To run manually, set: export PYTHONPATH="$PWD:$PYTHONPATH"
+
+# Install vendored CVXPyLayers (has setup.py)
 pip install -e vendor_deps/cvxpylayers
 ```
 
@@ -144,8 +151,10 @@ python scripts/training/train_multi_lag_stems.py \
 python scripts/evaluation/evaluate_thesis.py
 
 # Generate per-departure C1 and per-building C3 violation metrics
-python scripts/evaluation/eval_r26hi.py --run-dir runs/headroom_gated_cmdp/
+python scripts/evaluation/eval_r26hi.py --run <RUN_ID> --checkpoint <PATH_TO_CHECKPOINT>
 ```
+
+> **Note:** Pre-trained checkpoints are not included in this repository. You must run training first to generate the checkpoint files required for evaluation.
 
 ## Algorithm Roster
 
@@ -153,7 +162,7 @@ Eleven controllers benchmarked in the thesis:
 
 | Category | Algorithms |
 |----------|-----------|
-| Rule-based | Zero-Action, RBC (greedy) |
+| Baselines | Zero-Action, RBC (greedy) |
 | Unconstrained RL | PPO |
 | Single-Lagrangian | PPO-Lag, TRPO-Lag, SAC-Lag |
 | Projection-based | CPO |

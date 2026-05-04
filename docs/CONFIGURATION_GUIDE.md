@@ -323,8 +323,12 @@ runs.
 # R27a: Headroom-Gated CMDP
 set -euo pipefail
 
-# ── Conda activation ──
-eval "$(/home/sanjay/miniconda3/bin/conda shell.bash hook)"
+# ── Conda activation (adjust path if needed) ──
+if [ -n "${CONDA_EXE:-}" ]; then
+    eval "$(${CONDA_EXE} shell.bash hook)"
+elif command -v conda &>/dev/null; then
+    eval "$(conda shell.bash hook)"
+fi
 conda activate citylearn
 
 # ── Schema ──

@@ -1,4 +1,4 @@
-# scripts/train_multi_lag.py
+# scripts/training/train_multi_lag.py
 """Training script for PPOLagMulti (per-constraint Lagrange + softmax advantage).
 
 Bypasses omnisafe.Agent (which needs a default config YAML per algorithm)
@@ -16,9 +16,8 @@ import os
 import numpy as np
 import yaml
 
-# Register environments FIRST
-import citylearn_safe.omni_env       # noqa: F401
-import citylearn_safe.cmdp_env    # noqa: F401
+# Register environments FIRST (cmdp_env registers CityLearnSafety-V2G-v2)
+import citylearn_safe.cmdp_env    # noqa: F401  @env_register side-effect
 
 from omnisafe.utils.config import Config
 

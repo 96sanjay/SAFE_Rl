@@ -22,7 +22,7 @@ The approaches are numbered in roughly chronological order. Read them in sequenc
 - C1: EV departure SoC deadlines
 - C2: Battery cycling limits
 - C3: Peak demand caps
-- C4: Thermal comfort bounds
+- C4: Grid import ceiling
 
 A single Lagrangian multiplier cannot express trade-offs between these competing concerns. The agent would satisfy whichever constraint the multiplier was tuned for and ignore the rest.
 

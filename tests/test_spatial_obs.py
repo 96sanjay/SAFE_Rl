@@ -6,13 +6,14 @@ Uses the 5-building schema by default, but works with any schema.
 import os, sys
 import numpy as np
 
-os.chdir("/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork")
-sys.path.insert(0, os.getcwd())
+_PROJECT_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.chdir(_PROJECT_ROOT)
+sys.path.insert(0, _PROJECT_ROOT)
 
 # Default to 5-building schema; override with CITYLEARN_SCHEMA env var
 if "CITYLEARN_SCHEMA" not in os.environ:
     os.environ["CITYLEARN_SCHEMA"] = os.path.join(
-        os.getcwd(), "data/citylearn_challenge_2022_phase_all_plus_evs/schema.json"
+        _PROJECT_ROOT, "data/citylearn_challenge_2022_phase_all_plus_evs/schema.json"
     )
 os.environ["CITYLEARN_STEMS_P_BUILDING_MAX"] = "4.6083"
 os.environ["CITYLEARN_STEMS_P_GRID_MAX"] = "29.6915"

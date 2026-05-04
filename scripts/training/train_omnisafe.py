@@ -1,10 +1,9 @@
-# scripts/train_omnisafe.py
+# scripts/training/train_omnisafe.py
 from __future__ import annotations
 import argparse, yaml
 import omnisafe
 
-import citylearn_safe.omni_env  # <-- IMPORTANT: triggers @env_register
-import citylearn_safe.cmdp_env  # V2: forecast + EV reward + rebalanced cost
+import citylearn_safe.cmdp_env  # <-- IMPORTANT: triggers @env_register (registers CityLearnSafety-V2G-v2)
 import citylearn_safe.cmdp_env_shield  # V2-shield: ActionProjection + CMDP
 
 def main(cfg_path: str) -> None:

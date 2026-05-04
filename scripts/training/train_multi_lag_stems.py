@@ -1,4 +1,4 @@
-# scripts/train_multi_lag_stems.py
+# scripts/training/train_multi_lag_stems.py
 """Training script for PPOLagMulti + STEMS encoder (GCN-Transformer).
 
 Combines:
@@ -20,13 +20,12 @@ import torch
 import torch.nn as nn
 
 # Ensure project root is on path
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Register environments FIRST
-import citylearn_safe.omni_env       # noqa: F401
-import citylearn_safe.cmdp_env    # noqa: F401
+# Register environments FIRST (cmdp_env registers CityLearnSafety-V2G-v2)
+import citylearn_safe.cmdp_env    # noqa: F401  @env_register side-effect
 
 from omnisafe.utils.config import Config
 from omnisafe.models.actor.gaussian_learning_actor import GaussianLearningActor

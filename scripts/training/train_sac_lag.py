@@ -1,4 +1,4 @@
-# scripts/train_sac_lag.py
+# scripts/training/train_sac_lag.py
 """Training script for SACLagMulti (off-policy, per-constraint Lagrange multipliers).
 
 Bypasses omnisafe.Agent (which needs a default config YAML per algorithm)
@@ -15,9 +15,8 @@ import os
 
 import yaml
 
-# Register environments FIRST
-import citylearn_safe.omni_env       # noqa: F401
-import citylearn_safe.cmdp_env    # noqa: F401
+# Register environments FIRST (cmdp_env registers CityLearnSafety-V2G-v2)
+import citylearn_safe.cmdp_env    # noqa: F401  @env_register side-effect
 
 from omnisafe.utils.config import Config
 

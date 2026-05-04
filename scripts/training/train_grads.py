@@ -1,4 +1,4 @@
-# scripts/train_grads.py
+# scripts/training/train_grads.py
 """Training script for PPOLag + GradS.
 
 Bypasses omnisafe.Agent (which needs a default config YAML per algorithm)
@@ -16,9 +16,8 @@ import os
 import torch
 import yaml
 
-# Register environments FIRST
-import citylearn_safe.omni_env       # noqa: F401
-import citylearn_safe.cmdp_env    # noqa: F401
+# Register environments FIRST (cmdp_env registers CityLearnSafety-V2G-v2)
+import citylearn_safe.cmdp_env    # noqa: F401  @env_register side-effect
 
 from omnisafe.utils.config import Config
 from omnisafe.utils.tools import seed_all

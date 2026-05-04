@@ -23,6 +23,8 @@ else
 fi
 conda activate citylearn
 
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+
 export CITYLEARN_SCHEMA="$PWD/data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json"
 export CITYLEARN_TEMPORAL_RICH=1
 export CITYLEARN_TEMPORAL_WINDOW=12

@@ -24,13 +24,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Register envs first
-import citylearn_safe.omni_env  # noqa: F401
-import citylearn_safe.cmdp_env  # noqa: F401
+# Register envs first (cmdp_env registers CityLearnSafety-V2G-v2)
+import citylearn_safe.cmdp_env  # noqa: F401  @env_register side-effect
 
 from citylearn_safe.cmdp_env import CityLearnCMDP
 from citylearn_safe.pid_lagrange import PIDLagrange

@@ -30,12 +30,12 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import citylearn_safe.omni_env  # noqa: F401
-import citylearn_safe.cmdp_env  # noqa: F401
+# Register envs (cmdp_env registers CityLearnSafety-V2G-v2)
+import citylearn_safe.cmdp_env  # noqa: F401  @env_register side-effect
 
 from citylearn_safe.cmdp_env import CityLearnCMDP
 from citylearn_safe.feasibility_obs_wrapper import FeasibilityObsWrapper

@@ -3,7 +3,7 @@
 Tests for the Policy Health Diagnostic Suite scaffold.
 
 Run:
-  cd /home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork
+  cd <project_root>
   conda run -n citylearn python -m pytest tests/test_diagnose_policy_health.py -v
 """
 

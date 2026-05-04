@@ -5,7 +5,8 @@ import os
 import yaml
 import pytest
 
-CFG_PATH = "configs/on-policy/r28_pposaute.yaml"
+_PROJECT_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CFG_PATH = os.path.join(_PROJECT_ROOT, "configs", "active", "benchmark_pposaute.yaml")
 
 
 def test_config_file_exists():
@@ -84,8 +85,10 @@ def test_total_steps_is_100_epochs():
 def test_omnisafe_agent_loads_with_saute_adapter(tmp_path, monkeypatch):
     """PPOSaute agent instantiates, env loads, obs space is augmented by +1 dim."""
     # Env vars required by CityLearn omni_env (minimal subset; full set only needed for training)
+    monkeypatch.chdir(_PROJECT_ROOT)
     monkeypatch.setenv("CITYLEARN_SCHEMA",
-                       "data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json")
+                       os.path.join(_PROJECT_ROOT,
+                                    "data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json"))
     monkeypatch.setenv("CITYLEARN_CENTRAL_AGENT", "1")
     monkeypatch.setenv("CITYLEARN_REWARD_TYPE", "stems")
     monkeypatch.setenv("CITYLEARN_TEMPORAL_WINDOW", "0")

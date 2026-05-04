@@ -120,7 +120,7 @@ conda activate citylearn
 
 # Install dependencies
 pip install torch>=2.0
-pip install gymnasium numpy pandas matplotlib tyro pyyaml rich
+pip install gymnasium numpy pandas matplotlib seaborn tyro pyyaml rich
 
 # OmniSafe and CityLearn are vendored with required patches (do NOT install from PyPI).
 # Launch scripts set PYTHONPATH automatically.

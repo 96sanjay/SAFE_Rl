@@ -2,7 +2,7 @@
 ## OmniSafe × CityLearn Integration — End-to-End ML Pipeline
 
 > **Authors:** Multi-Agent Analysis (Senior ML Architect · Codebase Analyzer · Technical Documentation Writer)
-> **Codebase:** `/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork`
+> **Codebase:** This repository (`SAFE_RL/`)
 > **Branch:** `saf-omni-work`
 > **Date:** 2026-04-09
 

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from collections import defaultdict
 
-PROJECT = "/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork"
+PROJECT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(PROJECT)
 sys.path.insert(0, PROJECT)
 

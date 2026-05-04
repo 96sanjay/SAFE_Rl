@@ -19,12 +19,11 @@ from typing import Any
 import numpy as np
 import torch
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import citylearn_safe.omni_env  # noqa: F401
-import citylearn_safe.cmdp_env  # noqa: F401
+import citylearn_safe.cmdp_env  # noqa: F401  (registers env)
 
 from citylearn_safe.feasibility_obs_wrapper import FeasibilityObsWrapper
 from citylearn_safe.cmdp_env import CityLearnCMDP

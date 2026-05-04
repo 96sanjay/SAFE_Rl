@@ -14,7 +14,7 @@ import pandas as pd
 import torch
 from gymnasium.spaces import Box
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 VENDORED_OMNISAFE = PROJECT_ROOT / "vendor_deps"
@@ -185,10 +185,10 @@ def run_rollout(name, policy_kind, seed, run_dir, checkpoint=None):
 
 def main():
     RUN_DIR = Path(
-        "/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork/runs"
-        "/csac_lb_temp_strict_40ep"
-        "/CSACLBTemp-{CityLearnTemp-CoolingOnly-CSACLB-v0}"
-        "/seed-000-2026-03-27-23-30-03"
+        PROJECT_ROOT / "runs"
+        / "csac_lb_temp_strict_40ep"
+        / "CSACLBTemp-{CityLearnTemp-CoolingOnly-CSACLB-v0}"
+        / "seed-000-2026-03-27-23-30-03"
     )
     SEED = 0
 

@@ -194,8 +194,7 @@ class STEMSMeanNet(nn.Module):
 def build_eval_env():
     """Build the evaluation environment with the same wrapper chain as training."""
     # Register environments
-    import citylearn_safe.omni_env       # noqa: F401
-    import citylearn_safe.cmdp_env    # noqa: F401
+    import citylearn_safe.cmdp_env    # noqa: F401  (registers env)
 
     from scripts.make_env import make_base_env
     from citylearn_safe.safety_env import CityLearnSafetyEnv

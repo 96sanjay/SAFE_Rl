@@ -30,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-PROJECT_ROOT = "/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -267,8 +267,7 @@ def get_citylearn_env(env):
 
 
 def build_eval_env():
-    import citylearn_safe.omni_env  # noqa: F401
-    import citylearn_safe.cmdp_env  # noqa: F401
+    import citylearn_safe.cmdp_env  # noqa: F401  (registers env)
     from scripts.make_env import make_base_env
     from citylearn_safe.safety_env import CityLearnSafetyEnv
     from citylearn_safe.forecast_obs_wrapper import ForecastObsWrapper

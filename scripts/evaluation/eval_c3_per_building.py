@@ -13,9 +13,9 @@ Reports:
   - Structural vs agent-caused violations (NSL+solar baseline)
 
 Usage:
-    cd /home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork
+    cd <PROJECT_ROOT>
     conda activate citylearn
-    PYTHONPATH=$PWD python scripts/eval_c3_per_building.py
+    PYTHONPATH=$PWD python scripts/evaluation/eval_c3_per_building.py
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from collections import defaultdict
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-PROJECT = "/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork"
+PROJECT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(PROJECT)
 sys.path.insert(0, PROJECT)
 
@@ -43,7 +43,7 @@ BATT_DT = 1.0
 # Environment variables (matching r25b ablation configs)
 # =========================================================================
 COMMON_ENV = {
-    "CITYLEARN_SCHEMA": f"{PROJECT}/data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json",
+    "CITYLEARN_SCHEMA": os.path.join(PROJECT, "data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json"),
     "CITYLEARN_CENTRAL_AGENT": "1",
     "CITYLEARN_REWARD_TYPE": "stems",
     "CITYLEARN_EXPORT_FACTOR": "0.7",

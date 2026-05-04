@@ -2,8 +2,18 @@
 # R27b: r_ev=2.5 dense penalty + sparse C0 + r_ev_smart
 set -euo pipefail
 
-eval "$(/home/sanjay/miniconda3/bin/conda shell.bash hook)"
+if [ -n "${CONDA_EXE:-}" ]; then
+    eval "$(${CONDA_EXE} shell.bash hook)"
+elif command -v conda &>/dev/null; then
+    eval "$(conda shell.bash hook)"
+else
+    echo "ERROR: conda not found. Install conda or set CONDA_EXE." >&2
+    exit 1
+fi
 conda activate citylearn
+
+cd "$(dirname "$0")/../.."
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 export CITYLEARN_SCHEMA="$PWD/data/citylearn_challenge_2022_phase_all_plus_evs/schema_5buildings.json"
 export CITYLEARN_TEMPORAL_RICH=1

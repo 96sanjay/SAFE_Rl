@@ -16,8 +16,18 @@
 #   - No curriculum (mask keeps lambdas low from epoch 0)
 set -euo pipefail
 
-PROJECT="/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork"
+PROJECT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$PROJECT"
+
+if [ -n "${CONDA_EXE:-}" ]; then
+    eval "$(${CONDA_EXE} shell.bash hook)"
+elif command -v conda &>/dev/null; then
+    eval "$(conda shell.bash hook)"
+else
+    echo "ERROR: conda not found. Install conda or set CONDA_EXE." >&2
+    exit 1
+fi
+conda activate citylearn
 
 export PYTHONPATH="$PROJECT:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -121,5 +131,5 @@ echo "  No curriculum, no conflicting terms"
 echo "============================================"
 echo ""
 
-/home/christmas/miniconda3/envs/citylearn/bin/python scripts/train_multi_lag.py \
+python scripts/train_multi_lag.py \
     --cfg configs/active/action_mask_simple.yaml

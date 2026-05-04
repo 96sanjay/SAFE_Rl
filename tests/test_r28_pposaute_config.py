@@ -96,8 +96,7 @@ def test_omnisafe_agent_loads_with_saute_adapter(tmp_path, monkeypatch):
     monkeypatch.setenv("CITYLEARN_EV_SAUTE", "0")
 
     import omnisafe
-    import citylearn_safe.omni_env        # noqa: F401 - registers env
-    import citylearn_safe.cmdp_env     # noqa: F401 - registers env
+    import citylearn_safe.cmdp_env     # noqa: F401 - registers CityLearnSafety-V2G-v2
 
     with open(CFG_PATH) as f:
         cfg = yaml.safe_load(f)

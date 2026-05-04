@@ -20,17 +20,17 @@ fi
 # ---------------------------------------------------------------------------
 # Environment setup
 # ---------------------------------------------------------------------------
-if [ -f "/home/sanjay/miniconda3/bin/conda" ]; then
-    eval "$(/home/sanjay/miniconda3/bin/conda shell.bash hook)"
-elif [ -f "/home/christmas/miniconda3/bin/conda" ]; then
-    eval "$(/home/christmas/miniconda3/bin/conda shell.bash hook)"
+if [ -n "${CONDA_EXE:-}" ]; then
+    eval "$(${CONDA_EXE} shell.bash hook)"
+elif command -v conda &>/dev/null; then
+    eval "$(conda shell.bash hook)"
 else
-    echo "ERROR: conda not found"
+    echo "ERROR: conda not found. Install conda or set CONDA_EXE." >&2
     exit 1
 fi
 conda activate citylearn
 
-PROJECT="$(cd "$(dirname "$0")" && pwd)"
+PROJECT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${PROJECT}"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1

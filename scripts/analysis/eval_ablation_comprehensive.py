@@ -16,9 +16,9 @@ Evaluates final-epoch checkpoints of both methods, producing:
 Also prints a comprehensive summary table.
 
 Usage:
-    cd /home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork
+    cd <PROJECT_ROOT>
     conda activate citylearn
-    python scripts/eval_ablation_comprehensive.py
+    python scripts/analysis/eval_ablation_comprehensive.py
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ---------------------------------------------------------------------------
 # Path setup
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = "/home/extra-storage/THESIS/Safe-CityLearn-Fork/Safe-CityLearn-Fork"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -169,8 +169,7 @@ def set_env_vars():
 
 
 def build_eval_env():
-    import citylearn_safe.omni_env       # noqa: F401
-    import citylearn_safe.cmdp_env    # noqa: F401
+    import citylearn_safe.cmdp_env    # noqa: F401  (registers env)
     from scripts.make_env import make_base_env
     from citylearn_safe.safety_env import CityLearnSafetyEnv
     from citylearn_safe.forecast_obs_wrapper import ForecastObsWrapper

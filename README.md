@@ -59,11 +59,9 @@ CityLearn Simulation (5 buildings, battery + EV charger)
   CityLearnCMDP       -- OmniSafe CMDP registration, STEMS reward
         |
   PPO-Lag-Multi        -- per-channel PID Lagrangian optimisation
-    Actor:  STEMSEncoder -> GaussianPolicy
-    Critic: STEMSEncoder (reward) + 4x MLP (per-channel cost)
+    Actor:  GCN-Transformer encoder -> GaussianPolicy
+    Critic: GCN-Transformer (reward) + 4x MLP (per-channel cost)
 ```
-
-**STEMSEncoder** (GCN + 2-layer Temporal Transformer, 175K parameters) processes each building's state through a per-node temporal transformer (backward history + forward forecast tokens), then aggregates across buildings via an adaptive GCN with gated fusion. The encoder serves the pipeline; the contribution is the per-channel formulation it plugs into, not the encoder architecture itself.
 
 The **headroom-gated reward** (`r_ev_smart`) provides a departure-aware EV price signal: a feasibility corridor opens when the agent has charging slack and closes when departure is urgent, eliminating the reward-constraint conflict that caused prior approaches to fail on C1.
 

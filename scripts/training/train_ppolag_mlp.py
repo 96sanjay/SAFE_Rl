@@ -4,8 +4,8 @@
 Simple wrapper around omnisafe.Agent for A/B comparison runs.
 
 Usage:
-    python scripts/train_ppolag_mlp.py --cfg configs/on-policy/r11a_ppolag_improved.yaml
-    python scripts/train_ppolag_mlp.py --cfg configs/on-policy/r11a_ppolag_improved.yaml --smoke_1epoch
+    python scripts/training/train_ppolag_mlp.py --cfg configs/archive/on-policy/r11a_ppolag_improved.yaml
+    python scripts/training/train_ppolag_mlp.py --cfg configs/archive/on-policy/r11a_ppolag_improved.yaml --smoke_1epoch
 """
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ Combines:
   - train_stems_5bld.py: STEMS encoder monkeypatch into ActorBuilder
 
 Usage:
-    python scripts/train_multi_lag_stems.py --cfg configs/on-policy/r20_stems.yaml
+    python scripts/training/train_multi_lag_stems.py --cfg configs/active/headroom_gated_cmdp.yaml
 """
 from __future__ import annotations
 

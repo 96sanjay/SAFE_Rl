@@ -133,7 +133,7 @@ of C1, not a separate constraint):
 - C3: Building peak power
 - C4: Grid aggregate power
 
-**Config:** `configs/on-policy/r11b_multi_improved.yaml`
+**Config:** `configs/archive/on-policy/r11b_multi_improved.yaml`
 **Script:** `shell/archive/run_r11b_multi.sh`
 
 Key settings from the shell script:
@@ -208,7 +208,7 @@ The reference configuration for all subsequent experiments. Every R26+ run
 was compared against R25b.
 
 **Script:** `shell/archive/run_r25b_report_stable.sh`
-**Config:** `configs/on-policy/baseline_stable.yaml`
+**Config:** `configs/active/baseline_stable.yaml`
 
 Architecture and training:
 - Multi-constraint PPO-Lagrangian with per-constraint PID lambdas

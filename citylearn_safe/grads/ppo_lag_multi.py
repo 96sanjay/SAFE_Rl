@@ -12,7 +12,7 @@ Key design:
   - Cost weights (cost_weight_* in multi_cfgs) scale critic training signal
   - Lambda PID updates use raw costs (physical units, compared to cost_limits)
 
-Design: docs/plans/2026-03-08-ppolag-multi-softmax-design.md
+Based on PPO with per-constraint softmax advantage selection.
 """
 from __future__ import annotations
 

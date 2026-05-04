@@ -7,10 +7,10 @@ mean_net (STEMSEncoder5Bld) into OmniSafe's GaussianLearningActor.
 
 Usage:
   # Full run (50 epochs)
-  python scripts/train_stems_5bld.py --cfg configs/on-policy/r8_stems_5bld.yaml
+  python scripts/training/train_stems_5bld.py --cfg configs/archive/on-policy/r8_stems_5bld.yaml
 
   # Smoke test (1 epoch)
-  python scripts/train_stems_5bld.py --cfg configs/on-policy/r8_stems_5bld.yaml --smoke_1epoch
+  python scripts/training/train_stems_5bld.py --cfg configs/archive/on-policy/r8_stems_5bld.yaml --smoke_1epoch
 """
 from __future__ import annotations
 

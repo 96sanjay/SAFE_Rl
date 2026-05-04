@@ -45,5 +45,6 @@ python tests/test_r6_smoke.py
   instantiate the full CityLearn environment, which takes a few seconds per
   test. Use `pytest -x` to stop on first failure during debugging.
 - `test_diagnose_policy_health.py` uses synthetic data and does not require the
-  CityLearn environment, but does require `scripts/diagnose_policy_health.py`.
+  CityLearn environment. It auto-skips if `scripts/diagnose_policy_health.py`
+  is not available (advanced diagnostic tool, not part of the core pipeline).
 - GPU is not required; tests run on CPU by default.

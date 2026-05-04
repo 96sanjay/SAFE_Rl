@@ -13,7 +13,7 @@ Paper-faithful implementation:
   - Scale: ∇Jc = gc·|G|/N (Alg 1, line 9)
   - No 1/(1+λ) denominator (not in paper)
 
-Design doc: docs/plans/2026-03-07-grads-single-lambda-design.md
+Based on Yao et al. 2024 (L4DC) Gradient Shaping algorithm.
 """
 from __future__ import annotations
 

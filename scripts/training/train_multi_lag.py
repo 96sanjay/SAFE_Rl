@@ -5,7 +5,7 @@ Bypasses omnisafe.Agent (which needs a default config YAML per algorithm)
 and directly instantiates PPOLagMulti with the merged config.
 
 Usage:
-    python scripts/train_multi_lag.py --cfg configs/on-policy/ppolag_multi_5bld.yaml
+    python scripts/training/train_multi_lag.py --cfg configs/active/headroom_gated_cmdp.yaml
 """
 from __future__ import annotations
 

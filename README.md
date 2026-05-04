@@ -111,7 +111,7 @@ SAFE_RL/
 
 ```bash
 # Clone the repository
-git clone https://github.com/96sanjay/SAFE_Rl.git
+git clone https://github.com/96sanjay/SAFE_Rl.git SAFE_RL
 cd SAFE_RL
 
 # Create conda environment
@@ -126,8 +126,7 @@ pip install gymnasium numpy pandas matplotlib seaborn tyro pyyaml rich
 # Launch scripts set PYTHONPATH automatically.
 # To run manually, set: export PYTHONPATH="$PWD:$PYTHONPATH"
 
-# Install vendored CVXPyLayers (has setup.py)
-pip install -e vendor_deps/cvxpylayers
+# CVXPyLayers is vendored (imported via PYTHONPATH, no install needed)
 ```
 
 ### Training

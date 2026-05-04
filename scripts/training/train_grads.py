@@ -5,7 +5,7 @@ Bypasses omnisafe.Agent (which needs a default config YAML per algorithm)
 and directly instantiates PPOLagGradS with the merged config.
 
 Usage:
-    python scripts/train_grads.py --cfg configs/on-policy/ppolag_grads_5bld.yaml
+    python scripts/training/train_grads.py --cfg configs/archive/on-policy/ppolag_grads_5bld.yaml
 """
 from __future__ import annotations
 

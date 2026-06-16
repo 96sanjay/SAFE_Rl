@@ -23,7 +23,6 @@ from omnisafe.utils.config import Config
 
 # Import PPOLagMulti and PPOLagGradS (triggers @registry.register)
 from citylearn_safe.grads.ppo_lag_multi import PPOLagMulti
-from citylearn_safe.grads.ppo_lag_grads import PPOLagGradS
 
 
 def load_ppo_defaults() -> dict:
@@ -128,7 +127,6 @@ def main(cfg_path: str, use_bc: bool = False, no_curriculum: bool = False) -> No
     # 5. Direct instantiation (bypasses omnisafe.Agent)
     algo_classes = {
         'PPOLagMulti': PPOLagMulti,
-        'PPOLagGradS': PPOLagGradS,
     }
     algo_cls = algo_classes.get(algo)
     if algo_cls is None:

@@ -116,7 +116,7 @@ export CITYLEARN_POLICY_ACTION_MASK="0"
 # ---------------------------------------------------------------------------
 # Algorithm list
 # ---------------------------------------------------------------------------
-ALGOS=("ppolag" "trpolag" "focops" "cppopid" "pcpo")
+ALGOS=("ppo" "ppolag" "trpolag" "cppopid" "cpo" "pposaute" "saclag")
 LOG_DIR="/tmp/omnisafe_benchmarks"
 mkdir -p "${LOG_DIR}"
 
